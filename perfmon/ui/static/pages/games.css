@@ -1,0 +1,21 @@
+/* Page-specific styles for #/games (shared design tokens live in /style.css). */
+.games-table tbody tr { cursor: pointer; }
+.games-table tbody tr:hover { background: var(--surface-2); }
+.games-table td.muted { color: var(--muted); }
+.games-table .sev { margin-left: 10px; }
+.games-table .live { color: var(--good); font-size: 12px; margin-left: 10px; }
+.page-head .back { color: var(--muted); text-decoration: none; font-size: 13px; }
+.page-head .back:hover { color: var(--ink); }
+.page-head a.btn { text-decoration: none; }
+.list.static .row { cursor: default; }
+.list.static .row:hover { background: transparent; }
+.list .row.go { cursor: pointer; }
+.list .row.go:hover { background: var(--surface-2); }
+.list .row .detail { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: normal; }
+.list .row.find { align-items: flex-start; }
+.list .row.find .title { white-space: normal; }
+.list .row.find .sev { margin-top: 3px; }
+.line { color: var(--ink-2); font-size: 13px; margin: 20px 0 0; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 24px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv .v { color: var(--ink-2); font-variant-numeric: tabular-nums; }
