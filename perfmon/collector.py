@@ -35,6 +35,7 @@ INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUE
 
 FREEZE_MS = 2000      # shell/DWM unresponsive this long = freeze incident
 TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
+CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
 
 SRC_DIR = Path(__file__).resolve().parent
 RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
@@ -77,6 +78,8 @@ class Collector:
         self.games = {}                # pid -> dict(session, capture, exe)
         self.open_incidents = {}       # kind -> incident id (for ongoing freezes/temps)
         self.cores = psutil.cpu_percent(percpu=True)
+        self.not_games = set()         # (pid, create_time) of processes already ruled out as games
+        self.pending_crash_checks = [] # (session, exe, end_ts) re-checked for late WER crash events
         self.reload = False            # set when the loop exits to hand over to a new instance
         self.src_stamp = source_stamp()
         self.last_reload_check = time.time()
@@ -234,6 +237,8 @@ class Collector:
         for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info"]):
             try:
                 i = pr.info
+                if i["pid"] == 0:
+                    continue  # "System Idle Process": idle time, not load
                 ct = i["cpu_times"]
                 cpu_s = ct.user + ct.system
                 try:
@@ -275,16 +280,25 @@ class Collector:
         return any(m in pl for m in self.cfg["game_path_markers"])
 
     def check_games(self):
-        alive = set()
-        for pr in psutil.process_iter(["pid", "name", "exe"]):
+        alive, live_pids = set(), set()
+        for pr in psutil.process_iter(["pid", "name", "create_time"]):
             try:
-                pid, name, exe = pr.info["pid"], pr.info["name"], pr.info["exe"]
+                pid, name = pr.info["pid"], pr.info["name"]
+                key = (pid, pr.info["create_time"])
             except Exception:
                 continue
+            live_pids.add(key)
             if pid in self.games:
                 alive.add(pid)
                 continue
+            if key in self.not_games:
+                continue  # already ruled out; skip the costly exe lookup
+            try:
+                exe = pr.exe()
+            except Exception:
+                exe = None
             if not self.is_game(name, exe):
+                self.not_games.add(key)
                 continue
             # Ignore helper processes that use almost no memory (launch stubs, updaters)
             try:
@@ -294,6 +308,7 @@ class Collector:
                 continue
             self.start_game(pid, name, exe)
             alive.add(pid)
+        self.not_games &= live_pids
         for pid in list(self.games):
             if pid not in alive:
                 self.end_game(pid, "exit")
@@ -329,15 +344,33 @@ class Collector:
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
-        # A crash/hang event for this exe within the last minute means it did not exit cleanly
-        crashed = self.exec(
-            "SELECT 1 FROM events WHERE ts > ? AND event_id IN (1000,1002) AND message LIKE ? LIMIT 1",
-            (end - 90, f"%{g['exe']}%")).fetchone()
-        if reason == "exit" and crashed:
-            reason = "crash"
+        if reason == "exit":
+            if self._crash_event(g["exe"], end):
+                reason = "crash"
+            else:
+                # WER writes 1000/1002 seconds after the process dies and we poll the log every 30 s
+                self.pending_crash_checks.append((g["session"], g["exe"], end))
         self.save_summary(g)
         self.exec("UPDATE sessions SET end_ts=?, end_reason=? WHERE id=?", (end, reason, g["session"]))
         log.info("game end %s session=%s reason=%s", g["exe"], g["session"], reason)
+
+    def _crash_event(self, exe, end):
+        """A crash/hang event for this exe around the exit means it did not exit cleanly."""
+        return self.exec(
+            "SELECT 1 FROM events WHERE ts BETWEEN ? AND ? AND event_id IN (1000,1002) "
+            "AND provider IN ('Application Error','Application Hang') AND message LIKE ? LIMIT 1",
+            (end - 90, end + CRASH_LATE_S, f"%{exe}%")).fetchone() is not None
+
+    def recheck_crashes(self, now):
+        """Re-check sessions that ended 'exit' once later event-log polls have arrived."""
+        keep = []
+        for sid, exe, end in self.pending_crash_checks:
+            if now - end < CRASH_LATE_S:
+                keep.append((sid, exe, end))
+            elif self._crash_event(exe, end):
+                self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,))
+                log.info("session %s reclassified as crash (late WER event)", sid)
+        self.pending_crash_checks = keep
 
     # ---------- event log ----------
     def poll_events(self):
@@ -401,10 +434,10 @@ class Collector:
         stamp = source_stamp()
         if stamp == self.src_stamp and not requested:
             return
-        if not requested and now - stamp < 3:
-            return  # files may still be mid-save
-        if self.games:
-            # Restarting would split the game session and its frame capture in two
+        if not requested and now - stamp < 10:
+            return  # files may still be mid-save (an edit session touches several files)
+        if self.games or self.pending_crash_checks:
+            # Restarting would split the game session in two / lose the late crash re-check
             if not self.reload_deferred_logged:
                 log.info("reload pending, deferred until the game session ends")
                 self.reload_deferred_logged = True
@@ -451,6 +484,7 @@ class Collector:
                 if now - self.last_events >= self.cfg["event_poll_s"]:
                     self.last_events = now
                     self.poll_events()
+                    self.recheck_crashes(now)
                 self.housekeeping(now)
                 self.check_reload(now)
             except Exception:
