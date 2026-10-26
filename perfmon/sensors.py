@@ -101,6 +101,38 @@ class HardwareSensors:
             log.debug("LHM read error: %s", e)
         return out
 
+    def dump(self) -> list:
+        """Every LHM sensor (incl. motherboard/Super I/O and memory) - for discovering what is readable."""
+        if not self.ok:
+            return []
+        c = self.computer
+        c.IsMotherboardEnabled = True
+        c.IsMemoryEnabled = True
+        out = []
+        try:
+            def walk(h, parent=None):
+                h.Update()
+                for s in h.Sensors:
+                    v, mn, mx = s.Value, s.Min, s.Max
+                    out.append({"hardware": h.Name, "hw_type": str(h.HardwareType), "parent": parent,
+                                "type": str(s.SensorType), "name": s.Name, "id": str(s.Identifier),
+                                "value": float(v) if v is not None else None,
+                                "min": float(mn) if mn is not None else None,
+                                "max": float(mx) if mx is not None else None})
+                for sub in h.SubHardware:
+                    walk(sub, h.Name)
+            for h in c.Hardware:  # first pass primes rate/effective-clock sensors
+                h.Update()
+                for sub in h.SubHardware:
+                    sub.Update()
+            time.sleep(0.5)
+            for h in c.Hardware:
+                walk(h)
+        finally:
+            c.IsMotherboardEnabled = False
+            c.IsMemoryEnabled = False
+        return out
+
     def describe(self) -> dict:
         return {"cpu": self.cpu.Name if self.cpu else None, "gpu": self.gpu.Name if self.gpu else None}
 

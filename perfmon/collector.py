@@ -38,6 +38,8 @@ TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
 
 SRC_DIR = Path(__file__).resolve().parent
 RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
+DUMP_FLAG = config.DATA_DIR / "sensors_dump.request"   # touched by `pm sensors dump`
+DUMP_PATH = config.DATA_DIR / "sensors_dump.json"
 RELOAD_CHECK_S = 5
 MUTEX_NAME = os.environ.get("PERFMON_MUTEX", "Global\\PerfMonitorCollector")   # env override: tests
 
@@ -388,6 +390,13 @@ class Collector:
         if now - self.last_reload_check < RELOAD_CHECK_S:
             return
         self.last_reload_check = now
+        if DUMP_FLAG.exists():
+            DUMP_FLAG.unlink(missing_ok=True)
+            tmp = DUMP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"ts": now, "admin": is_admin(), "sensors": self.hw.dump()},
+                                      ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(DUMP_PATH)
+            log.info("sensor dump written to %s", DUMP_PATH)
         requested = RELOAD_FLAG.exists()
         stamp = source_stamp()
         if stamp == self.src_stamp and not requested:

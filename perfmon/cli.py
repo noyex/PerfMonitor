@@ -344,6 +344,23 @@ def cmd_collector(con, a):
         "w trakcie sesji gry przeładowanie czeka na jej koniec. Sprawdź: pm status")
 
 
+def cmd_sensors(con, a):
+    """Have the elevated collector dump every LHM sensor (the CLI itself runs without admin rights)."""
+    path, flag = config.DATA_DIR / "sensors_dump.json", config.DATA_DIR / "sensors_dump.request"
+    t0 = time.time()
+    flag.touch()
+    while not (path.exists() and path.stat().st_mtime >= t0 - 1):
+        if time.time() - t0 > 30:
+            flag.unlink(missing_ok=True)
+            sys.exit("Kolektor nie odpowiedział w 30 s (czy działa? pm status)")
+        time.sleep(0.5)
+    d = json.loads(path.read_text(encoding="utf-8"))
+    if a.json:
+        return dump(d)
+    out(f"## Czujniki LHM ({len(d['sensors'])}, admin={d['admin']}, {an.fmt_ts(d['ts'])})")
+    table(d["sensors"], ["hardware", "type", "name", "value", "min", "max"])
+
+
 def build():
     p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
@@ -388,6 +405,7 @@ def build():
     s.add_argument("--since", default="180d")
     add("config", cmd_config)
     add("collector", cmd_collector, help="restart the running collector").add_argument("action", choices=["reload"])
+    add("sensors", cmd_sensors, help="dump every hardware sensor").add_argument("action", choices=["dump"])
     return p
 
 
