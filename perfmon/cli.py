@@ -361,6 +361,33 @@ def cmd_sensors(con, a):
     table(d["sensors"], ["hardware", "type", "name", "value", "min", "max"])
 
 
+def cmd_freeze_check(con, a):
+    from perfmon import freezecheck
+    r = freezecheck.run(con)
+    if a.json:
+        return dump(r)
+    out(f"## Freeze check {r['at']} ({r['took_s']} s)")
+    out("### Werdykt")
+    for v in r["verdict"]:
+        out(f"- {v}")
+    kv({"DwmFlush [ms]": "ZABLOKOWANY > 20 s" if r["dwm_blocked"] else r["dwm_flush_ms"],
+        "explorer ping [ms]": round(r["shell_ping_ms"]) if r["shell_ping_ms"] is not None else r["shell_note"],
+        "pierwszy plan": f"{r['foreground']['exe']} (hung={r['foreground']['hung']})",
+        "GPU 3D wg adaptera [%]": r["gpu_3d_by_adapter"], "CPU %": r["cpu_pct"], "RAM %": r["ram_pct"],
+        "dwm.exe": r["dwm_process"], "explorer.exe": r["explorer_process"],
+        "kolektor": r.get("collector")}, "Pomiary")
+    out("### Monitory")
+    table(r["displays"])
+    out("### Top procesy CPU (1 s)")
+    table(r["top_procs"])
+    if r.get("recent_incidents"):
+        out("### Incydenty z ostatnich 10 min")
+        table(r["recent_incidents"])
+    if r.get("recent_events"):
+        out("### Zdarzenia (level<=3) z ostatnich 10 min")
+        table(r["recent_events"], ["time", "provider", "event_id", "level", "message"])
+
+
 def build():
     p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
@@ -406,6 +433,7 @@ def build():
     add("config", cmd_config)
     add("collector", cmd_collector, help="restart the running collector").add_argument("action", choices=["reload"])
     add("sensors", cmd_sensors, help="dump every hardware sensor").add_argument("action", choices=["dump"])
+    add("freeze-check", cmd_freeze_check, help="live diagnosis while the desktop is frozen")
     return p
 
 
