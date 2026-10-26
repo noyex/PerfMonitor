@@ -1,0 +1,874 @@
+"""Analysis helpers over the perf.db SQLite database.
+
+Pure functions taking a (preferably read-only) connection and returning
+JSON-serializable dicts/lists. Used by the CLI (perfmon.cli) and the web UI.
+Human-readable finding strings are in Polish; code and comments are English.
+"""
+import bisect
+import json
+import math
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+
+# --------------------------------------------------------------------------
+# Time parsing / generic helpers
+# --------------------------------------------------------------------------
+
+_REL = re.compile(r"^-?\s*(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|d|w)$", re.I)
+_UNITS = {"s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_time(s) -> float:
+    """Unix ts, 'YYYY-MM-DD HH:MM[:SS]', 'HH:MM[:SS]' (today, local), '-2h' / '30m' / '7d' (ago), 'now'."""
+    if isinstance(s, (int, float)):
+        return float(s)
+    t = str(s).strip()
+    if not t or t.lower() == "now":
+        return time.time()
+    m = _REL.match(t)
+    if m:
+        return time.time() - float(m.group(1)) * _UNITS[m.group(2).lower()]
+    if re.fullmatch(r"\d{9,11}(\.\d+)?", t):
+        return float(t)
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", t):
+        parts = [int(x) for x in t.split(":")]
+        now = datetime.now()
+        dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2] if len(parts) > 2 else 0, microsecond=0)
+        return dt.timestamp()
+    t2 = t.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t2, fmt).timestamp()
+        except ValueError:
+            pass
+    raise ValueError(f"Nie rozumiem czasu: {s!r}")
+
+
+def fmt_ts(ts) -> str:
+    if ts is None:
+        return ""
+    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rows(con, sql, args=()):
+    return [dict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def _one(con, sql, args=()):
+    r = con.execute(sql, args).fetchone()
+    return dict(r) if r else None
+
+
+def _json(s):
+    if s is None:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
+
+
+def _r(v, n=1):
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return round(v, n)
+    except Exception:
+        return v
+
+
+def _pct(vals, p):
+    vals = sorted(v for v in vals if v is not None)
+    if not vals:
+        return None
+    k = (len(vals) - 1) * p
+    lo, hi = int(math.floor(k)), int(math.ceil(k))
+    return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+
+
+def _table_cols(con, table):
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+
+TEXT_SAMPLE_COLS = {"fg_exe", "disk_lat_disk", "extra"}
+MAX_AGG_SAMPLE = {"disk_lat_ms", "ui_ms", "dwm_ms", "disk_queue", "hard_faults_s"}
+FRAME_AGG = {  # name -> SQL aggregate expression
+    "fps": "AVG(fps)", "fps_min": "MIN(fps)", "ft_avg": "AVG(ft_avg)", "ft_p99": "MAX(ft_p99)",
+    "ft_max": "MAX(ft_max)", "cpu_busy": "AVG(cpu_busy)", "gpu_busy": "AVG(gpu_busy)",
+    "display_lat": "AVG(display_lat)", "frames": "AVG(frames)",
+}
+KEY_COLS = ["cpu_total", "cpu_core_max", "cpu_clock_mhz", "cpu_temp", "cpu_power_w", "dpc_pct", "interrupt_pct",
+            "ram_pct", "ram_used_gb", "commit_gb", "hard_faults_s", "gpu_load", "gpu_vram_mb", "gpu_clock_mhz",
+            "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w", "gpu_fan_rpm", "disk_lat_ms",
+            "disk_busy_pct", "ui_ms", "dwm_ms"]
+
+NOT_BACKGROUND = {"system idle process", "system", "idle", "presentmon.exe", "memory compression", "registry"}
+
+
+# --------------------------------------------------------------------------
+# latest / status
+# --------------------------------------------------------------------------
+
+def latest(con):
+    s = _one(con, "SELECT * FROM samples ORDER BY ts DESC LIMIT 1")
+    now = time.time()
+    meta = {r["k"]: r["v"] for r in con.execute("SELECT k, v FROM meta")}
+    sess = _one(con, "SELECT * FROM sessions WHERE end_ts IS NULL ORDER BY id DESC LIMIT 1")
+    if sess:
+        sess["summary"] = _json(sess.get("summary"))
+        sess["running_s"] = round(now - sess["start_ts"])
+    if s:
+        s["extra"] = _json(s.get("extra"))
+    cnt = _one(con, "SELECT (SELECT COUNT(*) FROM incidents) AS incidents, (SELECT COUNT(*) FROM sessions) AS sessions,"
+                    " (SELECT MIN(ts) FROM samples) AS first_sample")
+    return {
+        "now": now,
+        "sample": s,
+        "sample_age_s": _r(now - s["ts"]) if s else None,
+        "collector_alive": bool(s and now - s["ts"] < 5),
+        "admin": meta.get("admin") == "1",
+        "collector_started": float(meta["collector_started"]) if meta.get("collector_started") else None,
+        "collector_stopped": float(meta["collector_stopped"]) if meta.get("collector_stopped") else None,
+        "hw": _json(meta.get("hw")),
+        "open_session": sess,
+        "counts": cnt,
+    }
+
+
+# --------------------------------------------------------------------------
+# sessions
+# --------------------------------------------------------------------------
+
+def _ctx(r):
+    """sessions.context JSON as dict (column may be missing or null in older DBs)."""
+    c = _json(r.get("context")) if hasattr(r, "get") else None
+    return c if isinstance(c, dict) else {}
+
+
+def _driver(ctx):
+    return ctx.get("adrenalin") or ctx.get("gpu_driver")
+
+
+def _flatten_session(r, stutters=None):
+    summ = _json(r.get("summary")) or {}
+    end = r["end_ts"] if r["end_ts"] else None
+    d = {
+        "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": r["end_ts"],
+        "end_reason": r["end_reason"],
+        "duration_s": round((end or time.time()) - r["start_ts"]) if r["start_ts"] else None,
+        "running": r["end_ts"] is None,
+    }
+    for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error"):
+        d[k] = summ.get(k)
+    ctx = _ctx(r)
+    d["context"] = ctx or None
+    d["gpu_driver"] = _driver(ctx)
+    d["game_version"] = ctx.get("game_version")
+    if stutters is not None:
+        d["stutters"] = stutters
+    return d
+
+
+def sessions(con, limit=20):
+    rows = _rows(con, "SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (int(limit),))
+    if not rows:
+        return []
+    ids = [r["id"] for r in rows]
+    q = ",".join("?" * len(ids))
+    st = {r["session"]: r["n"] for r in con.execute(
+        f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
+    return [_flatten_session(r, st.get(r["id"], 0)) for r in rows]
+
+
+def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
+    ts = st["ts"]
+    causes = []
+    lo, hi = bisect.bisect_left(samples_ts, ts - 2), bisect.bisect_right(samples_ts, ts + 2)
+    win = samples[lo:hi]
+
+    def mx(col):
+        v = [s[col] for s in win if s[col] is not None]
+        return max(v) if v else None
+
+    if win:
+        if (mx("disk_lat_ms") or 0) > 30 or (mx("hard_faults_s") or 0) > 200:
+            causes.append("disk")
+        vr = [s["gpu_vram_mb"] / s["gpu_vram_total_mb"] for s in win if s["gpu_vram_mb"] and s["gpu_vram_total_mb"]]
+        if vr and max(vr) > 0.95:
+            causes.append("vram")
+        cm = [s["commit_gb"] / s["commit_limit_gb"] for s in win if s["commit_limit_gb"]]
+        if (mx("ram_pct") or 0) > 90 or (cm and max(cm) > 0.92):
+            causes.append("ram")
+        if any((s["cpu_core_max"] or 0) > 95 and (s["gpu_load"] if s["gpu_load"] is not None else 0) < 85 for s in win):
+            causes.append("cpu_thread")
+    plo, phi = bisect.bisect_left(procs_ts, ts - 5), bisect.bisect_right(procs_ts, ts + 5)
+    bg = {}
+    for p in procs[plo:phi]:
+        n = (p["name"] or "").lower()
+        if p["cpu_pct"] and p["cpu_pct"] > 10 and n != (game_exe or "").lower() and n not in NOT_BACKGROUND:
+            bg[p["name"]] = max(bg.get(p["name"], 0), p["cpu_pct"])
+    for name in sorted(bg, key=lambda k: -bg[k])[:2]:
+        causes.append(f"background:{name}")
+    if win and game_exe:
+        fg = [s["fg_exe"] for s in win if s["fg_exe"]]
+        if fg and any(f.lower() != game_exe.lower() for f in fg):
+            causes.append("alt_tab")
+    if win:
+        if (mx("dpc_pct") or 0) > 5 or (mx("interrupt_pct") or 0) > 5:
+            causes.append("dpc")
+        if (mx("cpu_temp") or 0) > 90 or (mx("gpu_hotspot") or 0) > 100:
+            causes.append("thermal")
+    if not causes:
+        causes.append("shader_or_unknown")
+    return causes
+
+
+def session_report(con, session_id):
+    row = _one(con, "SELECT * FROM sessions WHERE id=?", (int(session_id),))
+    if not row:
+        return {"error": f"Brak sesji {session_id}"}
+    start = row["start_ts"]
+    last_sample = _one(con, "SELECT MAX(ts) AS t FROM samples WHERE game_session=?", (row["id"],))["t"]
+    end = row["end_ts"] or last_sample or time.time()
+    dur = max(1.0, end - start)
+    exe = row["exe"]
+    rep = {"session": _flatten_session(row), "summary": _json(row["summary"]) or {}, "duration_s": round(dur),
+           "start": fmt_ts(start), "end": fmt_ts(end)}
+
+    # --- frames: bound shares + fps timeline
+    frames = _rows(con, "SELECT ts, fps, ft_p99, ft_max, cpu_busy, gpu_busy, bound, present_mode FROM frames "
+                        "WHERE session=? ORDER BY ts", (row["id"],))
+    bound_counts = Counter(f["bound"] for f in frames if f["bound"])
+    nb = sum(bound_counts.values())
+    rep["bound_pct"] = {k: _r(100 * bound_counts.get(k, 0) / nb) for k in ("GPU", "CPU", "limit")} if nb else {}
+    fps = [f["fps"] for f in frames if f["fps"]]
+    if fps:
+        avg = sum(fps) / len(fps)
+        rep["fps_timeline"] = {
+            "seconds": len(frames), "avg": _r(avg), "min": _r(min(fps)), "max": _r(max(fps)),
+            "p5": _r(_pct(fps, 0.05)), "p50": _r(_pct(fps, 0.5)), "p95": _r(_pct(fps, 0.95)),
+            "seconds_below_60pct_of_avg": sum(1 for v in fps if v < 0.6 * avg),
+            "worst_ft_max_ms": _r(max((f["ft_max"] or 0) for f in frames)),
+            "present_mode": Counter(f["present_mode"] for f in frames if f["present_mode"]).most_common(1)[0][0]
+            if any(f["present_mode"] for f in frames) else None,
+        }
+    else:
+        rep["fps_timeline"] = {}
+
+    # --- stutters with causes
+    st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
+    samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, "
+                         "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
+                         "fg_exe FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (start - 3, end + 3))
+    procs = _rows(con, "SELECT ts, name, cpu_pct FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? ORDER BY ts",
+                  (start - 6, end + 6))
+    s_ts, p_ts = [s["ts"] for s in samples], [p["ts"] for p in procs]
+    cause_counts = Counter()
+    bg_counts = Counter()
+    for s in st:
+        cs = _causes_for_stutter(s, s_ts, samples, p_ts, procs, exe)
+        s["causes"] = cs
+        for c in cs:
+            cause_counts[c] += 1
+            if c.startswith("background:"):
+                bg_counts[c.split(":", 1)[1]] += 1
+    worst = sorted(st, key=lambda s: -s["ft_ms"])[:15]
+    rep["stutters"] = {
+        "count": len(st), "per_min": _r(len(st) / (dur / 60), 2),
+        "worst_ft_ms": _r(max((s["ft_ms"] for s in st), default=None)),
+        "cause_counts": dict(cause_counts.most_common()),
+        "background_procs": dict(bg_counts.most_common(5)),
+        "worst": [{"ts": w["ts"], "time": fmt_ts(w["ts"]), "ft_ms": _r(w["ft_ms"]), "median_ms": _r(w["median_ms"]),
+                   "causes": w["causes"]} for w in worst],
+    }
+
+    # --- hardware peaks
+    agg = _one(con, "SELECT COUNT(*) AS n, MAX(cpu_temp) AS cpu_temp_max, AVG(cpu_temp) AS cpu_temp_avg, "
+                    "MAX(gpu_temp) AS gpu_temp_max, MAX(gpu_hotspot) AS gpu_hotspot_max, MAX(gpu_mem_temp) AS gpu_mem_temp_max, "
+                    "AVG(cpu_clock_mhz) AS cpu_clock_avg, MAX(cpu_clock_mhz) AS cpu_clock_max, "
+                    "AVG(gpu_clock_mhz) AS gpu_clock_avg, MAX(gpu_clock_mhz) AS gpu_clock_max, "
+                    "AVG(gpu_load) AS gpu_load_avg, AVG(cpu_total) AS cpu_total_avg, MAX(cpu_core_max) AS cpu_core_max_peak, "
+                    "MAX(gpu_vram_mb) AS vram_peak_mb, MAX(gpu_vram_total_mb) AS vram_total_mb, "
+                    "MAX(ram_pct) AS ram_peak_pct, MAX(ram_used_gb) AS ram_peak_gb, MAX(commit_gb) AS commit_peak_gb, "
+                    "MAX(commit_limit_gb) AS commit_limit_gb, MAX(disk_lat_ms) AS disk_lat_max_ms, "
+                    "MAX(gpu_power_w) AS gpu_power_max_w, MAX(cpu_power_w) AS cpu_power_max_w, "
+                    "MAX(ui_ms) AS ui_ms_max, MAX(dwm_ms) AS dwm_ms_max, MAX(dpc_pct) AS dpc_max, "
+                    "MAX(interrupt_pct) AS interrupt_max "
+                    "FROM samples WHERE ts BETWEEN ? AND ?", (start, end))
+    rep["hardware"] = {k: _r(v, 1) for k, v in agg.items()} if agg else {}
+
+    # --- events & incidents during the session
+    rep["incidents"] = incidents_between(con, start, end + 5)
+    rep["events"] = _rows(con, "SELECT ts, provider, event_id, level, substr(message,1,300) AS message FROM events "
+                               "WHERE ts BETWEEN ? AND ? AND (level<=2 OR event_id IN (1000,1002,1001,10001)) "
+                               "ORDER BY ts LIMIT 60", (start, end + 60))
+    for e in rep["events"]:
+        e["time"] = fmt_ts(e["ts"])
+    rep["findings"] = _session_findings(rep, row)
+    return rep
+
+
+def _session_findings(rep, row):
+    f = []
+    add = lambda sev, title, detail: f.append({"severity": sev, "title": title, "detail": detail})
+    exe = row["exe"]
+    fl = rep.get("fps_timeline") or {}
+    summ = rep.get("summary") or {}
+    bp = rep.get("bound_pct") or {}
+    st = rep.get("stutters") or {}
+    hw = rep.get("hardware") or {}
+    n_st = st.get("count", 0)
+
+    if row["end_reason"] == "crash":
+        add("critical", f"{exe} zakończył się crashem",
+            "Sesja zakończyła się awarią gry - sprawdź zdarzenia 1000/1001 (Application Error / WER) w sekcji events.")
+    if row["end_reason"] == "unknown":
+        add("serious", "Sesja zakończona w nieznany sposób",
+            "Kolektor nie zapisał końca sesji - możliwy twardy reset/zawieszenie komputera podczas gry.")
+    if not fl:
+        add("info", "Brak danych o klatkach",
+            "PresentMon nie zapisał klatek (brak PresentMon, brak uprawnień administratora lub bardzo krótka sesja).")
+    else:
+        if bp:
+            top = max(bp, key=lambda k: bp[k] or 0)
+            if (bp.get("GPU") or 0) >= 60:
+                add("info", f"GPU limituje wydajność przez {bp['GPU']:.0f}% czasu",
+                    "Karta jest wąskim gardłem (normalne w grach AAA). Aby podnieść FPS: obniż rozdzielczość lub użyj "
+                    "FSR/upscalera, zmniejsz ustawienia cieni/RT/tekstur.")
+            if (bp.get("CPU") or 0) >= 40:
+                add("warning", f"CPU limituje wydajność przez {bp['CPU']:.0f}% czasu",
+                    "Procesor nie nadąża z przygotowaniem klatek. Sprawdź procesy w tle (lista w stutters/background_procs), "
+                    "obniż ustawienia mocno obciążające CPU (zasięg widzenia, tłum, symulacja), upewnij się, że EXPO i "
+                    "plan zasilania Wysoka wydajność/Zrównoważony z Game Mode działają poprawnie.")
+            if (bp.get("limit") or 0) >= 40:
+                add("info", f"Brak limitu CPU/GPU przez {bp['limit']:.0f}% czasu (limit FPS / vsync)",
+                    "Ani CPU, ani GPU nie pracują pełnym czasem klatki. Sprawdź limiter FPS w grze, V-Sync, Radeon Chill, "
+                    "FRTC (Frame Rate Target Control) w Adrenalinie oraz limit odświeżania monitora.")
+        avg = summ.get("fps_avg") or fl.get("avg")
+        low1 = summ.get("fps_1low")
+        if avg and low1 and low1 / avg < 0.6:
+            add("warning", f"Nierówny frametime: 1% low {low1} FPS przy średniej {avg} FPS",
+                "Duża rozbieżność między średnią a 1% low oznacza przycięcia. Zobacz przyczyny stutterów poniżej.")
+        if fl.get("seconds_below_60pct_of_avg", 0) > 0.05 * fl.get("seconds", 1):
+            add("info", f"{fl['seconds_below_60pct_of_avg']} s z FPS poniżej 60% średniej",
+                "Fragmenty gry z wyraźnymi spadkami - porównaj timestampy w `worst` z wykresem w UI.")
+
+    if n_st:
+        rate = st.get("per_min") or 0
+        sev = "serious" if rate > 6 else "warning" if rate > 2 else "info"
+        add(sev, f"{n_st} stutterów ({rate}/min, najgorszy {st.get('worst_ft_ms')} ms)",
+            "Przyczyny: " + ", ".join(f"{k}={v}" for k, v in (st.get("cause_counts") or {}).items()))
+        cc = st.get("cause_counts") or {}
+        share = lambda k: cc.get(k, 0) / n_st
+        if cc.get("disk", 0) >= 3 and share("disk") >= 0.25:
+            add("serious", f"{cc['disk']} stutterów powiązanych z dyskiem",
+                "Opóźnienia dysku/ładowanie z pliku wymiany w trakcie przycięć. Zainstaluj grę na Samsung 990 PRO "
+                "(nie na Goodram), sprawdź plik wymiany (system-managed na szybkim dysku), zamknij skanery/pobieranie w tle.")
+        if cc.get("vram", 0) >= 3:
+            add("warning", f"{cc['vram']} stutterów przy pełnym VRAM",
+                "Pamięć karty >95%. Obniż jakość tekstur / rozdzielczość, wyłącz RT lub ultra tekstury.")
+        if cc.get("ram", 0) >= 3:
+            add("warning", f"{cc['ram']} stutterów przy dużym zużyciu RAM/commit",
+                "RAM >90% lub commit blisko limitu. Zamknij przeglądarkę/inne aplikacje, zwiększ plik wymiany.")
+        if cc.get("cpu_thread", 0) >= 3 and share("cpu_thread") >= 0.25:
+            add("warning", f"{cc['cpu_thread']} stutterów przy 100% jednego wątku CPU",
+                "Gra jest ograniczona jednym wątkiem (GPU niedociążone). Obniż ustawienia CPU-zależne, sprawdź procesy w tle.")
+        if st.get("background_procs"):
+            names = ", ".join(f"{k} ({v}x)" for k, v in st["background_procs"].items())
+            add("warning", "Procesy w tle obciążające CPU podczas stutterów", f"{names}. Zamknij je na czas grania lub wyłącz autostart.")
+        if cc.get("alt_tab", 0) >= 1:
+            add("info", f"{cc['alt_tab']} stutterów gdy gra nie była na pierwszym planie",
+                "Alt-Tab / nakładki / okna na wierzchu mogły wywołać przycięcia.")
+        if cc.get("dpc", 0) >= 3:
+            add("warning", f"{cc['dpc']} stutterów z wysokim DPC/przerwaniami",
+                "Podejrzany sterownik (sieć, audio, USB, RGB/Gigabyte). Zaktualizuj chipset/LAN/audio, wyłącz zbędne usługi producenta.")
+        if cc.get("thermal", 0) >= 1:
+            add("warning", f"{cc['thermal']} stutterów przy wysokiej temperaturze",
+                "CPU >90°C lub hotspot GPU >100°C - poprawa chłodzenia, krzywa wentylatorów, limit mocy/PBO.")
+        if cc.get("shader_or_unknown", 0) >= 0.5 * n_st and n_st >= 5:
+            add("info", "Większość stutterów bez przyczyny systemowej",
+                "Zwykle kompilacja shaderów lub streaming zasobów w grze. Pomaga: wstępna kompilacja shaderów, "
+                "aktualne sterowniki Adrenalin, gra na szybkim SSD, ReBAR/SAM włączony.")
+
+    if hw:
+        tc, th = hw.get("cpu_temp_max"), hw.get("gpu_hotspot_max")
+        if (tc and tc >= 95) or (th and th >= 105):
+            add("serious", "Temperatury na granicy throttlingu", f"CPU max {tc}°C, hotspot GPU max {th}°C. Sprawdź chłodzenie i przepływ powietrza.")
+        elif (tc and tc > 90) or (th and th > 100):
+            add("warning", "Wysokie temperatury", f"CPU max {tc}°C, hotspot GPU max {th}°C.")
+        vt, vp = hw.get("vram_total_mb"), hw.get("vram_peak_mb")
+        if vt and vp and vp / vt > 0.95:
+            add("warning", f"VRAM wykorzystany w {vp / vt * 100:.0f}% (szczyt {vp:.0f}/{vt:.0f} MB)", "Obniż jakość tekstur lub rozdzielczość.")
+        if (hw.get("ram_peak_pct") or 0) > 90:
+            add("warning", f"RAM do {hw['ram_peak_pct']}%", "Zamknij aplikacje w tle; sprawdź plik wymiany.")
+        if (hw.get("ui_ms_max") or 0) >= 2000 or (hw.get("dwm_ms_max") or 0) >= 2000:
+            add("critical", "Zawieszenie pulpitu/DWM podczas sesji",
+                f"ui_ms max {hw.get('ui_ms_max')}, dwm_ms max {hw.get('dwm_ms_max')} - szczegóły w incydentach.")
+    for inc in rep.get("incidents") or []:
+        if inc["kind"] in ("gpu_driver", "whea", "bsod"):
+            add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
+    if not f:
+        add("info", "Brak wykrytych problemów", "Sesja wygląda zdrowo.")
+    order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
+    f.sort(key=lambda x: order[x["severity"]])
+    return f
+
+
+# --------------------------------------------------------------------------
+# incidents / events
+# --------------------------------------------------------------------------
+
+def incidents_between(con, t0, t1, kinds=None, limit=500):
+    sql = "SELECT id, ts, end_ts, kind, severity, title, details FROM incidents WHERE ts BETWEEN ? AND ?"
+    args = [t0, t1]
+    if kinds:
+        kinds = [kinds] if isinstance(kinds, str) else list(kinds)
+        sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+        args += kinds
+    rows = _rows(con, sql + " ORDER BY ts LIMIT ?", args + [limit])
+    for r in rows:
+        r["details"] = _json(r["details"])
+        r["time"] = fmt_ts(r["ts"])
+    return rows
+
+
+def incidents(con, since, kinds=None):
+    t0 = parse_time(since) if not isinstance(since, (int, float)) else since
+    return incidents_between(con, t0, time.time() + 1, kinds)
+
+
+def events(con, since, level=None, grep=None, limit=200):
+    t0 = parse_time(since)
+    sql, args = "SELECT ts, log, provider, event_id, level, message FROM events WHERE ts>=?", [t0]
+    if level is not None:
+        sql += " AND level<=?"
+        args.append(int(level))
+    if grep:
+        sql += " AND (message LIKE ? OR provider LIKE ?)"
+        args += [f"%{grep}%", f"%{grep}%"]
+    rows = _rows(con, sql + " ORDER BY ts DESC LIMIT ?", args + [limit])
+    for r in rows:
+        r["time"] = fmt_ts(r["ts"])
+    return rows
+
+
+# --------------------------------------------------------------------------
+# range / moment
+# --------------------------------------------------------------------------
+
+def range_report(con, t0, t1):
+    t0, t1 = float(t0), float(t1)
+    n = con.execute("SELECT COUNT(*) FROM samples WHERE ts BETWEEN ? AND ?", (t0, t1)).fetchone()[0]
+    rep = {"from": fmt_ts(t0), "to": fmt_ts(t1), "duration_s": round(t1 - t0), "sample_count": n}
+    stats = {}
+    if n:
+        sel = ",".join(f"AVG({c}) AS a_{c}, MAX({c}) AS m_{c}" for c in KEY_COLS)
+        a = _one(con, f"SELECT {sel} FROM samples WHERE ts BETWEEN ? AND ?", (t0, t1))
+        step = max(1, math.ceil(n / 40000))
+        sub = _rows(con, f"SELECT {','.join(KEY_COLS)} FROM samples WHERE ts BETWEEN ? AND ? AND "
+                         f"CAST(ts AS INTEGER) % ? = 0", (t0, t1, step))
+        for c in KEY_COLS:
+            if a[f"m_{c}"] is None:
+                continue
+            stats[c] = {"avg": _r(a[f"a_{c}"], 2), "p95": _r(_pct([s[c] for s in sub], 0.95), 2), "max": _r(a[f"m_{c}"], 2)}
+        gaps = _rows(con, "SELECT ts, next_ts - ts AS gap FROM (SELECT ts, LEAD(ts) OVER (ORDER BY ts) AS next_ts "
+                          "FROM samples WHERE ts BETWEEN ? AND ?) WHERE gap > 10 ORDER BY gap DESC LIMIT 5", (t0, t1))
+        rep["data_gaps"] = [{"after": fmt_ts(g["ts"]), "gap_s": round(g["gap"])} for g in gaps]
+        fg = _rows(con, "SELECT fg_exe, COUNT(*) AS seconds FROM samples WHERE ts BETWEEN ? AND ? AND fg_exe IS NOT NULL "
+                        "GROUP BY fg_exe ORDER BY seconds DESC LIMIT 6", (t0, t1))
+        rep["foreground"] = fg
+    rep["stats"] = stats
+    rep["incidents"] = incidents_between(con, t0, t1)
+    rep["freezes"] = [i for i in rep["incidents"] if i["kind"] in ("ui_freeze", "dwm_stall", "app_not_responding")]
+    ev = _rows(con, "SELECT ts, provider, event_id, level, substr(message,1,300) AS message FROM events "
+                    "WHERE ts BETWEEN ? AND ? AND level<=2 ORDER BY ts LIMIT 100", (t0, t1))
+    for e in ev:
+        e["time"] = fmt_ts(e["ts"])
+    rep["events"] = ev
+    rep["top_procs"] = {
+        "cpu": _rows(con, "SELECT name, ROUND(AVG(cpu_pct),2) AS avg_cpu_pct, ROUND(MAX(cpu_pct),1) AS max_cpu_pct, "
+                          "COUNT(*) AS appearances FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? "
+                          "AND name NOT IN ('System Idle Process','Idle') GROUP BY name ORDER BY SUM(cpu_pct) DESC LIMIT 10",
+                     (t0, t1)),
+        "io": _rows(con, "SELECT name, ROUND(AVG(io_mbs),2) AS avg_io_mbs, ROUND(MAX(io_mbs),1) AS max_io_mbs, "
+                         "COUNT(*) AS appearances FROM procs WHERE kind='io' AND ts BETWEEN ? AND ? GROUP BY name "
+                         "ORDER BY SUM(io_mbs) DESC LIMIT 10", (t0, t1)),
+        "mem": _rows(con, "SELECT name, ROUND(AVG(mem_mb)) AS avg_mem_mb, ROUND(MAX(mem_mb)) AS max_mem_mb "
+                          "FROM procs WHERE kind='mem' AND ts BETWEEN ? AND ? GROUP BY name ORDER BY AVG(mem_mb) DESC LIMIT 8",
+                     (t0, t1)),
+    }
+    rep["sessions"] = [_flatten_session(r) for r in _rows(
+        con, "SELECT * FROM sessions WHERE start_ts<=? AND COALESCE(end_ts, ?)>=? ORDER BY start_ts", (t1, t1, t0))]
+    return rep
+
+
+MOMENT_COLS = ["cpu_total", "cpu_core_max", "cpu_clock_mhz", "cpu_temp", "gpu_load", "gpu_clock_mhz", "gpu_temp",
+               "gpu_hotspot", "gpu_vram_mb", "ram_pct", "commit_gb", "hard_faults_s", "disk_lat_ms", "disk_lat_disk",
+               "disk_busy_pct", "dpc_pct", "interrupt_pct", "ui_ms", "dwm_ms", "fg_exe", "fg_hung", "user_idle_s",
+               "game_session"]
+
+
+def moment(con, ts, window=30):
+    ts, window = float(ts), float(window)
+    t0, t1 = ts - window, ts + window
+    rows = _rows(con, f"SELECT ts, {','.join(MOMENT_COLS)} FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (t0, t1))
+    for r in rows:
+        r["time"] = fmt_ts(r["ts"])
+        r["t_rel"] = _r(r["ts"] - ts, 0)
+        for k, v in r.items():
+            if isinstance(v, float) and k not in ("ts",):
+                r[k] = _r(v, 1)
+    procs = _rows(con, "SELECT ts, kind, name, pid, ROUND(cpu_pct,1) AS cpu_pct, ROUND(mem_mb) AS mem_mb, "
+                       "ROUND(io_mbs,1) AS io_mbs FROM procs WHERE ts BETWEEN ? AND ? ORDER BY ts, kind", (t0, t1))
+    for p in procs:
+        p["time"] = fmt_ts(p["ts"])
+    evs = _rows(con, "SELECT ts, log, provider, event_id, level, substr(message,1,400) AS message FROM events "
+                     "WHERE ts BETWEEN ? AND ? ORDER BY ts", (t0, t1))
+    for e in evs:
+        e["time"] = fmt_ts(e["ts"])
+    prev = _one(con, "SELECT ts FROM samples WHERE ts<? ORDER BY ts DESC LIMIT 1", (t0,))
+    nxt = _one(con, "SELECT ts FROM samples WHERE ts>? ORDER BY ts LIMIT 1", (t1,))
+    return {"at": fmt_ts(ts), "window_s": window, "samples": rows, "procs": procs, "events": evs,
+            "incidents": incidents_between(con, t0, t1),
+            "sample_gap_note": None if rows else "Brak próbek w tym oknie (kolektor nie działał - np. komputer był wyłączony).",
+            "nearest_sample_before": fmt_ts(prev["ts"]) if prev else None,
+            "nearest_sample_after": fmt_ts(nxt["ts"]) if nxt else None}
+
+
+# --------------------------------------------------------------------------
+# health / diagnosis
+# --------------------------------------------------------------------------
+
+_KV = re.compile(r"(\w+)=([^;\]]*)")
+
+
+def parse_kernel_power_41(message):
+    """Extract the structured fields appended to the message as [Name=val; ...]."""
+    m = re.search(r"\[([^\]]*BugcheckCode[^\]]*)\]", message or "")
+    if not m:
+        return {}
+    d = {k: v.strip() for k, v in _KV.findall(m.group(1))}
+    out = {"raw": d}
+    try:
+        code = int(d.get("BugcheckCode", "0"), 0)
+    except ValueError:
+        code = None
+    sleep = d.get("SleepInProgress")
+    pb = d.get("PowerButtonTimestamp", "0")
+    out["bugcheck_code"] = code
+    out["sleep_in_progress"] = sleep
+    out["power_button_ts"] = pb
+    notes = []
+    if code == 0:
+        notes.append("BugcheckCode=0: brak BSOD - zasilanie ucięte/twardy reset/natychmiastowy restart bez zrzutu "
+                     "(zawieszenie sprzętu, zasilacz/VRM, niestabilny RAM/EXPO, ręczny reset)")
+    elif code:
+        notes.append(f"BugcheckCode=0x{code:X}: był blue screen")
+    if sleep not in (None, "0"):
+        notes.append(f"SleepInProgress={sleep}: zdarzyło się w trakcie przejścia w uśpienie/hibernację/zamykanie systemu")
+    if pb not in (None, "0", "") and not re.fullmatch(r"0+", pb):
+        notes.append("PowerButtonTimestamp != 0: system zarejestrował wciśnięcie przycisku zasilania (użytkownik wyłączył "
+                     "zawieszony komputer długim przytrzymaniem?)")
+    out["interpretation"] = notes
+    out["during_shutdown"] = sleep not in (None, "0", "")
+    return out
+
+
+def _unclean_shutdowns(con, t0):
+    rows = _rows(con, "SELECT id, ts, kind, title, details FROM incidents WHERE kind='unclean_shutdown' AND ts>=? ORDER BY ts", (t0,))
+    out = []
+    for r in rows:
+        det = _json(r["details"]) or {}
+        msg = det.get("message", "") if isinstance(det, dict) else ""
+        info = {"id": r["id"], "ts": r["ts"], "time": fmt_ts(r["ts"]), "source": f"{det.get('provider')} {det.get('event_id')}"
+                if isinstance(det, dict) else None}
+        if msg:
+            info["message"] = msg[:300]
+        info.update(parse_kernel_power_41(msg))
+        # data before the event: when did we last see samples, what happened right before
+        last = _one(con, "SELECT ts, cpu_temp, gpu_hotspot, gpu_load, ram_pct, fg_exe, ui_ms, dwm_ms FROM samples "
+                         "WHERE ts<? AND ts>? ORDER BY ts DESC LIMIT 1", (r["ts"], r["ts"] - 6 * 3600))
+        if last:
+            last = {k: (_r(v) if isinstance(v, float) else v) for k, v in last.items()}
+            last["time"] = fmt_ts(last["ts"])
+            info["last_sample_before"] = last
+        out.append(info)
+    # Kernel-Power 41 and EventLog 6008 usually both exist for the same crash; merge entries within 10 min
+    merged = []
+    for u in out:
+        if merged and u["ts"] - merged[-1]["ts"] < 600:
+            if "bugcheck_code" in u and "bugcheck_code" not in merged[-1]:
+                u["also"] = merged[-1].get("source")
+                merged[-1] = u
+            continue
+        merged.append(u)
+    return merged
+
+
+def health_overview(con, days=14):
+    t0 = time.time() - float(days) * 86400
+    by_kind = {r["kind"]: r["n"] for r in con.execute(
+        "SELECT kind, COUNT(*) AS n FROM incidents WHERE ts>=? GROUP BY kind ORDER BY n DESC", (t0,))}
+    per_day = defaultdict(dict)
+    for r in con.execute("SELECT date(ts,'unixepoch','localtime') AS d, kind, COUNT(*) AS n FROM incidents "
+                         "WHERE ts>=? GROUP BY d, kind", (t0,)):
+        per_day[r["d"]][r["kind"]] = r["n"]
+    unclean = _unclean_shutdowns(con, t0)
+    crashes = _rows(con, "SELECT kind, title, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM incidents "
+                         "WHERE kind IN ('app_crash','app_hang') AND ts>=? GROUP BY kind, title ORDER BY n DESC LIMIT 15", (t0,))
+    for c in crashes:
+        c["first"], c["last"] = fmt_ts(c.pop("first_ts")), fmt_ts(c.pop("last_ts"))
+        c["app"] = c["title"].split(":", 1)[-1].strip()
+    cfg = incidents_between(con, t0, time.time(), kinds="config_change")
+    for c in cfg:
+        d = c.get("details")
+        c["changed"] = list(d.keys()) if isinstance(d, dict) else None
+    freezes = incidents_between(con, t0, time.time(), kinds=["ui_freeze", "dwm_stall", "app_not_responding"])
+    cov = _one(con, "SELECT MIN(ts) AS first, MAX(ts) AS last, COUNT(*) AS n FROM samples")
+    rep = {
+        "days": days, "since": fmt_ts(t0), "incidents_by_kind": by_kind,
+        "incidents_per_day": {d: per_day[d] for d in sorted(per_day)},
+        "unclean_shutdowns": unclean, "recurring_crashes": crashes, "config_changes": cfg,
+        "freezes": [{"time": f["time"], "kind": f["kind"], "title": f["title"],
+                     "duration_s": _r(f["end_ts"] - f["ts"]) if f["end_ts"] else None} for f in freezes],
+        "sample_coverage": {"first": fmt_ts(cov["first"]), "last": fmt_ts(cov["last"]), "samples": cov["n"]} if cov and cov["n"] else None,
+    }
+    rep["findings"] = diagnose(rep, con, t0)
+    return rep
+
+
+def diagnose(rep, con=None, t0=None):
+    """Pattern-based findings across the health overview (Polish)."""
+    f = []
+    add = lambda sev, title, detail: f.append({"severity": sev, "title": title, "detail": detail})
+    un = rep["unclean_shutdowns"]
+    bk = rep["incidents_by_kind"]
+    if un:
+        no_bsod = [u for u in un if u.get("bugcheck_code") == 0]
+        shut = [u for u in un if u.get("during_shutdown")]
+        pb = [u for u in un if u.get("power_button_ts") not in (None, "0", "") and not re.fullmatch(r"0+", u.get("power_button_ts", "0"))]
+        sev = "critical" if len(un) >= 3 else "serious"
+        add(sev, f"{len(un)} nieoczekiwanych wyłączeń/twardych resetów w ostatnich {rep['days']} dniach",
+            f"W tym {len(no_bsod)} bez BSOD (BugcheckCode=0), {len(shut)} w trakcie zamykania/uśpienia, "
+            f"{len(pb)} z wciśniętym przyciskiem zasilania. Ostatni: {un[-1]['time']}.")
+        if len(no_bsod) >= 2:
+            add("critical", "Powtarzające się resety bez blue screena",
+                "BugcheckCode=0 oznacza, że Windows nie zdążył zapisać błędu: kandydaci to zawieszenie GPU/sterownika "
+                "(potem ręczny reset), niestabilny RAM (EXPO 5200 na B650 - spróbuj niższego taktowania/większych napięć SoC), "
+                "zasilacz, VRM/płyta, przegrzanie. Kroki: wyłącz EXPO na test, zaktualizuj BIOS (AGESA) i sterowniki Adrenalin/chipset, "
+                "wyłącz iGPU, usuń Gigabyte EasyTune/AORUS LCD, przetestuj RAM (MemTest86), sprawdź zasilacz.")
+        if len(shut) >= 2 and len(shut) >= 0.4 * len(un):
+            add("serious", "Wiele resetów podczas zamykania/hibernacji",
+                "Problem występuje przy przejściu stanu zasilania: wyłącz Szybkie uruchamianie (Fast Startup), "
+                "sprawdź usługi/aplikacje blokujące zamknięcie (steam.exe, Gigabyte), zaktualizuj BIOS i sterowniki chipsetu, "
+                "sprawdź zdarzenia 1074/10001 tuż przed resetem.")
+    fz = rep["freezes"]
+    if fz:
+        kinds = Counter(x["kind"] for x in fz)
+        add("serious", f"{len(fz)} zawieszeń pulpitu/aplikacji zarejestrowanych przez kolektor",
+            ", ".join(f"{k}={v}" for k, v in kinds.items()) + ". Użyj `pm at <czas>` żeby zobaczyć stan systemu tuż przed. "
+            "Jeśli system dalej żyje (zamykanie przyciskiem działało) to problem w trybie użytkownika/stosie grafiki "
+            "(sterownik GPU, DWM, nakładki), nie w jądrze.")
+    for c in rep["recurring_crashes"]:
+        if c["n"] >= 3:
+            add("warning", f"{c['app']} {('crashuje' if c['kind'] == 'app_crash' else 'wiesza się')} {c['n']}x",
+                f"Od {c['first']} do {c['last']}. " + (
+                    "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
+                    else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
+    for k, desc in (("whea", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
+                    ("gpu_driver", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
+                    ("bsod", "Blue screeny - sprawdź kod w zdarzeniach BugCheck."),
+                    ("disk", "Błędy dysku - sprawdź SMART (CrystalDiskInfo) i kable/slot."),
+                    ("low_memory", "Kończyła się pamięć wirtualna - zwiększ plik wymiany/zamknij aplikacje."),
+                    ("throttle", "Throttling CPU - sprawdź chłodzenie i zasilanie VRM.")):
+        if bk.get(k):
+            add("critical" if k in ("whea", "bsod") else "serious" if k in ("gpu_driver", "disk", "low_memory") else "warning",
+                f"{bk[k]}x {k}", desc)
+    cfg = rep["config_changes"]
+    if cfg and un:
+        first_bad = min(u["ts"] for u in un)
+        near = [c for c in cfg if 0 <= first_bad - c["ts"] <= 3 * 86400]
+        if near:
+            add("info", "Zmiana konfiguracji tuż przed pierwszym resetem",
+                "; ".join(f"{c['time']}: {', '.join(c.get('changed') or [])}" for c in near[:3]) +
+                ". Porównaj z `pm sysinfo --diff` (sterowniki/BIOS/ustawienia).")
+    if not f:
+        f.append({"severity": "info", "title": "Brak istotnych incydentów", "detail": f"W ostatnich {rep['days']} dniach nic niepokojącego."})
+    order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
+    f.sort(key=lambda x: order[x["severity"]])
+    return f
+
+
+# --------------------------------------------------------------------------
+# comparisons across periods / drivers / game versions
+# --------------------------------------------------------------------------
+
+def _session_metrics(con, exe=None, since=None):
+    """One dict per finished-or-running session with fps/stutter/bound metrics (oldest first)."""
+    t0 = parse_time(since) if since is not None else 0
+    sql, args = "SELECT * FROM sessions WHERE start_ts>=?", [t0]
+    if exe:
+        sql += " AND lower(exe)=lower(?)"
+        args.append(exe)
+    rows = _rows(con, sql + " ORDER BY start_ts", args)
+    if not rows:
+        return []
+    ids = [r["id"] for r in rows]
+    q = ",".join("?" * len(ids))
+    fr = {r["session"]: r for r in con.execute(
+        f"SELECT session, SUM(frames) AS nf, SUM(frames/fps) AS secs, COUNT(*) AS n, "
+        f"SUM(bound='GPU') AS g, SUM(bound='CPU') AS c, SUM(bound='limit') AS l, "
+        f"AVG(ft_p99) AS p99 FROM frames WHERE fps>0 AND session IN ({q}) GROUP BY session", ids)}
+    st = {r["session"]: r["n"] for r in con.execute(
+        f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
+    out = []
+    for r in rows:
+        f = _flatten_session(r)
+        end = r["end_ts"] or time.time()
+        minutes = max(0.0, (end - r["start_ts"]) / 60)
+        x = fr.get(r["id"])
+        fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("fps_avg")
+        low1 = f.get("fps_1low")
+        if low1 is None and x and x["p99"]:
+            low1 = 1000 / x["p99"]
+        ctx = _ctx(r)
+        out.append({
+            "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": r["end_ts"], "minutes": _r(minutes),
+            "fps_avg": _r(fps), "fps_1low": _r(low1), "fps_01low": f.get("fps_01low"),
+            "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
+            "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
+            "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
+            "_g": x["g"] if x else 0, "_c": x["c"] if x else 0, "_l": x["l"] if x else 0, "_n": x["n"] if x else 0,
+            "_secs": x["secs"] if x else 0,
+        })
+    return out
+
+
+def session_points(con, exe=None, since=None):
+    return [{"id": s["id"], "exe": s["exe"], "start_ts": s["start_ts"], "time": fmt_ts(s["start_ts"]),
+             "minutes": s["minutes"], "fps_avg": s["fps_avg"], "fps_1low": s["fps_1low"], "fps_01low": s["fps_01low"],
+             "stutters_per_min": s["stutters_per_min"], "gpu_driver": s["gpu_driver"], "game_version": s["game_version"]}
+            for s in _session_metrics(con, exe, since)]
+
+
+def compare(con, exe=None, group_by="week", since=None):
+    """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe."""
+    if group_by not in ("week", "day", "month", "driver", "game_version", "session"):
+        raise ValueError("group_by must be week|day|month|driver|game_version|session")
+    groups = {}
+    for s in _session_metrics(con, exe, since):
+        d = datetime.fromtimestamp(s["start_ts"])
+        key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
+               "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
+               "session": f"#{s['id']}"}[group_by]
+        groups.setdefault((s["exe"], key), []).append(s)
+    rows = []
+    for (e, key), ss in groups.items():
+        mins = sum(s["minutes"] or 0 for s in ss)
+        secs = sum(s["_secs"] for s in ss)
+        nf = sum(s["fps_avg"] * s["_secs"] for s in ss if s["fps_avg"] and s["_secs"])
+        fps = nf / secs if secs else None
+        lw = [(s["fps_1low"], s["minutes"] or 0) for s in ss if s["fps_1low"]]
+        low1 = sum(v * w for v, w in lw) / sum(w for _, w in lw) if lw and sum(w for _, w in lw) else None
+        nb = sum(s["_g"] + s["_c"] + s["_l"] for s in ss)
+        rows.append({
+            "exe": e, "group": key, "from": min(s["start_ts"] for s in ss),
+            "to": max((s["end_ts"] or s["start_ts"]) for s in ss),
+            "sessions": len(ss), "minutes": _r(mins), "fps_avg": _r(fps), "fps_1low": _r(low1),
+            "stutters_per_min": _r(sum(s["stutters"] for s in ss) / mins, 2) if mins > 0.5 else None,
+            "gpu_bound_pct": _r(100 * sum(s["_g"] for s in ss) / nb) if nb else None,
+            "cpu_bound_pct": _r(100 * sum(s["_c"] for s in ss) / nb) if nb else None,
+            "limit_pct": _r(100 * sum(s["_l"] for s in ss) / nb) if nb else None,
+            "drivers": sorted({s["gpu_driver"] for s in ss if s["gpu_driver"]}),
+            "game_versions": sorted({s["game_version"] for s in ss if s["game_version"]}),
+            "session_ids": [s["id"] for s in ss],
+        })
+    rows.sort(key=lambda r: (r["exe"] or "", r["from"]))
+    prev = {}
+    for r in rows:
+        p = prev.get(r["exe"])
+        for k in ("fps_avg", "fps_1low"):
+            r[f"{k}_delta_pct"] = _r(100 * (r[k] - p[k]) / p[k]) if p and p.get(k) and r.get(k) else None
+        prev[r["exe"]] = r
+        r["from_time"], r["to_time"] = fmt_ts(r["from"]), fmt_ts(r["to"])
+    return rows
+
+
+def timeline_markers(con, exe=None, since=None):
+    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions."""
+    t0 = parse_time(since) if since is not None else 0
+    ss = _session_metrics(con, None, None)   # full history so the first in-range change is detected
+    markers = []
+
+    def walk(items, field, kind, label):
+        last = None
+        for s in items:
+            v = field(s)
+            if v and last is not None and v != last and s["start_ts"] >= t0:
+                markers.append({"ts": s["start_ts"], "kind": kind, "label": label(last, v, s), "session": s["id"]})
+            if v:
+                last = v
+
+    walk(ss, lambda s: _driver(s["ctx"]), "driver", lambda a, b, s: f"Sterownik GPU {a} -> {b}")
+    walk(ss, lambda s: s["ctx"].get("os_build"), "os", lambda a, b, s: f"Windows {a} -> {b}")
+    walk(ss, lambda s: s["ctx"].get("bios"), "bios", lambda a, b, s: f"BIOS {a} -> {b}")
+    for e in {s["exe"] for s in ss if not exe or (s["exe"] or "").lower() == exe.lower()}:
+        mine = [s for s in ss if s["exe"] == e]
+        walk(mine, lambda s: s["ctx"].get("game_version"), "game_update", lambda a, b, s, e=e: f"{e}: wersja {a} -> {b}")
+        last_bid = None
+        for s in mine:
+            st = s["ctx"].get("steam") or {}
+            bid = st.get("buildid")
+            if bid and last_bid is not None and bid != last_bid:
+                ts = st.get("last_updated") or s["start_ts"]
+                if ts >= t0:
+                    markers.append({"ts": ts, "kind": "game_update", "label": f"{e}: Steam build {last_bid} -> {bid}",
+                                    "session": s["id"]})
+            if bid:
+                last_bid = bid
+    for i in incidents_between(con, t0, time.time(), kinds="config_change"):
+        markers.append({"ts": i["ts"], "kind": "config", "label": i["title"], "session": None})
+    markers.sort(key=lambda m: m["ts"])
+    for m in markers:
+        m["time"] = fmt_ts(m["ts"])
+    return markers
+
+
+# --------------------------------------------------------------------------
+# time series for charts
+# --------------------------------------------------------------------------
+
+def series(con, t0, t1, cols, max_points=1500):
+    t0, t1 = float(t0), float(t1)
+    valid = set(_table_cols(con, "samples")) - TEXT_SAMPLE_COLS - {"ts"}
+    cols = [c for c in cols if c in valid]
+    if not cols:
+        return {"ts": []}
+    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
+    sel = ",".join(f"{'MAX' if c in MAX_AGG_SAMPLE else 'AVG'}({c}) AS {c}" for c in cols)
+    rows = con.execute(f"SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, {sel} FROM samples "
+                       f"WHERE ts BETWEEN ? AND ? GROUP BY b ORDER BY b", (t0, step, t0, t1)).fetchall()
+    out = {"ts": [r["ts"] for r in rows], "step_s": step}
+    for c in cols:
+        out[c] = [_r(r[c], 2) for r in rows]
+    return out
+
+
+def frame_series(con, t0, t1, session=None, max_points=1500):
+    t0, t1 = float(t0), float(t1)
+    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
+    sel = ",".join(f"{expr} AS {name}" for name, expr in FRAME_AGG.items())
+    sql = (f"SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, {sel} FROM frames WHERE ts BETWEEN ? AND ?")
+    args = [t0, step, t0, t1]
+    if session is not None:
+        sql += " AND session=?"
+        args.append(int(session))
+    rows = con.execute(sql + " GROUP BY b ORDER BY b", args).fetchall()
+    out = {"ts": [r["ts"] for r in rows], "step_s": step}
+    for name in FRAME_AGG:
+        out[name] = [_r(r[name], 2) for r in rows]
+    return out

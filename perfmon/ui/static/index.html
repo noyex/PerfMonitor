@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>PerfMonitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/vendor/uPlot.min.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">PerfMonitor</div>
+    <nav>
+      <a href="#/now">Teraz</a>
+      <a href="#/timeline">Oś czasu</a>
+      <a href="#/games">Gry</a>
+      <a href="#/compare">Porównania</a>
+      <a href="#/problems">Problemy</a>
+    </nav>
+    <div class="status"><span class="dot" id="st-dot"></span><span id="st-text">…</span></div>
+  </header>
+  <main id="view"></main>
+  <div class="toast" id="toast"></div>
+  <script src="/vendor/uPlot.iife.min.js"></script>
+  <script src="/lib.js"></script>
+  <script src="/pages/now.js"></script>
+  <script src="/pages/timeline.js"></script>
+  <script src="/pages/games.js"></script>
+  <script src="/pages/compare.js"></script>
+  <script src="/pages/problems.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
