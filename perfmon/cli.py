@@ -336,6 +336,14 @@ def cmd_config(con, a):
     out(f"- **DB_PATH**: {config.DB_PATH}")
 
 
+def cmd_collector(con, a):
+    """Ask the running (elevated) collector to restart itself - no UAC needed."""
+    flag = config.DATA_DIR / "reload.request"
+    flag.touch()
+    out(f"Zlecono przeładowanie kolektora ({flag}). Kolektor sprawdza flagę co 5 s; "
+        "w trakcie sesji gry przeładowanie czeka na jej koniec. Sprawdź: pm status")
+
+
 def build():
     p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
@@ -379,6 +387,7 @@ def build():
     s.add_argument("--exe")
     s.add_argument("--since", default="180d")
     add("config", cmd_config)
+    add("collector", cmd_collector, help="restart the running collector").add_argument("action", choices=["reload"])
     return p
 
 

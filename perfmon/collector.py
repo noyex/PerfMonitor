@@ -5,9 +5,12 @@ import logging
 import logging.handlers
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
+from pathlib import Path
 
 import psutil
 
@@ -32,6 +35,16 @@ INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUE
 
 FREEZE_MS = 2000      # shell/DWM unresponsive this long = freeze incident
 TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
+
+SRC_DIR = Path(__file__).resolve().parent
+RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
+RELOAD_CHECK_S = 5
+MUTEX_NAME = os.environ.get("PERFMON_MUTEX", "Global\\PerfMonitorCollector")   # env override: tests
+
+
+def source_stamp():
+    """Newest mtime of the collector's modules (ui/ is not imported by the collector)."""
+    return max(p.stat().st_mtime for p in SRC_DIR.glob("*.py"))
 
 
 def is_admin():
@@ -62,6 +75,10 @@ class Collector:
         self.games = {}                # pid -> dict(session, capture, exe)
         self.open_incidents = {}       # kind -> incident id (for ongoing freezes/temps)
         self.cores = psutil.cpu_percent(percpu=True)
+        self.reload = False            # set when the loop exits to hand over to a new instance
+        self.src_stamp = source_stamp()
+        self.last_reload_check = time.time()
+        self.reload_deferred_logged = False
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -363,6 +380,48 @@ class Collector:
             if changed:
                 self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)
 
+    # ---------- self reload ----------
+    def check_reload(self, now):
+        """Hand over to a fresh instance when perfmon/*.py changed or a reload was requested.
+
+        The new process inherits our elevation, so code changes never need a UAC prompt."""
+        if now - self.last_reload_check < RELOAD_CHECK_S:
+            return
+        self.last_reload_check = now
+        requested = RELOAD_FLAG.exists()
+        stamp = source_stamp()
+        if stamp == self.src_stamp and not requested:
+            return
+        if not requested and now - stamp < 3:
+            return  # files may still be mid-save
+        if self.games:
+            # Restarting would split the game session and its frame capture in two
+            if not self.reload_deferred_logged:
+                log.info("reload pending, deferred until the game session ends")
+                self.reload_deferred_logged = True
+            return
+        self.src_stamp = stamp
+        RELOAD_FLAG.unlink(missing_ok=True)
+        err = self._import_check()
+        if err:
+            log.error("reload aborted, new code does not import:\n%s", err)
+            return
+        log.info("reloading collector (%s)", "requested" if requested else "source changed")
+        self.reload = True
+        self.running = False
+
+    @staticmethod
+    def _import_check():
+        """Import the new code in a throwaway interpreter; returns the error text or None."""
+        try:
+            r = subprocess.run([sys.executable.replace("pythonw.exe", "python.exe"), "-c",
+                                "import perfmon.collector, perfmon.analyze"],
+                               cwd=str(SRC_DIR.parent), capture_output=True, text=True, timeout=120,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            return None if r.returncode == 0 else (r.stderr or r.stdout)[-3000:]
+        except Exception as e:
+            return str(e)
+
     # ---------- main loop ----------
     def run(self):
         self.on_start()
@@ -384,6 +443,7 @@ class Collector:
                     self.last_events = now
                     self.poll_events()
                 self.housekeeping(now)
+                self.check_reload(now)
             except Exception:
                 log.exception("loop error")
             nxt += interval
@@ -413,16 +473,47 @@ def setup_logging():
         root.addHandler(logging.StreamHandler())
 
 
-def single_instance():
-    """Named mutex so the scheduled task and a manual run never collect twice."""
-    k = ctypes.windll.kernel32
-    k.CreateMutexW(None, False, "Global\\PerfMonitorCollector")
-    return k.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype = wintypes.HANDLE
+_k32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+_k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+
+def single_instance(wait_s=0.0):
+    """Named mutex so the scheduled task and a manual run never collect twice.
+
+    Returns the mutex handle, or None if another collector holds it after wait_s seconds
+    (a reloaded instance waits for its predecessor to exit)."""
+    deadline = time.time() + wait_s
+    while True:
+        h = _k32.CreateMutexW(None, False, MUTEX_NAME)
+        if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+            return h
+        _k32.CloseHandle(h)
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
+def spawn_successor():
+    """Start a new collector that takes over once we exit; it inherits our token (elevation)."""
+    args = [sys.executable, "-m", "perfmon.collector", "--wait-mutex"]
+    base = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    for flags in (base | subprocess.CREATE_BREAKAWAY_FROM_JOB, base):
+        try:
+            subprocess.Popen(args, cwd=str(SRC_DIR.parent), creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            continue  # breakaway is denied when our job object does not allow it
+    log.error("could not start the successor collector")
+    return False
 
 
 def main():
     setup_logging()
-    if not single_instance():
+    mutex = single_instance(90 if "--wait-mutex" in sys.argv else 0)
+    if not mutex:
         log.info("collector already running, exiting")
         return
     c = Collector()
@@ -432,6 +523,10 @@ def main():
     if duration:
         threading.Timer(duration, lambda: setattr(c, "running", False)).start()
     c.run()
+    if c.reload:
+        c.con.close()
+        _k32.CloseHandle(mutex)
+        spawn_successor()
 
 
 if __name__ == "__main__":

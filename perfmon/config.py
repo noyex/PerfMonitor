@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or ROOT / "data")   # env override: tests
 DB_PATH = DATA_DIR / "perf.db"
 LOG_PATH = DATA_DIR / "collector.log"
 CONFIG_PATH = DATA_DIR / "config.json"
