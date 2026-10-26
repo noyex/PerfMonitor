@@ -117,8 +117,20 @@ const markersPlugin = (getMarkers) => ({
 
 const syncKey = "pm";
 
+// 24 h Polish tick labels (uPlot defaults to US "9:20pm" + "10/18/26").
+const timeTicks = (u, vals) => {
+  const span = u.scales.x.max - u.scales.x.min;
+  return vals.map((v) => {
+    const d = new Date(v * 1000);
+    const day = `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
+    if (span > 3 * 86400) return day;
+    const t = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return span > 86400 ? `${day} ${t}` : t;
+  });
+};
+
 /**
- * chart(container, {title, unit, decimals, series:[{label, color?}], height, markers:()=>[], yMin, yMax, onSelect})
+ * chart(container, {title, unit, decimals, series:[{label, color?}], height, markers:()=>[], yMin, yMax, onSelect, xRange:[t0,t1]})
  * data = [xs, ys1, ys2...]. Returns {u, setData(data)}.
  * Single series: no legend, title names it; hover readout shows the value. 2+ series: swatch legend with values.
  */
@@ -169,12 +181,13 @@ const chart = (container, opt, data) => {
         y: false,
       },
       scales: {
-        x: { time: true },
+        // xRange pins every chart of a page to the same window, even when a series covers only part of it
+        x: opt.xRange ? { time: true, range: () => opt.xRange } : { time: true },
         y: { range: (u, mn, mx) => [opt.yMin ?? Math.min(0, mn ?? 0), opt.yMax ?? Math.max((mx ?? 1) * 1.08, opt.yFloor ?? 1)] },
       },
       axes: [
-        { ...axis, space: 70 },
-        { ...axis, size: 44, values: (u, vals) => vals.map((v) => fmt(v, opt.decimals && v < 10 ? 1 : 0)) },
+        { ...axis, space: 70, values: timeTicks },
+        { ...axis, size: 44, values: (u, vals) => vals.map((v) => (v === 0 ? "0" : fmt(v, opt.decimals && v < 10 ? 1 : 0))) },
       ],
       series: [
         {},

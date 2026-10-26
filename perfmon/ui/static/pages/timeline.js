@@ -66,11 +66,12 @@ Pages.timeline = (() => {
       charts = [];
       wrap.innerHTML = "";
       const hasFrames = (f.ts || []).length > 0;
-      if (hasFrames) charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: long }, cols(f, ["fps"])));
+      const xRange = [t0, t1];
+      if (hasFrames) charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: long, xRange }, cols(f, ["fps"])));
       if (!(s.ts || []).length) {
         wrap.append(h("div", { class: "empty" }, "Brak danych w tym okresie"));
       } else {
-        for (const d of DEFS) charts.push(chart(wrap, { ...d, height: 130, markers, onSelect: zoom, longRange: long }, cols(s, d.keys)));
+        for (const d of DEFS) charts.push(chart(wrap, { ...d, height: 130, markers, onSelect: zoom, longRange: long, xRange }, cols(s, d.keys)));
       }
 
       list.innerHTML = "";
