@@ -99,6 +99,20 @@ class EventReader:
         return out
 
 
+_APPNAME = re.compile(r"\bAppName=([^;\]]+)")
+_EXE = re.compile(r"([^\s:,\"'\[\]]+\.exe)\b", re.I)
+
+
+def exe_from_message(m: str) -> str:
+    """Faulting/hung exe from a WER 1000/1002 message, independent of the system language
+    ("Faulting application name: x.exe, ..." / "Nazwa aplikacji powodującej błąd: x.exe, ...")."""
+    s = _APPNAME.search(m or "")
+    if s and s.group(1).strip():
+        return s.group(1).strip()
+    s = _EXE.search(m or "")
+    return s.group(1) if s else "?"
+
+
 def classify(ev: dict):
     """Returns (kind, severity, title) if the event is an incident, otherwise None."""
     p, i, m = ev["provider"], ev["event_id"], ev["message"] or ""
@@ -113,17 +127,15 @@ def classify(ev: dict):
     if (p == "Display" and i == 4101) or p.lower() in ("amdkmdag", "amdkmdap", "nvlddmkm"):
         return "gpu_driver", "serious", f"Problem sterownika GPU: {p} {i}"
     if i == 1000 and p == "Application Error":
-        exe = m.split(",")[0].split(":")[-1].strip() if m else "?"
-        return "app_crash", "serious", f"Crash aplikacji: {exe}"
+        return "app_crash", "serious", f"Crash aplikacji: {exe_from_message(m)}"
     if i == 1002 and p == "Application Hang":
-        exe = re.search(r"(\S+\.exe)", m)
-        return "app_hang", "serious", f"Aplikacja przestała odpowiadać: {exe.group(1) if exe else '?'}"
+        return "app_hang", "serious", f"Aplikacja przestała odpowiadać: {exe_from_message(m)}"
     if p == "Microsoft-Windows-Kernel-Processor-Power" and i == 37:
         return "throttle", "warning", "Firmware ograniczył taktowanie CPU (throttling)"
     if p in ("disk", "Ntfs", "stornvme", "storahci", "volmgr", "Microsoft-Windows-Ntfs") and ev["level"] <= 3:
         return "disk", "serious", f"Błąd/ostrzeżenie dysku: {p} {i}"
     if p == "Microsoft-Windows-Resource-Exhaustion-Detector":
         return "low_memory", "serious", "Windows: kończy się pamięć wirtualna"
-    if p == "Microsoft-Windows-Kernel-PnP" and i in (219,) or (p == "Microsoft-Windows-USB-USBHUB3" and ev["level"] <= 2):
+    if (p == "Microsoft-Windows-Kernel-PnP" and i == 219) or (p == "Microsoft-Windows-USB-USBHUB3" and ev["level"] <= 2):
         return "device", "warning", f"Problem urządzenia: {p} {i}"
     return None
