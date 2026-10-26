@@ -153,14 +153,37 @@ def _driver(ctx):
     return ctx.get("adrenalin") or ctx.get("gpu_driver")
 
 
-def _flatten_session(r, stutters=None):
+def _eff_ends(con, rows):
+    """{session id: effective end ts}. None = still running (end_ts NULL). Sessions with end_ts <= start_ts
+    (collector crash / hard reset) get the last frames/samples ts of the session, else start_ts."""
+    ends, broken = {}, []
+    for r in rows:
+        e = r["end_ts"]
+        if e is None:
+            ends[r["id"]] = None
+        elif r["start_ts"] is not None and e <= r["start_ts"]:
+            broken.append(r)
+        else:
+            ends[r["id"]] = e
+    for r in broken:  # few; frames PK (session, ts) and samples PK (ts) keep these cheap
+        sid, st = r["id"], r["start_ts"]
+        nxt = con.execute("SELECT MIN(start_ts) FROM sessions WHERE start_ts>?", (st,)).fetchone()[0] or time.time()
+        f = con.execute("SELECT MAX(ts) FROM frames WHERE session=?", (sid,)).fetchone()[0]
+        s = con.execute("SELECT MAX(ts) FROM samples WHERE game_session=? AND ts>=? AND ts<=?", (sid, st, nxt)).fetchone()[0]
+        ends[sid] = max(st, f or st, s or st)
+    return ends
+
+
+def _flatten_session(r, stutters=None, ends=None):
     summ = _json(r.get("summary")) or {}
-    end = r["end_ts"] if r["end_ts"] else None
+    running = r["end_ts"] is None
+    end = ends.get(r["id"]) if ends else r["end_ts"]
+    estimated = bool(end and r["end_ts"] is not None and end != r["end_ts"])
     d = {
-        "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": r["end_ts"],
-        "end_reason": r["end_reason"],
+        "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": end if r["end_ts"] is not None else None,
+        "end_reason": r["end_reason"], "end_estimated": estimated,
         "duration_s": round((end or time.time()) - r["start_ts"]) if r["start_ts"] else None,
-        "running": r["end_ts"] is None,
+        "running": running,
     }
     for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error"):
         d[k] = summ.get(k)
@@ -181,7 +204,8 @@ def sessions(con, limit=20):
     q = ",".join("?" * len(ids))
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
-    return [_flatten_session(r, st.get(r["id"], 0)) for r in rows]
+    ends = _eff_ends(con, rows)
+    return [_flatten_session(r, st.get(r["id"], 0), ends) for r in rows]
 
 
 def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
@@ -233,10 +257,11 @@ def session_report(con, session_id):
         return {"error": f"Brak sesji {session_id}"}
     start = row["start_ts"]
     last_sample = _one(con, "SELECT MAX(ts) AS t FROM samples WHERE game_session=?", (row["id"],))["t"]
-    end = row["end_ts"] or last_sample or time.time()
+    ends = _eff_ends(con, [row])
+    end = ends[row["id"]] or last_sample or time.time()
     dur = max(1.0, end - start)
     exe = row["exe"]
-    rep = {"session": _flatten_session(row), "summary": _json(row["summary"]) or {}, "duration_s": round(dur),
+    rep = {"session": _flatten_session(row, ends=ends), "summary": _json(row["summary"]) or {}, "duration_s": round(dur),
            "start": fmt_ts(start), "end": fmt_ts(end)}
 
     # --- frames: bound shares + fps timeline
@@ -501,8 +526,9 @@ def range_report(con, t0, t1):
                           "FROM procs WHERE kind='mem' AND ts BETWEEN ? AND ? GROUP BY name ORDER BY AVG(mem_mb) DESC LIMIT 8",
                      (t0, t1)),
     }
-    rep["sessions"] = [_flatten_session(r) for r in _rows(
-        con, "SELECT * FROM sessions WHERE start_ts<=? AND COALESCE(end_ts, ?)>=? ORDER BY start_ts", (t1, t1, t0))]
+    srows = _rows(con, "SELECT * FROM sessions WHERE start_ts<=? AND COALESCE(end_ts, ?)>=? ORDER BY start_ts", (t1, t1, t0))
+    ends = _eff_ends(con, srows)
+    rep["sessions"] = [_flatten_session(r, ends=ends) for r in srows]
     return rep
 
 
@@ -609,6 +635,25 @@ def _unclean_shutdowns(con, t0):
     return merged
 
 
+def _freezes(con, items):
+    """Freeze incidents; if never closed (end_ts NULL) and a later reboot/unclean_shutdown exists, it lasted until that reset."""
+    resets = [r["ts"] for r in con.execute(
+        "SELECT ts FROM incidents WHERE kind IN ('reboot','unclean_shutdown') AND ts>=? ORDER BY ts",
+        (min((f["ts"] for f in items), default=0),))]
+    out = []
+    for f in items:
+        x = {"time": f["time"], "ts": f["ts"], "kind": f["kind"], "title": f["title"],
+             "duration_s": _r(f["end_ts"] - f["ts"]) if f["end_ts"] else None, "until_reset": False}
+        if not f["end_ts"]:
+            i = bisect.bisect_right(resets, f["ts"])
+            # only trust a reset within 6 h that follows with no other freeze incident in between
+            if i < len(resets) and resets[i] - f["ts"] <= 6 * 3600 and not any(
+                    g["ts"] > f["ts"] and g["ts"] < resets[i] for g in items):
+                x["until_reset"], x["until_ts"], x["duration_s"] = True, resets[i], _r(resets[i] - f["ts"])
+        out.append(x)
+    return out
+
+
 def health_overview(con, days=14):
     t0 = time.time() - float(days) * 86400
     by_kind = {r["kind"]: r["n"] for r in con.execute(
@@ -633,8 +678,7 @@ def health_overview(con, days=14):
         "days": days, "since": fmt_ts(t0), "incidents_by_kind": by_kind,
         "incidents_per_day": {d: per_day[d] for d in sorted(per_day)},
         "unclean_shutdowns": unclean, "recurring_crashes": crashes, "config_changes": cfg,
-        "freezes": [{"time": f["time"], "kind": f["kind"], "title": f["title"],
-                     "duration_s": _r(f["end_ts"] - f["ts"]) if f["end_ts"] else None} for f in freezes],
+        "freezes": _freezes(con, freezes),
         "sample_coverage": {"first": fmt_ts(cov["first"]), "last": fmt_ts(cov["last"]), "samples": cov["n"]} if cov and cov["n"] else None,
     }
     rep["findings"] = diagnose(rep, con, t0)
@@ -679,15 +723,16 @@ def diagnose(rep, con=None, t0=None):
                 f"Od {c['first']} do {c['last']}. " + (
                     "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
-    for k, desc in (("whea", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
-                    ("gpu_driver", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
-                    ("bsod", "Blue screeny - sprawdź kod w zdarzeniach BugCheck."),
-                    ("disk", "Błędy dysku - sprawdź SMART (CrystalDiskInfo) i kable/slot."),
-                    ("low_memory", "Kończyła się pamięć wirtualna - zwiększ plik wymiany/zamknij aplikacje."),
-                    ("throttle", "Throttling CPU - sprawdź chłodzenie i zasilanie VRM.")):
+    for k, name, desc in (
+            ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
+            ("gpu_driver", "problem sterownika GPU", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
+            ("bsod", "blue screen", "Blue screeny - sprawdź kod w zdarzeniach BugCheck."),
+            ("disk", "błąd dysku", "Błędy dysku - sprawdź SMART (CrystalDiskInfo) i kable/slot."),
+            ("low_memory", "brak pamięci wirtualnej", "Kończyła się pamięć wirtualna - zwiększ plik wymiany/zamknij aplikacje."),
+            ("throttle", "throttling CPU", "Throttling CPU - sprawdź chłodzenie i zasilanie VRM.")):
         if bk.get(k):
             add("critical" if k in ("whea", "bsod") else "serious" if k in ("gpu_driver", "disk", "low_memory") else "warning",
-                f"{bk[k]}x {k}", desc)
+                f"{bk[k]}x {name}", desc)
     cfg = rep["config_changes"]
     if cfg and un:
         first_bad = min(u["ts"] for u in un)
@@ -726,9 +771,10 @@ def _session_metrics(con, exe=None, since=None):
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     out = []
+    ends = _eff_ends(con, rows)
     for r in rows:
-        f = _flatten_session(r)
-        end = r["end_ts"] or time.time()
+        f = _flatten_session(r, ends=ends)
+        end = ends[r["id"]] or time.time()
         minutes = max(0.0, (end - r["start_ts"]) / 60)
         x = fr.get(r["id"])
         fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("fps_avg")
@@ -737,7 +783,7 @@ def _session_metrics(con, exe=None, since=None):
             low1 = 1000 / x["p99"]
         ctx = _ctx(r)
         out.append({
-            "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": r["end_ts"], "minutes": _r(minutes),
+            "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": f["end_ts"], "minutes": _r(minutes),
             "fps_avg": _r(fps), "fps_1low": _r(low1), "fps_01low": f.get("fps_01low"),
             "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
@@ -818,18 +864,31 @@ def timeline_markers(con, exe=None, since=None):
     walk(ss, lambda s: s["ctx"].get("bios"), "bios", lambda a, b, s: f"BIOS {a} -> {b}")
     for e in {s["exe"] for s in ss if not exe or (s["exe"] or "").lower() == exe.lower()}:
         mine = [s for s in ss if s["exe"] == e]
-        walk(mine, lambda s: s["ctx"].get("game_version"), "game_update", lambda a, b, s, e=e: f"{e}: wersja {a} -> {b}")
-        last_bid = None
+        vers, builds = [], []   # (prev session, session, old, new[, ts]) changes of exe version / Steam buildid
+        lv = lb = prev = None
         for s in mine:
+            v = s["ctx"].get("game_version")
             st = s["ctx"].get("steam") or {}
             bid = st.get("buildid")
-            if bid and last_bid is not None and bid != last_bid:
-                ts = st.get("last_updated") or s["start_ts"]
-                if ts >= t0:
-                    markers.append({"ts": ts, "kind": "game_update", "label": f"{e}: Steam build {last_bid} -> {bid}",
-                                    "session": s["id"]})
-            if bid:
-                last_bid = bid
+            if v and lv is not None and v != lv:
+                vers.append((prev, s, lv, v))
+            if bid and lb is not None and bid != lb:
+                builds.append((prev, s, lb, bid, st.get("last_updated") or s["start_ts"]))
+            lv, lb, prev = v or lv, bid or lb, s
+        used = set()
+        for p, s, a, b in vers:
+            label, ts = f"{e}: wersja {a} -> {b}", s["start_ts"]
+            # same update if the build was first seen in this session, or its update time falls in the gap before it
+            for i, (bp, bs, ba, bb, bts) in enumerate(builds):
+                if i not in used and (bs["id"] == s["id"] or (p and p["start_ts"] <= bts <= s["start_ts"])):
+                    used.add(i)
+                    label, ts = f"{label} (Steam build {ba} -> {bb})", min(ts, bts)
+                    break
+            if ts >= t0:
+                markers.append({"ts": ts, "kind": "game_update", "label": label, "session": s["id"]})
+        for i, (bp, bs, ba, bb, bts) in enumerate(builds):
+            if i not in used and bts >= t0:
+                markers.append({"ts": bts, "kind": "game_update", "label": f"{e}: Steam build {ba} -> {bb}", "session": bs["id"]})
     for i in incidents_between(con, t0, time.time(), kinds="config_change"):
         markers.append({"ts": i["ts"], "kind": "config", "label": i["title"], "session": None})
     markers.sort(key=lambda m: m["ts"])
