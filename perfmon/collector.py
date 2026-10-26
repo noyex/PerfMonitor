@@ -126,7 +126,11 @@ class Collector:
             db.set_meta(self.con, "admin", int(is_admin()))
             db.set_meta(self.con, "hw", json.dumps(self.hw.describe()))
             # Close sessions left open by a previous crash of the collector
-            self.con.execute("UPDATE sessions SET end_ts=start_ts, end_reason='unknown' WHERE end_ts IS NULL")
+            # (end = last data we have for them, e.g. right before a hard reset)
+            self.con.execute(
+                "UPDATE sessions SET end_reason='unknown', end_ts=COALESCE("
+                "(SELECT MAX(ts) FROM frames WHERE session=sessions.id), "
+                "(SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), start_ts) WHERE end_ts IS NULL")
             self.con.commit()
         log.info("collector start, admin=%s", is_admin())
 
