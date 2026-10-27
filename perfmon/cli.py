@@ -14,7 +14,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from perfmon import analyze as an  # noqa: E402
-from perfmon import config, db, present  # noqa: E402
+from perfmon import bottleneck, config, db, present  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -131,7 +131,7 @@ def cmd_sessions(con, a):
         r["start"], r["end"] = an.fmt_ts(r["start_ts"]), an.fmt_ts(r["end_ts"])
         r["min"] = round((r["duration_s"] or 0) / 60, 1)
     table(rows, ["id", "exe", "start", "min", "end_reason", "fps_avg", "fps_1low", "fps_01low", "stutters",
-                 "present", "mem_growth", "gpu_driver", "game_version"])
+                 "present", "bottleneck", "mem_growth", "gpu_driver", "game_version"])
 
 
 def cmd_session(con, a):
@@ -147,6 +147,8 @@ def cmd_session(con, a):
     if r["bound_pct"]:
         kv({"GPU-bound %": r["bound_pct"].get("GPU"), "CPU-bound %": r["bound_pct"].get("CPU"),
             "limit %": r["bound_pct"].get("limit")}, "Wąskie gardło")
+    if r.get("bottleneck"):
+        out(f"Wąskie gardło: {bottleneck.describe(r['bottleneck'])}")
     if r["fps_timeline"]:
         kv(r["fps_timeline"], "FPS w czasie")
     if r.get("present"):
@@ -384,17 +386,25 @@ def cmd_sql(con, a):
 
 
 def cmd_compare(con, a):
-    rows = an.compare(con, a.exe, a.by, a.since)
+    rows = an.compare(con, a.exe, a.by, a.since, a.before, a.after)
     if a.json:
         return dump(rows)
-    out(f"## Porównanie FPS wg: {a.by} (od {a.since})")
+    if a.before:
+        out(f"## Porównanie przed {a.before} / po {a.after or a.before}")
+    else:
+        out(f"## Porównanie FPS wg: {a.by} (od {a.since})")
     for r in rows:
         r["period"] = f"{r['from_time'][:16]} - {r['to_time'][5:16]}"
         r["drivers"] = ", ".join(r["drivers"])
         r["versions"] = ", ".join(r["game_versions"])
+        r["bottleneck"] = ", ".join(f"{k} {v}%" for k, v in r["bottleneck"].items())
     table(rows, ["exe", "group", "period", "sessions", "minutes", "fps_avg", "fps_avg_delta_pct", "fps_1low",
-                 "fps_1low_delta_pct", "stutters_per_min", "gpu_bound_pct", "cpu_bound_pct", "limit_pct", "drivers",
-                 "versions"])
+                 "fps_1low_delta_pct", "stutters_per_min", "stutters_per_min_delta_pct", "gpu_bound_pct",
+                 "cpu_bound_pct", "limit_pct", "bottleneck", "drivers", "versions"])
+    small = sorted({r["exe"] for r in rows if r.get("small_sample")})
+    if small:
+        out(f"UWAGA (small_sample): za mało danych dla {', '.join(small)} - grupa ma < {an.SMALL_SAMPLE_MIN} min "
+            f"lub < {an.SMALL_SAMPLE_SESSIONS} sesje; różnice mogą być przypadkowe.")
 
 
 def cmd_markers(con, a):
@@ -402,7 +412,9 @@ def cmd_markers(con, a):
     if a.json:
         return dump(m)
     out("## Znaczniki zmian (sterowniki, aktualizacje gier, OS, BIOS, konfiguracja)")
-    table(m, ["time", "kind", "label", "session"])
+    table(m, ["n", "time", "kind", "label", "session"])
+    if m:
+        out("_Przed/po: pm compare --exe EXE --before m<n> (np. m3)_")
 
 
 def cmd_config(con, a):
@@ -529,6 +541,8 @@ def build():
     s.add_argument("--exe")
     s.add_argument("--by", default="week", choices=["week", "day", "month", "driver", "game_version", "session", "present_mode"])
     s.add_argument("--since", default="90d")
+    s.add_argument("--before", help="split point: time or change marker m<n> from pm markers --exe EXE")
+    s.add_argument("--after", help="start of the 'after' group (default: --before); sessions in between are skipped")
     s = add("markers", cmd_markers)
     s.add_argument("--exe")
     s.add_argument("--since", default="180d")

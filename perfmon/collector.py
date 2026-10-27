@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
+from . import bottleneck, config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
 from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -380,12 +380,14 @@ class Collector:
             ctx = gamectx.collect(exe, self.hw.gpu.Name if self.hw.gpu is not None else None)
         except Exception as e:
             ctx = {"error": str(e)}
+        start = time.time()
         sid = self.exec("INSERT INTO sessions(exe, path, pid, start_ts, context) VALUES (?,?,?,?,?)",
-                        (name, exe, pid, time.time(), json.dumps(ctx))).lastrowid
+                        (name, exe, pid, start, json.dumps(ctx))).lastrowid
         cap = None
         if os.path.exists(self.cfg["presentmon_exe"]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
-        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "path": exe, "last_summary": time.time()}
+        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "path": exe, "start": start,
+                           "last_summary": time.time()}
         self.shader.set_game(exe)   # the newest game: usually the only one
         self.shader_pid = pid
         log.info("game start %s pid=%s session=%s", name, pid, sid)
@@ -401,6 +403,14 @@ class Collector:
 
     def save_summary(self, g):
         summ = g["capture"].summary() if g["capture"] else {"error": "PresentMon niedostępny"}
+        try:
+            with self.lock:
+                b = bottleneck.compute(self.con, g["session"], g["start"], time.time())
+            if b:
+                summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
+                summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
+        except Exception:
+            log.exception("bottleneck for session %s", g["session"])
         self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)
 
     def end_game(self, pid, reason):

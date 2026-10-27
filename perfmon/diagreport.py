@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import config, crashinfo, diskinfo, memleak, present, procwatch
+from . import bottleneck, config, crashinfo, diskinfo, memleak, present, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -149,6 +149,15 @@ def extend(con, rep, row, start, end):
     rep["present"] = present.session_present(con, row, summ)
     rep["shader"] = shader_summary(con, row)
     rep["mem_growth"] = memleak.assess(con, row["id"], start, end)
+    rep["bottleneck"] = bottleneck.compute(con, row["id"], start, end, (rep.get("hardware") or {}).get("vram_total_mb"))
+
+
+def fill_bottleneck(con, metrics):
+    """Bottleneck kind of finished sessions recorded before summary.bottleneck existed (comparisons)."""
+    for s in metrics:
+        if s.get("bottleneck") is None and s.get("end_ts"):
+            b = bottleneck.compute(con, s["id"], s["start_ts"], s["end_ts"])
+            s["bottleneck"] = b["kind"] if b else None
 
 
 def session_extras(con, rows):
@@ -157,7 +166,8 @@ def session_extras(con, rows):
     out = {}
     for r in rows:
         summ = an._json(r.get("summary")) or {}
-        out[r["id"]] = {"present": pres.get(r["id"]), "mem_growth": summ.get("mem_growth_mb_h")}
+        out[r["id"]] = {"present": pres.get(r["id"]), "mem_growth": summ.get("mem_growth_mb_h"),
+                        "bottleneck": (summ.get("bottleneck") or {}).get("kind")}
     return out
 
 

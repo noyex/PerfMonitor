@@ -824,16 +824,45 @@ def session_points(con, exe=None, since=None):
             for s in _session_metrics(con, exe, since)]
 
 
-def compare(con, exe=None, group_by="week", since=None):
-    """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe."""
+SMALL_SAMPLE_MIN, SMALL_SAMPLE_SESSIONS = 30, 3   # before/after groups below this: weak evidence
+
+
+def resolve_point(con, s, exe=None):
+    """Split point for before/after: a time (parse_time) or a change marker number 'm3' / '#3' (pm markers)."""
+    m = re.fullmatch(r"\s*(?:#|m|marker:?)(\d+)\s*", str(s), re.I)
+    if not m:
+        return parse_time(s)
+    n = int(m.group(1))
+    for mk in timeline_markers(con, exe):
+        if mk.get("n") == n:
+            return mk["ts"]
+    raise ValueError(f"Brak markera {n} (lista: pm markers{' --exe ' + exe if exe else ''})")
+
+
+def compare(con, exe=None, group_by="week", since=None, before=None, after=None):
+    """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe.
+
+    before/after (time or marker 'm3'): two groups, sessions started before `before` and at/after `after`
+    (default: the same point); sessions in between are left out."""
     if group_by not in ("week", "day", "month", "driver", "game_version", "session", "present_mode"):
         raise ValueError("group_by must be week|day|month|driver|game_version|session|present_mode")
+    split = None
+    if before is not None:
+        b = resolve_point(con, before, exe)
+        split = (b, resolve_point(con, after, exe) if after is not None else b)
     groups = {}
-    for s in _session_metrics(con, exe, since):
-        d = datetime.fromtimestamp(s["start_ts"])
-        key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
-               "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
-               "session": f"#{s['id']}", "present_mode": s.get("present") or "?"}[group_by]
+    metrics = _session_metrics(con, exe, None if split else since)
+    diagreport.fill_bottleneck(con, metrics)
+    for s in metrics:
+        if split:
+            key = "przed" if s["start_ts"] < split[0] else "po" if s["start_ts"] >= split[1] else None
+            if key is None:
+                continue
+        else:
+            d = datetime.fromtimestamp(s["start_ts"])
+            key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
+                   "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
+                   "session": f"#{s['id']}", "present_mode": s.get("present") or "?"}[group_by]
         groups.setdefault((s["exe"], key), []).append(s)
     rows = []
     for (e, key), ss in groups.items():
@@ -852,6 +881,7 @@ def compare(con, exe=None, group_by="week", since=None):
             "gpu_bound_pct": _r(100 * sum(s["_g"] for s in ss) / nb) if nb else None,
             "cpu_bound_pct": _r(100 * sum(s["_c"] for s in ss) / nb) if nb else None,
             "limit_pct": _r(100 * sum(s["_l"] for s in ss) / nb) if nb else None,
+            "bottleneck": _shares([(s.get("bottleneck"), s["minutes"] or 0) for s in ss]),
             "drivers": sorted({s["gpu_driver"] for s in ss if s["gpu_driver"]}),
             "game_versions": sorted({s["game_version"] for s in ss if s["game_version"]}),
             "session_ids": [s["id"] for s in ss],
@@ -860,18 +890,35 @@ def compare(con, exe=None, group_by="week", since=None):
     prev = {}
     for r in rows:
         p = prev.get(r["exe"])
-        for k in ("fps_avg", "fps_1low"):
-            r[f"{k}_delta_pct"] = _r(100 * (r[k] - p[k]) / p[k]) if p and p.get(k) and r.get(k) else None
+        for k in ("fps_avg", "fps_1low", "stutters_per_min"):
+            r[f"{k}_delta_pct"] = _r(100 * (r[k] - p[k]) / p[k]) if p and p.get(k) and r.get(k) is not None else None
         prev[r["exe"]] = r
         r["from_time"], r["to_time"] = fmt_ts(r["from"]), fmt_ts(r["to"])
+    if split:
+        small = {r["exe"] for r in rows if (r["minutes"] or 0) < SMALL_SAMPLE_MIN or r["sessions"] < SMALL_SAMPLE_SESSIONS}
+        small |= {e for e in {r["exe"] for r in rows} if sum(1 for r in rows if r["exe"] == e) < 2}
+        for r in rows:
+            r["small_sample"] = r["exe"] in small
     return rows
 
 
-def timeline_markers(con, exe=None, since=None, diag=False):
-    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions.
+def _shares(items):
+    """[(key, weight)] -> {key: % of the total weight}, keys without a value left out."""
+    tot = sum(w for k, w in items if k)
+    acc = Counter()
+    for k, w in items:
+        if k:
+            acc[k] += w
+    return {k: _r(100 * w / tot) for k, w in acc.most_common()} if tot else {}
 
-    diag: also user marks and Defender scans (chart markers; not numbered points for before/after comparisons)."""
-    t0 = parse_time(since) if since is not None else 0
+
+def timeline_markers(con, exe=None, since=None, diag=False):
+    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions, numbered `n`
+    over the whole history (stable whatever `since` is; `pm compare --before m<n>`).
+
+    diag: also user marks and Defender scans (chart markers, not numbered)."""
+    since_ts = parse_time(since) if since is not None else 0
+    t0 = 0
     ss = _session_metrics(con, None, None)   # full history so the first in-range change is detected
     markers = []
 
@@ -914,11 +961,15 @@ def timeline_markers(con, exe=None, since=None, diag=False):
         for i, (bp, bs, ba, bb, bts) in enumerate(builds):
             if i not in used and bts >= t0:
                 markers.append({"ts": bts, "kind": "game_update", "label": f"{e}: Steam build {ba} -> {bb}", "session": bs["id"]})
-    for i in incidents_between(con, t0, time.time(), kinds="config_change"):
+    for i in incidents_between(con, t0, time.time(), kinds="config_change", limit=100000):
         markers.append({"ts": i["ts"], "kind": "config", "label": i["title"], "session": None})
-    if diag:
-        markers += diagreport.diag_markers(con, t0, time.time())
     markers.sort(key=lambda m: m["ts"])
+    for n, m in enumerate(markers, 1):
+        m["n"] = n
+    markers = [m for m in markers if m["ts"] >= since_ts]
+    if diag:
+        markers += diagreport.diag_markers(con, since_ts, time.time())
+        markers.sort(key=lambda m: m["ts"])
     for m in markers:
         m["time"] = fmt_ts(m["ts"])
     return markers

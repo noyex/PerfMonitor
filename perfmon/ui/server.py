@@ -41,8 +41,10 @@ ROUTES = {
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts"), int(q.get("window", 30))),
     "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
     "health": lambda con, q: analyze.health_overview(con, int(q.get("days", 14))),
-    "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d")),
-    "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d")),
+    "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d"),
+                                              q.get("before") or None, q.get("after") or None),
+    "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d"),
+                                                       diag=q.get("diag") == "1"),
     "points": lambda con, q: analyze.session_points(con, q.get("exe") or None, _since(q, "180d")),
 }
 
