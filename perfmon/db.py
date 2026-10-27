@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS game_proc (          -- the game process itself every
     thread_max_pct REAL,                         -- busiest thread, % of one core over the interval
     threads INTEGER, handles INTEGER,
     io_read_mbs REAL,                            -- game reads from disk (asset streaming)
-    gpu_pct REAL,                                -- GPU engines load of the game (3D+Compute+Copy+Video)
+    gpu_pct REAL, gpu_3d_pct REAL,               -- GPU engines load of the game (3D+Compute+Copy+Video) / 3D only
     vram_dedicated_mb REAL, vram_shared_mb REAL, -- shared > ~0.5 GB = VRAM spills into system RAM
     shader_bytes INTEGER,                        -- size of the driver/Steam shader caches (growth = compiling)
     PRIMARY KEY (session, ts)

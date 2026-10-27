@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, db, gamectx, marks, sysinfo
+from . import config, db, gamectx, gpuproc, marks, sysinfo
 from .events import EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -68,6 +68,9 @@ class Collector:
         self.pdh = PdhCounters()
         self.wd = Watchdog()
         self.events = EventReader()
+        self.gpu_procs = gpuproc.GpuProcs()
+        self.game_sampler = gpuproc.GameProcSampler()
+        self.last_gpu_proc = 0.0
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -283,11 +286,33 @@ class Collector:
             for name, pid, c, m, io in sorted(rows, key=lambda x: -x[key])[:n]:
                 if kind == "io" and io < 0.5:
                     continue
-                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2)))
+                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2), None, None))
+        game_rows = []
+        if now - self.last_gpu_proc >= self.cfg.get("gpu_proc_interval_s", 5) - 0.5:
+            self.last_gpu_proc = now
+            out += self.sample_gpu(now, {r[1]: r for r in rows}, game_rows)
         with self.lock:
-            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs) "
-                                 "VALUES (?,?,?,?,?,?,?)", out)
+            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs, gpu_pct, vram_mb) "
+                                 "VALUES (?,?,?,?,?,?,?,?,?)", out)
+            for g in game_rows:
+                self.con.execute(f"INSERT OR REPLACE INTO game_proc ({','.join(g)}) VALUES ({','.join('?' * len(g))})",
+                                 list(g.values()))
             self.con.commit()
+
+    def sample_gpu(self, now, by_pid, game_rows):
+        """procs rows kind='gpu' (top 5 without the game) + game_proc rows of running games."""
+        gpu = self.gpu_procs.read()
+        for pid, g in self.games.items():
+            r = self.game_sampler.sample(pid, g["session"], gpu.get(pid), now)
+            if r:
+                game_rows.append(r)
+        out = []
+        for pid, d in gpuproc.top_background(gpu, set(self.games)):
+            r = by_pid.get(pid)
+            out.append((now, "gpu", r[0] if r else self.pname(pid), pid, round(r[2], 2) if r else None,
+                        round(r[3], 1) if r else None, None, round(d["gpu"], 1),
+                        round(d["ded_mb"]) if d["ded_mb"] is not None else None))
+        return out
 
     # ---------- games ----------
     def is_game(self, name, path):
@@ -363,6 +388,7 @@ class Collector:
 
     def end_game(self, pid, reason):
         g = self.games.pop(pid)
+        self.game_sampler.forget(pid)
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
@@ -422,7 +448,7 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             self.name_cache.clear()
 

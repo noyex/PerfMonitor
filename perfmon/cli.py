@@ -156,6 +156,13 @@ def cmd_session(con, a):
         table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])}
                for w in st["worst"]])
     kv(r["hardware"], "Sprzęt (szczyty/średnie)")
+    gp = r.get("game_proc")
+    if gp:
+        out(f"VRAM gry: dedicated max {cell(gp['vram_dedicated_max_mb'])} MB, shared max {cell(gp['vram_shared_max_mb'])} MB; "
+            f"najbardziej obciążony wątek p95 {cell(gp['thread_max_p95'])}%, pamięć prywatna max {cell(gp['private_max_mb'])} MB")
+    if r.get("gpu_background"):
+        out("### Procesy w tle na GPU")
+        table(r["gpu_background"])
     if r["incidents"]:
         out("### Incydenty w trakcie sesji")
         table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
@@ -262,7 +269,7 @@ def cmd_procs(con, a):
         rows = an._rows(con, "SELECT * FROM procs WHERE kind=? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 2000", (a.kind, t0, t1))
         return dump(rows)
     out(f"## Procesy ({a.kind}) {an.fmt_ts(t0)} -> {an.fmt_ts(t1)}")
-    col = {"cpu": "cpu_pct", "mem": "mem_mb", "io": "io_mbs"}[a.kind]
+    col = {"cpu": "cpu_pct", "mem": "mem_mb", "io": "io_mbs", "gpu": "gpu_pct"}[a.kind]
     table(an._rows(con, f"SELECT name, ROUND(AVG({col}),2) AS avg, ROUND(MAX({col}),1) AS max, COUNT(*) AS appearances "
                         f"FROM procs WHERE kind=? AND ts BETWEEN ? AND ? AND name NOT IN ('System Idle Process','Idle') GROUP BY name ORDER BY SUM({col}) DESC LIMIT 25",
                    (a.kind, t0, t1)))
@@ -447,7 +454,7 @@ def build():
     s = add("procs", cmd_procs)
     s.add_argument("frm", metavar="FROM")
     s.add_argument("to", metavar="TO", nargs="?", default="now")
-    s.add_argument("--kind", default="cpu", choices=["cpu", "mem", "io"])
+    s.add_argument("--kind", default="cpu", choices=["cpu", "mem", "io", "gpu"])
     add("sysinfo", cmd_sysinfo).add_argument("--diff", action="store_true")
     add("schema", cmd_schema)
     add("sql", cmd_sql).add_argument("query")

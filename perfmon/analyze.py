@@ -12,7 +12,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import marks
+from . import diagreport, marks
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -216,7 +216,7 @@ def game_list(con):
                       "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
 
 
-def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
+def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=None):
     ts = st["ts"]
     causes = []
     lo, hi = bisect.bisect_left(samples_ts, ts - 2), bisect.bisect_right(samples_ts, ts + 2)
@@ -254,6 +254,8 @@ def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
             causes.append("dpc")
         if (mx("cpu_temp") or 0) > 90 or (mx("gpu_hotspot") or 0) > 100:
             causes.append("thermal")
+    if ext is not None:
+        causes = ext.refine(ts, win, causes)
     if not causes:
         causes.append("shader_or_unknown")
     return causes
@@ -302,8 +304,9 @@ def session_report(con, session_id):
     s_ts, p_ts = [s["ts"] for s in samples], [p["ts"] for p in procs]
     cause_counts = Counter()
     bg_counts = Counter()
+    ext = diagreport.StutterExt(con, row, start, end)
     for s in st:
-        cs = _causes_for_stutter(s, s_ts, samples, p_ts, procs, exe)
+        cs = _causes_for_stutter(s, s_ts, samples, p_ts, procs, exe, ext)
         s["causes"] = cs
         for c in cs:
             cause_counts[c] += 1
@@ -342,6 +345,7 @@ def session_report(con, session_id):
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
     rep["marks"] = marks.report(con, start, end + 5, exe)
+    diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
     return rep
 
@@ -445,6 +449,7 @@ def _session_findings(rep, row):
     for inc in rep.get("incidents") or []:
         if inc["kind"] in ("gpu_driver", "whea", "bsod"):
             add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
+    f += diagreport.findings(rep, row)
     if not f:
         add("info", "Brak wykrytych problemów", "Sesja wygląda zdrowo.")
     order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
