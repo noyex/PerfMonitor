@@ -345,8 +345,9 @@ def session_report(con, session_id):
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
     # --- network during the session + does it line up with the stutters (network lag vs local stutter)
-    rep["net"] = net_summary(con, start, end)
-    rep["net"]["correlation"] = (net_correlation(con, _net_rows(con, start, end), [s["ts"] for s in st], start, end)
+    nrows = _net_rows(con, start, end)
+    rep["net"] = net_summary(con, start, end, rows=nrows)
+    rep["net"]["correlation"] = (net_correlation(con, nrows, [s["ts"] for s in st], start, end)
                                  if rep["net"]["seconds"] else None)
     rep["findings"] = _session_findings(rep, row)
     return rep
@@ -679,11 +680,11 @@ def _net_wifi_disconnects(con, t0, t1):
     return out
 
 
-def net_summary(con, t0, t1):
+def net_summary(con, t0, t1, rows=None):
     """Network quality over a time range: per-target latency/jitter/loss, DNS, link, Wi-Fi, NIC errors, incidents,
     and a short Polish verdict. Always returns the same shape (empty stats when there is no net data)."""
     t0, t1 = float(t0), float(t1)
-    rows = _net_rows(con, t0, t1)
+    rows = _net_rows(con, t0, t1) if rows is None else rows
     rep = {"from": fmt_ts(t0), "to": fmt_ts(t1), "seconds": len(rows), "targets": {}, "dns": None,
            "disconnected_s": 0, "link_s": {}, "wifi": None, "nic_errors": {}, "incidents": [], "verdict": []}
     rep["targets"] = {k: _net_target([], k) for k in NET_TARGETS}
@@ -694,7 +695,14 @@ def net_summary(con, t0, t1):
         return rep
     rep["targets"] = {k: _net_target(rows, k) for k in NET_TARGETS}
     dns = [r["dns_ms"] for r in rows if r["dns_ms"] is not None]
-    extras = []
+    # extra only stores changes: seed the state (SSID/BSSID/channel) that was current when the range started
+    extras = [{}]
+    seed = _rows(con, "SELECT extra FROM net_samples WHERE ts < ? AND extra IS NOT NULL ORDER BY ts DESC LIMIT 200",
+                 (t0,)) if rows[0]["link"] == "wifi" else []
+    for r in reversed(seed):
+        x = _json(r["extra"])
+        if isinstance(x, dict):
+            extras[0].update({k: v for k, v in x.items() if k.startswith("wifi_")})
     for r in rows:
         x = _json(r["extra"]) if r["extra"] else None
         extras.append(x if isinstance(x, dict) else {})
@@ -735,8 +743,10 @@ def _net_verdict(con, rep, t0, t1):
     if rep["disconnected_s"]:
         v.append(f"Brak łącza sieciowego przez {rep['disconnected_s']} s ({100 * rep['disconnected_s'] / n:.1f}% czasu)")
     # loss: report at the closest-to-user hop that already shows it, that is where the problem starts
+    # Routers rate-limit ICMP to themselves, so a hop is only blamed when the traffic behind it is lossy too
+    end_lossy = [k for k in ("inet", "game") if (tg[k]["loss_pct"] or 0) >= 1]
     lossy = [(k, tg[k]["loss_pct"]) for k in NET_TARGETS if (tg[k]["loss_pct"] or 0) >= 1]
-    if lossy:
+    if end_lossy:
         k, pct = lossy[0]
         where = {"gw": "problem po stronie Wi-Fi/routera (sieci domowej)",
                  "isp": "problem po stronie operatora (łącze/pierwszy węzeł)",
