@@ -15,7 +15,8 @@ from pathlib import Path
 import psutil
 
 from . import config, db, gamectx, sysinfo
-from .events import EventReader, classify
+from .events import LOGS, EventReader, classify
+from .netmon import NetMonitor
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
 from .watchdog import Watchdog, foreground, user_idle_s
@@ -67,6 +68,7 @@ class Collector:
         self.pdh = PdhCounters()
         self.wd = Watchdog()
         self.events = EventReader()
+        self.net = NetMonitor(self.cfg, self.on_net_second, self._net_incident, self._close_incident)
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -99,6 +101,17 @@ class Collector:
                         (ts or time.time(), end_ts, kind, severity, title,
                          json.dumps(details, ensure_ascii=False) if details is not None else None))
         return cur.lastrowid
+
+    def _net_incident(self, kind, severity, title, details, ts):
+        return self.incident(kind, severity, title, details, ts=ts)
+
+    def _close_incident(self, iid, ts):
+        self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (ts, iid))
+
+    def on_net_second(self, r):
+        cols = list(r)
+        self.exec(f"INSERT OR REPLACE INTO net_samples ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                  [r[c] for c in cols])
 
     def pname(self, pid):
         if pid is None:
@@ -329,6 +342,7 @@ class Collector:
         if os.path.exists(self.cfg["presentmon_exe"]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
         self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time()}
+        self.net.set_game(pid, name, sid)
         log.info("game start %s pid=%s session=%s", name, pid, sid)
 
     def on_frame_second(self, r):
@@ -346,6 +360,11 @@ class Collector:
 
     def end_game(self, pid, reason):
         g = self.games.pop(pid)
+        if not self.games:
+            self.net.set_game(None, None, None)
+        elif self.net.game and self.net.game[0] == pid:
+            other, og = next(iter(self.games.items()))
+            self.net.set_game(other, og["exe"], og["session"])
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
@@ -383,7 +402,7 @@ class Collector:
             last = db.get_meta(self.con, "events_since")
         since = float(last) if last else time.time() - 14 * 86400
         newest = since
-        for logname in ("System", "Application"):
+        for logname in LOGS:
             for ev in self.events.read_since(logname, since):
                 newest = max(newest, ev["ts"])
                 cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message) "
@@ -405,7 +424,7 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "net_samples"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             self.name_cache.clear()
 
@@ -484,6 +503,7 @@ class Collector:
     # ---------- main loop ----------
     def run(self):
         self.on_start()
+        self.net.start()
         interval = self.cfg["sample_interval_s"]
         nxt = time.time()
         while self.running:
@@ -520,6 +540,7 @@ class Collector:
         for iid in self.open_incidents.values():
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
         self.open_incidents.clear()
+        self.net.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

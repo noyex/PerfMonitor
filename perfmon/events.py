@@ -9,6 +9,9 @@ import win32evtlog
 log = logging.getLogger("perfmon.events")
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
+WLAN_LOG = "Microsoft-Windows-WLAN-AutoConfig/Operational"
+LOGS = ("System", "Application", WLAN_LOG)
+
 # Informational events we also want (level 4)
 INFO_KEEP = {
     ("System", 1074),   # who initiated shutdown/restart
@@ -19,6 +22,8 @@ INFO_KEEP = {
     ("System", 7045),   # new service installed
     ("Application", 10001),  # Winsrv: application blocked shutdown
     ("Application", 1001),   # WER: error report (crash details)
+    (WLAN_LOG, 8001), (WLAN_LOG, 8002), (WLAN_LOG, 8003),  # Wi-Fi connected / failed to connect / disconnected
+    (WLAN_LOG, 8000),   # connect started
 }
 NOISE = {
     ("Microsoft-Windows-DistributedCOM", 10016),
