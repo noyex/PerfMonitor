@@ -835,7 +835,7 @@ def net_correlation(con, rows, stutter_ts, t0, t1, window=2.0):
 # health / diagnosis
 # --------------------------------------------------------------------------
 
-_KV =re.compile(r"(\w+)=([^;\]]*)")
+_KV = re.compile(r"(\w+)=([^;\]]*)")
 
 
 def parse_kernel_power_41(message):
