@@ -1,6 +1,9 @@
 # Plan: dane do undervoltingu i podkręcania (CPU + GPU)
 
-Status: **do akceptacji** (nic z tego nie jest jeszcze zaimplementowane). Moje propozycje do decyzji: sekcja „Rekomendacje” na końcu.
+Status: **wdrożone** (gałąź `feat/uv-oc`, rekomendacje 1–4 przyjęte). Odstępstwa od planu:
+- ADL Overdrive8 na 9070 XT działa częściowo: odczytuje VRAM MHz, limit mocy, zero RPM i krzywą wentylatora. Indeks offsetu napięcia na RDNA4 nie jest udokumentowany, więc zapisywana jest cała surowa tabela (76 wartości), a każda zmiana daje incydent `gpu_settings_change`. Wykrywania „skoku napięcia przy tym samym zegarze” nie ma na żywo: widać go na krzywej V/F.
+- Sesje testów to wiersze `sessions` z `kind` = `stress` / `manual` / `idle_soak` (nie trafiają do list i porównań gier).
+- Progi stabilności testów: CoreCycler ≥ 8 h łącznie (≈ 1 h na rdzeń), y-cruncher i OCCT ≥ 1 h, 3DMark ≥ 20 min, bezczynność ≥ 2 h.
 
 ## 1. Co faktycznie da się odczytać (zrzut `pm sensors dump`, admin, 2026-10-27)
 
