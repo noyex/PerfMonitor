@@ -699,6 +699,7 @@ def health_overview(con, days=14):
         "freezes": _freezes(con, freezes),
         "sample_coverage": {"first": fmt_ts(cov["first"]), "last": fmt_ts(cov["last"]), "samples": cov["n"]} if cov and cov["n"] else None,
     }
+    rep["diag_incidents"] = diagreport.health_incidents(con, t0)
     rep["findings"] = diagnose(rep, con, t0)
     return rep
 

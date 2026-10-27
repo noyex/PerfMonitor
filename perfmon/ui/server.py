@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import analyze, config, db
+from .. import analyze, config, db, diagreport
 
 STATIC = Path(__file__).parent / "static"
 
@@ -35,6 +35,7 @@ ROUTES = {
                                                   int(q["session"]) if q.get("session") else None,
                                                   int(q.get("points", 1500))),
     "sessions": lambda con, q: analyze.sessions(con, int(q.get("limit", 50))),
+    "game_proc": lambda con, q: diagreport.game_series(con, int(q["session"]), int(q.get("points", 1500))),
     "games": lambda con, q: analyze.game_list(con),
     "session": lambda con, q: analyze.session_report(con, int(q["id"])),
     "range": lambda con, q: analyze.range_report(con, _f(q, "from"), _f(q, "to", time.time())),

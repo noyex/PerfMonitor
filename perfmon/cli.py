@@ -120,6 +120,9 @@ def cmd_health(con, a):
     table(h["freezes"])
     out("### Zmiany konfiguracji")
     table([{"time": c["time"], "title": c["title"]} for c in h["config_changes"]])
+    if h.get("diag_incidents"):
+        out("### Znaczniki, dyski, skany, wycieki (ostatnie 30)")
+        table(h["diag_incidents"][:30], ["time", "kind", "severity", "title"], maxw=160)
 
 
 def cmd_sessions(con, a):

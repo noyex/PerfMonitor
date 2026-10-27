@@ -233,10 +233,38 @@ def health_findings(con, rep):
 
 
 def diag_markers(con, t0, t1):
-    """Chart markers: user marks and Defender scans (timeline_markers(diag=True))."""
+    """Chart markers (timeline_markers(diag=True)): user marks, Defender scans and background culprits started
+    during game sessions."""
     out = []
-    for i in an.incidents_between(con, t0, t1, kinds=["user_mark", "defender_scan"]):
+    for i in an.incidents_between(con, t0, t1, kinds=["user_mark", "defender_scan"], limit=5000):
         d = i["details"] if isinstance(i["details"], dict) else {}
         out.append({"ts": i["ts"], "end_ts": i["end_ts"], "kind": "mark" if i["kind"] == "user_mark" else "scan",
                     "label": (d.get("text") or "Znacznik") if i["kind"] == "user_mark" else i["title"], "session": None})
+    culprits = {c.lower() for c in config.load().get("background_culprits") or procwatch.DEFAULT_CULPRITS}
+    for r in con.execute("SELECT ts, name, session FROM proc_events WHERE action='start' AND session IS NOT NULL "
+                         "AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 5000", (t0, t1)):
+        if (r[1] or "").lower() in culprits:
+            out.append({"ts": r[0], "end_ts": None, "kind": "start", "label": f"Start: {r[1]}", "session": r[2]})
+    return out
+
+
+DIAG_INCIDENTS = ["user_mark", "nvme_reset", "disk_retry", "disk_removed", "disk_health", "defender_scan", "malware",
+                  "game_mem_leak", "etw_capture"]
+
+
+def health_incidents(con, t0):
+    """`pm health` / Problems list of the diagnostics incidents, newest first."""
+    rows = an.incidents_between(con, t0, 4e9, kinds=DIAG_INCIDENTS, limit=100000)
+    return sorted(rows, key=lambda i: -i["ts"])[:200]
+
+
+def game_series(con, session, max_points=1500):
+    """Game process series for the session chart: VRAM dedicated/shared, private memory (game_proc, every ~5 s)."""
+    rows = con.execute("SELECT ts, vram_dedicated_mb, vram_shared_mb, private_mb FROM game_proc WHERE session=? "
+                       "ORDER BY ts", (int(session),)).fetchall()
+    step = max(1, -(-len(rows) // max(1, int(max_points))))
+    rows = rows[::step]
+    out = {"ts": [r[0] for r in rows]}
+    for i, k in enumerate(("vram_dedicated_mb", "vram_shared_mb", "private_mb"), 1):
+        out[k] = [round(r[i]) if r[i] is not None else None for r in rows]
     return out
