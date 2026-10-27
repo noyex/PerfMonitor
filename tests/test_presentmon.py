@@ -47,7 +47,8 @@ def capture():
     c.lines, c.stopped, c.track_frame_type = 0, False, True
     c.p_modes, c.p_runtime, c.p_sync, c.p, c.p_lock = Counter(), Counter(), Counter(), Counter(), threading.Lock()
     c.started = 0
-    c.retarget_pending, c.pids, c.session_name = False, [1], "PerfMon_1_1"
+    c.retarget_pending, c.session_name = False, "PerfMon_1_1"
+    c.game_exe, c.pid, c.names = "cod.exe", 1, []
     return c
 
 
@@ -110,9 +111,16 @@ class PresentMonParseTest(unittest.TestCase):
         self.assertFalse(c.track_frame_type)
         self.assertGreater(len(c.seconds), 0)
 
-    def test_retarget_restarts_with_all_pids(self):
+    def test_targets_pid_until_a_child_appears(self):
         c = capture()
-        c.exe_path, c.session_name, c.pids, c.retarget_pending = "pm.exe", "PerfMon_1_1", [10], False
+        c.exe_path = "pm.exe"
+        a = c._args()
+        self.assertEqual(a[a.index("--process_id") + 1], "1")
+        self.assertNotIn("--process_name", a)
+
+    def test_retarget_restarts_with_exe_names(self):
+        c = capture()
+        c.exe_path = "pm.exe"
         c.proc = FakeProc("")      # the first process ends because retarget() terminated it
         argv = []
 
@@ -122,13 +130,15 @@ class PresentMonParseTest(unittest.TestCase):
             c.started = time.time()
             return True
         c._spawn = spawn
-        c.retarget([10, 20])
-        c.retarget([20, 10])       # same set again: no second restart
+        c.retarget(["sp26-cod.exe"])
+        c.retarget(["sp26-cod.exe"])   # the child respawned with a new pid: same name, no second restart
+        c.retarget([])                 # the child exited: its name is kept for the next respawn
         c.proc = FakeProc("")
         c._run()
         self.assertEqual(len(argv), 1)
         a = argv[0]
-        self.assertEqual([a[i + 1] for i, x in enumerate(a) if x == "--process_id"], ["10", "20"])
+        self.assertEqual([a[i + 1] for i, x in enumerate(a) if x == "--process_name"], ["cod.exe", "sp26-cod.exe"])
+        self.assertNotIn("--process_id", a)
         self.assertEqual(c.seconds[0]["frames"], 100)   # frames of the new trace are kept
         self.assertFalse(c.retarget_pending)
         c.stopped = True

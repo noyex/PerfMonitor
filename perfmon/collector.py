@@ -412,13 +412,10 @@ class Collector:
             if pid not in alive:
                 self.end_game(pid, "exit")
                 continue
-            gone = [c for c in g["children"] if c not in live]
-            for c in gone:
+            for c in [c for c in g["children"] if c not in live]:
                 del g["children"][c]
                 self.game_sampler.forget(c)
-                log.info("game child end pid=%s session=%s", c, g["session"])
-            if gone:
-                self.retarget(g)
+                log.info("game child end pid=%s session=%s", c, g["session"])   # PresentMon keeps its exe name
 
     def attach_child(self, parent_pid, pid, name):
         g = self.games[parent_pid]
@@ -428,7 +425,7 @@ class Collector:
 
     def retarget(self, g):
         if g["capture"]:
-            g["capture"].retarget([g["pid"], *g["children"]])
+            g["capture"].retarget(g["children"].values())
 
     def start_game(self, pid, name, exe):
         try:

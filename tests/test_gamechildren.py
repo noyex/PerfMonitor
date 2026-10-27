@@ -9,8 +9,8 @@ class FakeCapture:
     def __init__(self):
         self.calls = []
 
-    def retarget(self, pids):
-        self.calls.append(pids)
+    def retarget(self, names):
+        self.calls.append(list(names))
 
 
 class Proc:
@@ -34,11 +34,8 @@ class GameChildTest(unittest.TestCase):
 
     def test_child_joins_parent_session_and_capture(self):
         self.c.attach_child(100, 200, "sp26-cod.exe")
-        self.assertEqual(self.cap.calls[-1], [100, 200])
+        self.assertEqual(self.cap.calls[-1], ["sp26-cod.exe"])
         self.assertEqual(self.c.game_pids(), {100, 200})
-        del self.c.games[100]["children"][200]
-        self.c.retarget(self.c.games[100])
-        self.assertEqual(self.cap.calls[-1], [100])
 
     def test_sampling_follows_the_child(self):
         self.c.attach_child(100, 200, "sp26-cod.exe")

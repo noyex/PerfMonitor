@@ -93,13 +93,16 @@ def percentile(sorted_vals, p):
 class FrameCapture:
     """One instance per game session. Calls on_second(row) and on_stutter(row) from the reading thread.
 
-    The target is a set of PIDs (the game and its child game processes, e.g. cod.exe -> sp26-cod.exe, which is the one
-    that actually presents); retarget() restarts PresentMon when the set changes."""
+    The target is the game's PID; once the game spawns child game processes (cod.exe -> sp26-cod.exe, the child is the
+    one that presents) it switches to exe names, because --process_id cannot be repeated but --process_name can, and a
+    name also catches every later respawn of the child without another restart. retarget() restarts PresentMon."""
 
     def __init__(self, exe_path: str, game_exe: str, pid: int, session_id: int, on_second, on_stutter):
         self.session_id = session_id
         self.exe_path = exe_path
-        self.pids = [pid]
+        self.game_exe = game_exe
+        self.pid = pid
+        self.names = []          # empty = capture by PID only
         self.retarget_pending = False
         self.session_name = f"PerfMon_{os.getpid()}_{session_id}"
         self.on_second = on_second
@@ -127,8 +130,11 @@ class FrameCapture:
         self.thread.start()
 
     def _args(self):
-        pid_args = [a for p in self.pids for a in ("--process_id", str(p))]
-        return [self.exe_path, *pid_args, "--output_stdout", "--no_console_stats",
+        if self.names:
+            target = [a for n in self.names for a in ("--process_name", n)]
+        else:
+            target = ["--process_id", str(self.pid)]
+        return [self.exe_path, *target, "--output_stdout", "--no_console_stats",
                 # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
                 "--session_name", self.session_name, "--stop_existing_session",
                 "--terminate_on_proc_exit"] + (["--track_frame_type"] if self.track_frame_type else [])
@@ -185,7 +191,7 @@ class FrameCapture:
                 self.retarget_pending = False
                 self._flush()
                 self.offset = self.prev_t = self.time_unit = None   # PresentMon time restarts with the new trace
-                log.info("PresentMon retarget -> pids %s", self.pids)
+                log.info("PresentMon retarget -> %s", self.names)
                 if self._spawn():
                     continue
                 break
@@ -346,12 +352,13 @@ class FrameCapture:
             "present": self.present_summary(),
         }
 
-    def retarget(self, pids):
-        """Capture exactly these PIDs from now on (restarts PresentMon; a second or two of frames is lost)."""
-        pids = sorted(set(pids))
-        if not pids or pids == sorted(self.pids) or self.stopped:
+    def retarget(self, child_names):
+        """Capture the game and these child exe names from now on (restarts PresentMon; a second or two of frames is
+        lost). A name is never dropped: CoD respawns sp26-cod.exe every few minutes."""
+        names = sorted({self.game_exe, *self.names, *child_names})
+        if names == self.names or self.stopped:
             return
-        self.pids = pids
+        self.names = names
         self.retarget_pending = True
         self._kill()
 
