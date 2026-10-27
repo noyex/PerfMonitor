@@ -14,7 +14,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, db, gamectx, sysinfo
+from . import config, db, gamectx, ocanalyze, ocmon, sysinfo
 from .events import EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -29,12 +29,22 @@ SAMPLE_COLS = [
     "gpu_clock_mhz", "gpu_mem_clock_mhz", "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w",
     "gpu_fan_rpm", "disk_read_mbs", "disk_write_mbs", "disk_lat_ms", "disk_lat_disk", "disk_queue",
     "disk_busy_pct", "net_rx_kbs", "net_tx_kbs", "fg_exe", "fg_hung", "ui_ms", "dwm_ms",
-    "user_idle_s", "game_session", "extra",
+    "user_idle_s", "game_session", "cpu_vcore", "gpu_voltage", "vrm_temp", "cpu_eff_max", "extra",
 ]
 INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUES ({','.join('?' * len(SAMPLE_COLS))})"
+DETAIL_COLS = [
+    "ts", "session", "cpu_eff", "cpu_clk", "cpu_core_w", "thread_load", "cpu_vcore", "cpu_vsoc", "cpu_vmisc",
+    "cpu_pkg_w", "tctl", "tccd", "vrm_temp", "vsoc_temp", "dimm_temp", "cpu_fan", "gpu_clk", "gpu_mem_clk", "gpu_v",
+    "gpu_w", "gpu_load", "gpu_temp", "gpu_hot", "gpu_mem_temp", "gpu_fan",
+]
+INSERT_DETAIL = f"INSERT OR REPLACE INTO hw_detail ({','.join(DETAIL_COLS)}) VALUES ({','.join('?' * len(DETAIL_COLS))})"
 
 FREEZE_MS = 2000      # shell/DWM unresponsive this long = freeze incident
-TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
+TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100, "vrm_temp": 100}
+VSOC_MAX = 1.30       # V: upper safe limit of Zen 4 SoC voltage
+OC_ALERT_S = 5        # UV/OC alerts fire only after the condition held this long
+STRETCH_MAX = 0.97    # effective / reference clock of a fully loaded core below this = clock stretching
+GPU_OD_POLL_S = 60
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -85,6 +95,14 @@ class Collector:
         self.last_reload_check = time.time()
         self.reload_deferred_logged = False
         self.import_check = None       # {"requested", "err"} while the new code is being import-checked
+        self.manual = {}               # session id -> kind of open `pm stress start` / idle-soak sessions
+        self.last_detail = 0.0
+        self.oc_since = {}             # UV/OC alert key -> ts the condition started (debounce)
+        self.gpu_clk_hist = []         # (ts, MHz) of the GPU core clock under full load, last 60 s
+        self.gpu_od = ocmon.GpuOverdrive(self.hw.gpu.Name if self.hw.gpu is not None else None)
+        self.last_gpu_od = 0.0
+        self.last_oc_stats = 0.0
+        self.vacuuming = False
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -117,7 +135,8 @@ class Collector:
         boot = psutil.boot_time()
         last_ts = self.con.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
         prev_boot = db.get_meta(self.con, "boot_time")
-        if last_ts and prev_boot and abs(float(prev_boot) - boot) > 60:
+        new_boot = bool(prev_boot and abs(float(prev_boot) - boot) > 60)
+        if last_ts and new_boot:
             # New boot since last run: record where data stopped so freezes before power-off are findable
             self.incident("reboot", "info", "Restart systemu (koniec poprzednich danych)",
                           {"last_sample": last_ts, "boot": boot, "gap_s": round(boot - last_ts)}, ts=last_ts)
@@ -131,8 +150,11 @@ class Collector:
             self.con.execute(
                 "UPDATE sessions SET end_reason='unknown', end_ts=MAX(start_ts, "
                 "COALESCE((SELECT MAX(ts) FROM frames WHERE session=sessions.id), 0), "
-                "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL")
+                "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL"
+                # `pm stress` sessions survive a collector reload, not a reboot
+                + ("" if new_boot else " AND COALESCE(kind, 'game') NOT IN ('manual', 'idle_soak')"))
             self.con.commit()
+        self.vacuum_setup()
         log.info("collector start, admin=%s", is_admin())
 
     # ---------- per-second sample ----------
@@ -169,7 +191,7 @@ class Collector:
         if not clock and p.get("perf_pct"):
             clock = 4500 * p["perf_pct"] / 100  # 7700X base clock * % Processor Performance
 
-        session = next(iter(self.games.values()))["session"] if self.games else None
+        session = next(iter(self.games.values()))["session"] if self.games else next(iter(self.manual), None)
         extra = {"disks": extra_disks}
         if self.hw.storage_temps:
             extra["disk_temps"] = self.hw.storage_temps
@@ -187,9 +209,18 @@ class Collector:
             disk_read_mbs=rd / 1e6, disk_write_mbs=wr / 1e6, disk_lat_ms=worst_lat, disk_lat_disk=worst_disk,
             disk_queue=queue, disk_busy_pct=busy, net_rx_kbs=rx, net_tx_kbs=tx,
             fg_exe=self.pname(fg_pid), fg_hung=int(fg_hung), ui_ms=ui_ms, dwm_ms=dwm_ms,
-            user_idle_s=user_idle_s(), game_session=session, extra=json.dumps(extra),
+            user_idle_s=user_idle_s(), game_session=session,
+            **{k: h.get(k) for k in ("cpu_vcore", "gpu_voltage", "vrm_temp", "cpu_eff_max")}, extra=json.dumps(extra),
         )
         self.exec(INSERT_SAMPLE, [row[c] for c in SAMPLE_COLS])
+        det = h.get("detail")
+        if det:
+            det = dict(det, ts=now, session=session, thread_load=[round(c) for c in cores])
+            if session is not None or now - self.last_detail >= self.cfg["detail_interval_s"]:
+                self.last_detail = now
+                self.exec(INSERT_DETAIL, [json.dumps(det.get(c)) if isinstance(det.get(c), list) else det.get(c)
+                                          for c in DETAIL_COLS])
+            self.detect_oc(row, det)
         self.detect_live(row)
 
     # ---------- live incident detection ----------
@@ -200,6 +231,42 @@ class Collector:
         elif not active and iid is not None:
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
             del self.open_incidents[kind]
+
+    def _held(self, key, active, now):
+        """True once `active` has held for OC_ALERT_S seconds (debounce for UV/OC alerts)."""
+        if not active:
+            self.oc_since.pop(key, None)
+            return False
+        return now - self.oc_since.setdefault(key, now) >= OC_ALERT_S
+
+    def detect_oc(self, r, d):
+        now = r["ts"]
+        vsoc = d.get("cpu_vsoc")
+        self._ongoing("vsoc_high", self._held("vsoc", bool(vsoc and vsoc > VSOC_MAX), now), "serious",
+                      f"Napięcie SoC powyżej {VSOC_MAX:.2f} V", r, lambda: {"vsoc": vsoc})
+        # clock stretching: every SMT thread of a core fully loaded, effective clock clearly below the reference
+        loads, eff, clk = d.get("thread_load") or [], d.get("cpu_eff") or [], d.get("cpu_clk") or []
+        tpc = max(1, len(loads) // len(clk)) if clk else 1
+        stretched = {}
+        for i, (e, c) in enumerate(zip(eff, clk)):
+            th = loads[i * tpc:(i + 1) * tpc]
+            if e and c and th and min(th) >= 95 and e / c < STRETCH_MAX:
+                stretched[i] = round(100 * (1 - e / c), 1)
+        self._ongoing("clock_stretching", self._held("stretch", bool(stretched), now), "warning",
+                      "Clock stretching CPU: " + ", ".join(f"rdzeń {k} −{v}%" for k, v in stretched.items()), r,
+                      lambda: {"cores": stretched, "vcore": d.get("cpu_vcore"), "pkg_w": d.get("cpu_pkg_w"),
+                               "session": r["game_session"]})
+        # sudden GPU clock drop at the same (full) load, vs the median of the last 60 s at full load
+        gl, gc = d.get("gpu_load"), d.get("gpu_clk")
+        hist = self.gpu_clk_hist = [(t, v) for t, v in self.gpu_clk_hist if now - t <= 60]
+        ref = sorted(v for _, v in hist)[len(hist) // 2] if len(hist) >= 20 else None
+        drop = bool(gl is not None and gl >= 95 and gc and ref and gc < 0.85 * ref)
+        if gl is not None and gl >= 95 and gc and not drop:
+            hist.append((now, gc))
+        self._ongoing("gpu_clock_drop", self._held("gpu_drop", drop, now), "warning",
+                      "Nagły spadek zegara GPU przy pełnym obciążeniu", r,
+                      lambda: {"clock_mhz": gc, "median_60s": ref, "gpu_temp": d.get("gpu_temp"),
+                               "hotspot": d.get("gpu_hot"), "power_w": d.get("gpu_w")})
 
     def snapshot_procs(self):
         """Top processes right now - attached to freeze incidents."""
@@ -302,6 +369,11 @@ class Collector:
                 exe = pr.exe()
             except Exception:
                 exe = None
+            stress = ocmon.stress_kind(name, exe, self.cfg)
+            if stress:
+                self.start_game(pid, name, exe, stress=stress)
+                alive.add(pid)
+                continue
             if not self.is_game(name, exe):
                 self.not_games.add(key)
                 continue
@@ -317,16 +389,25 @@ class Collector:
         for pid in list(self.games):
             if pid not in alive:
                 self.end_game(pid, "exit")
+        # sessions opened and closed by `pm stress start|idle|stop` (the CLI writes them)
+        self.manual = {r[0]: r[1] for r in self.exec(
+            "SELECT id, kind FROM sessions WHERE kind IN ('manual','idle_soak') AND end_ts IS NULL ORDER BY id")}
 
-    def start_game(self, pid, name, exe):
+    def start_game(self, pid, name, exe, stress=None):
+        """Game session, or with stress=(name, uses_3d) a stress-test session (frames only for 3D tests)."""
         try:
             ctx = gamectx.collect(exe, self.hw.gpu.Name if self.hw.gpu is not None else None)
         except Exception as e:
             ctx = {"error": str(e)}
-        sid = self.exec("INSERT INTO sessions(exe, path, pid, start_ts, context) VALUES (?,?,?,?,?)",
-                        (name, exe, pid, time.time(), json.dumps(ctx))).lastrowid
+        if stress:
+            ctx["stress_test"] = stress[0]
+        now = time.time()
+        with self.lock:
+            profile = ocanalyze.active_profile_id(self.con, now)
+        sid = self.exec("INSERT INTO sessions(exe, path, pid, start_ts, context, kind, profile_id) VALUES (?,?,?,?,?,?,?)",
+                        (name, exe, pid, now, json.dumps(ctx), "stress" if stress else None, profile)).lastrowid
         cap = None
-        if os.path.exists(self.cfg["presentmon_exe"]):
+        if os.path.exists(self.cfg["presentmon_exe"]) and (not stress or stress[1]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
         self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time()}
         log.info("game start %s pid=%s session=%s", name, pid, sid)
@@ -391,8 +472,10 @@ class Collector:
                 if cur.rowcount:
                     c = classify(ev)
                     if c:
-                        self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
-                                                         "message": ev["message"][:1500]}, ts=ev["ts"])
+                        det = {"event_id": ev["event_id"], "provider": ev["provider"], "message": ev["message"][:1500]}
+                        if c[0] in ("whea_corrected", "whea_fatal"):
+                            det["whea"] = ocmon.parse_whea(ev["message"], self.cfg["apic_ids_per_core"])
+                        self.incident(c[0], c[1], c[2], det, ts=ev["ts"])
         with self.lock:
             db.set_meta(self.con, "events_since", newest)
             self.con.commit()
@@ -408,6 +491,95 @@ class Collector:
             for t in ("samples", "frames", "stutters", "procs", "events"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             self.name_cache.clear()
+            self.detail_retention(now)
+        if now - self.last_gpu_od > GPU_OD_POLL_S:
+            self.last_gpu_od = now
+            self.check_gpu_od(now)
+        if now - self.last_oc_stats > 60:
+            self.last_oc_stats = now
+            self.save_oc_stats()
+
+    # ---------- UV/OC ----------
+    def check_gpu_od(self, now):
+        """Store the Adrenalin tuning when it changes; a change = incident asking to tag the profile."""
+        cur = self.gpu_od.read()
+        if not cur:
+            return
+        prev = self.exec("SELECT settings FROM gpu_od_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+        prev = json.loads(prev[0]) if prev else None
+        diffs = ocmon.describe_change(prev, cur) if prev else []
+        if prev is None or diffs:
+            self.exec("INSERT INTO gpu_od_snapshots VALUES (?, ?)", (now, json.dumps(cur)))
+        if diffs:
+            self.incident("gpu_settings_change", "info", "Wykryto zmianę ustawień GPU (Adrenalin) - oznacz profil "
+                          "(pm oc add / activate)", {"changes": diffs, "settings": cur.get("named")}, ts=now)
+
+    def save_oc_stats(self):
+        """Per-session UV/OC aggregates of finished sessions (they outlive the pruned hw_detail)."""
+        rows = self.exec(
+            "SELECT id FROM sessions s WHERE end_ts IS NOT NULL AND start_ts > ? AND NOT EXISTS "
+            "(SELECT 1 FROM oc_session_stats o WHERE o.session=s.id) ORDER BY id DESC LIMIT 5",
+            (time.time() - self.cfg["detail_retention_days"] * 86400,)).fetchall()
+        for (sid,) in rows:
+            try:
+                with self.lock:
+                    st = ocanalyze.session_stats(self.con, sid)
+                    self.con.execute("INSERT OR REPLACE INTO oc_session_stats VALUES (?,?,?,?,?,?,?)",
+                                     (sid, st["profile_id"], st["kind"], st["exe"], st["start_ts"], st["end_ts"],
+                                      json.dumps(st["stats"])))
+                    self.con.commit()
+            except Exception:
+                log.exception("oc stats for session %s", sid)
+
+    def detail_retention(self, now):
+        days = self.cfg["detail_retention_days"]
+        try:
+            size = sum(p.stat().st_size for p in config.DATA_DIR.glob(config.DB_PATH.name + "*"))
+        except OSError:
+            size = 0
+        if size > self.cfg["db_guard_gb"] * 2**30:
+            days = min(days, 14)
+            if not self.exec("SELECT 1 FROM incidents WHERE kind='db_size' AND ts > ?", (now - 7 * 86400,)).fetchone():
+                self.incident("db_size", "warning", f"Baza perf.db ma {size / 2**30:.1f} GB - retencja szczegółów "
+                              "UV/OC skrócona do 14 dni", {"bytes": size}, ts=now)
+        self.exec("DELETE FROM hw_detail WHERE ts < ?", (now - days * 86400,))
+        with self.lock:
+            last = float(db.get_meta(self.con, "last_vacuum", 0))
+        if now - last > 7 * 86400 and not self.vacuuming:
+            self.vacuuming = True
+            threading.Thread(target=self._incremental_vacuum, daemon=True).start()
+
+    def _incremental_vacuum(self):
+        """Free pages in small steps so the sampling thread never waits long for the write lock."""
+        con = db.connect()
+        try:
+            for _ in range(10000):
+                if not con.execute("PRAGMA freelist_count").fetchone()[0]:
+                    break
+                con.execute("PRAGMA incremental_vacuum(500)")
+                time.sleep(0.05)
+            db.set_meta(con, "last_vacuum", time.time())
+            con.commit()
+        except Exception:
+            log.exception("incremental vacuum")
+        finally:
+            con.close()
+            self.vacuuming = False
+
+    def vacuum_setup(self):
+        """One-time switch to auto_vacuum=INCREMENTAL (needs a full VACUUM: only while the DB is still small)."""
+        if self.con.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+            return
+        try:
+            if config.DB_PATH.stat().st_size > 500 * 2**20:
+                log.info("perf.db too large for the one-time VACUUM, incremental vacuum stays off")
+                return
+            with self.lock:
+                self.con.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                self.con.execute("VACUUM")
+            log.info("auto_vacuum=INCREMENTAL enabled")
+        except Exception:
+            log.exception("vacuum setup")
 
     def _sysinfo(self):
         info = sysinfo.collect()

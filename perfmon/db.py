@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS samples (            -- every 1 s, whole system
     dwm_ms REAL,                                 -- longest DwmFlush in the last second (window compositor)
     user_idle_s REAL,                            -- seconds since last keyboard/mouse input
     game_session INTEGER,                        -- game session id if running
+    cpu_vcore REAL, gpu_voltage REAL,            -- V: board Vcore (Super I/O), GPU core voltage
+    vrm_temp REAL, cpu_eff_max REAL,             -- CPU VRM MOS temperature; highest per-core effective clock (MHz)
     extra TEXT                                   -- JSON: disks separately, disk temperatures etc.
 );
 CREATE TABLE IF NOT EXISTS sessions (           -- game session (from start to exe close)
@@ -30,7 +32,9 @@ CREATE TABLE IF NOT EXISTS sessions (           -- game session (from start to e
     exe TEXT, path TEXT, pid INTEGER,
     start_ts REAL, end_ts REAL, end_reason TEXT, -- exit | crash | collector_stop | unknown
     summary TEXT,                                -- JSON: fps, 1%/0.1% low, stutters, bottleneck...
-    context TEXT                                 -- JSON at start: gpu_driver, adrenalin, os_build, bios, game_version, steam build
+    context TEXT,                                -- JSON at start: gpu_driver, adrenalin, os_build, bios, game_version, steam build
+    kind TEXT,                                   -- NULL/game | stress (known stress-test exe) | manual (pm stress start) | idle_soak
+    profile_id INTEGER                           -- oc_profiles.id active when the session started
 );
 CREATE TABLE IF NOT EXISTS frames (             -- frame aggregate every 1 s from PresentMon
     ts REAL, session INTEGER,
@@ -58,11 +62,40 @@ CREATE TABLE IF NOT EXISTS system_info (        -- config snapshot (drivers, BIO
     ts REAL, info TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS hw_detail (          -- UV/OC telemetry: every 1 s during game/stress sessions, every 10 s otherwise
+    ts REAL PRIMARY KEY, session INTEGER,
+    cpu_eff TEXT, cpu_clk TEXT,                  -- JSON [8]: per-core effective clock / reference clock (MHz)
+    cpu_core_w TEXT, thread_load TEXT,           -- JSON: per-core power (SMU, W) [8] / per-thread load % [16]
+    cpu_vcore REAL, cpu_vsoc REAL, cpu_vmisc REAL,   -- V from the board's Super I/O (not per core)
+    cpu_pkg_w REAL, tctl REAL, tccd REAL,        -- Package power (~PPT), Tctl/Tdie, CCD1 Tdie
+    vrm_temp REAL, vsoc_temp REAL, dimm_temp REAL, cpu_fan REAL,
+    gpu_clk REAL, gpu_mem_clk REAL, gpu_v REAL, gpu_w REAL, gpu_load REAL,
+    gpu_temp REAL, gpu_hot REAL, gpu_mem_temp REAL, gpu_fan REAL
+);
+CREATE TABLE IF NOT EXISTS oc_profiles (        -- UV/OC settings profiles (entered by the user, never applied by PerfMonitor)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, created_ts REAL,
+    status TEXT,                                 -- testing | stable | rejected
+    cpu TEXT,                                    -- JSON: co_per_core[8], pbo{ppt,tdc,edc,scalar,boost_override}, expo, soc_v
+    gpu TEXT,                                    -- JSON: voltage_offset_mv, power_limit_pct, max_clock_offset, vram_mhz, vram_fast_timing, fan_curve
+    notes TEXT
+);
+CREATE TABLE IF NOT EXISTS oc_profile_log (     -- profile activations: profile active from ts until the next row
+    ts REAL, profile_id INTEGER, source TEXT     -- manual | detected
+);
+CREATE TABLE IF NOT EXISTS oc_session_stats (   -- per-session UV/OC aggregates (kept forever, hw_detail is pruned)
+    session INTEGER PRIMARY KEY, profile_id INTEGER, kind TEXT, exe TEXT,
+    start_ts REAL, end_ts REAL, stats TEXT       -- JSON: avg/p95 clocks, voltages, power, temps, FPS/W, stretching per core
+);
+CREATE TABLE IF NOT EXISTS gpu_od_snapshots (   -- AMD ADL Overdrive8 current settings, stored when they change
+    ts REAL, settings TEXT                       -- JSON {"named": {...}, "raw": [...]}
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
+CREATE INDEX IF NOT EXISTS ix_hw_detail_session ON hw_detail(session);
 """
 
 
@@ -75,11 +108,18 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
         con.executescript(SCHEMA)
-        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
-        if "context" not in cols:  # migrate DBs created before the context column existed
-            con.execute("ALTER TABLE sessions ADD COLUMN context TEXT")
+        # migrate DBs created before these columns existed
+        add_columns(con, "sessions", {"context": "TEXT", "kind": "TEXT", "profile_id": "INTEGER"})
+        add_columns(con, "samples", {"cpu_vcore": "REAL", "gpu_voltage": "REAL", "vrm_temp": "REAL", "cpu_eff_max": "REAL"})
     con.row_factory = sqlite3.Row
     return con
+
+
+def add_columns(con, table, cols):
+    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    for c, t in cols.items():
+        if c not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {c} {t}")
 
 
 def get_meta(con, k, default=None):
