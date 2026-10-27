@@ -83,19 +83,49 @@ CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
 def connect(readonly: bool = False) -> sqlite3.Connection:
     if readonly:
         con = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True, timeout=10, check_same_thread=False)
+        shim_schema(con)
     else:
         config.ensure_dirs()
         con = sqlite3.connect(config.DB_PATH, timeout=10, check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
-        con.executescript(SCHEMA)
-        # migrate DBs created before these columns existed
-        add_columns(con, "sessions", {"context": "TEXT"})
-        add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
-        add_columns(con, "events", {"data": "TEXT"})
-        add_columns(con, "samples", {"pagefile_pct": "REAL"})
+        migrate(con)
     con.row_factory = sqlite3.Row
     return con
+
+
+def migrate(con):
+    con.executescript(SCHEMA)
+    # migrate DBs created before these columns existed
+    add_columns(con, "sessions", {"context": "TEXT"})
+    add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
+    add_columns(con, "events", {"data": "TEXT"})
+    add_columns(con, "samples", {"pagefile_pct": "REAL"})
+
+
+def _columns(con, table, schema="main"):
+    return [r[1] for r in con.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def shim_schema(con):
+    """Read-only connection to a DB the running collector has not migrated yet (it defers reloads during a game):
+    missing tables become empty TEMP tables and missing columns NULL columns of a TEMP view with the table's name
+    (unqualified names resolve to temp first), so new analysis code runs on the old schema."""
+    mem = sqlite3.connect(":memory:")
+    migrate(mem)
+    for name, sql in mem.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+        try:
+            have = _columns(con, name)
+            if not have:   # sqlite_master keeps "CREATE TABLE name (...)" without IF NOT EXISTS
+                con.execute(sql.replace("CREATE TABLE", "CREATE TEMP TABLE", 1))
+                continue
+            missing = [c for c in _columns(mem, name) if c not in have]
+            if missing:
+                con.execute(f"CREATE TEMP VIEW {name} AS SELECT *, {', '.join(f'NULL AS {c}' for c in missing)} "
+                            f"FROM main.{name}")
+        except sqlite3.Error:
+            pass   # analysis then fails loudly on the missing column, as before
+    mem.close()
 
 
 def add_columns(con, table, cols):
