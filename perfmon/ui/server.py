@@ -35,6 +35,7 @@ ROUTES = {
                                                   int(q["session"]) if q.get("session") else None,
                                                   int(q.get("points", 1500))),
     "sessions": lambda con, q: analyze.sessions(con, int(q.get("limit", 50))),
+    "games": lambda con, q: analyze.game_list(con),
     "session": lambda con, q: analyze.session_report(con, int(q["id"])),
     "range": lambda con, q: analyze.range_report(con, _f(q, "from"), _f(q, "to", time.time())),
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts"), int(q.get("window", 30))),

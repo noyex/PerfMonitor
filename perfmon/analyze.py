@@ -208,6 +208,12 @@ def sessions(con, limit=20):
     return [_flatten_session(r, st.get(r["id"], 0), ends) for r in rows]
 
 
+def game_list(con):
+    """Games with at least one session, most played first (cheap list for pickers)."""
+    return _rows(con, "SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions "
+                      "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
+
+
 def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
     ts = st["ts"]
     causes = []
@@ -526,9 +532,11 @@ def range_report(con, t0, t1):
                           "FROM procs WHERE kind='mem' AND ts BETWEEN ? AND ? GROUP BY name ORDER BY AVG(mem_mb) DESC LIMIT 8",
                      (t0, t1)),
     }
-    srows = _rows(con, "SELECT * FROM sessions WHERE start_ts<=? AND COALESCE(end_ts, ?)>=? ORDER BY start_ts", (t1, t1, t0))
+    # end_ts <= start_ts = interrupted session whose real end is derived from its data (may overlap the range)
+    srows = _rows(con, "SELECT * FROM sessions WHERE start_ts<=? AND (COALESCE(end_ts, ?)>=? OR (end_ts<=start_ts "
+                       "AND start_ts>=?)) ORDER BY start_ts", (t1, t1, t0, t0 - 86400))
     ends = _eff_ends(con, srows)
-    rep["sessions"] = [_flatten_session(r, ends=ends) for r in srows]
+    rep["sessions"] = [_flatten_session(r, ends=ends) for r in srows if (ends[r["id"]] or t1) >= t0]
     return rep
 
 
