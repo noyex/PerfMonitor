@@ -193,9 +193,7 @@ class PresentAnalysisTest(unittest.TestCase):
 
 class StaleSessionCleanupTest(unittest.TestCase):
     def test_localized_logman_output_does_not_crash(self):
-        out = "Zbiór danych
-PerfMon_999999_3                Trace    Running
-".encode("cp852")
+        out = "Zbi\xf3r danych\r\nPerfMon_999999_3                Trace    Running\r\n".encode("cp852")
         run = mock.Mock(return_value=mock.Mock(stdout=out))
         with mock.patch.object(pmn.subprocess, "run", run), mock.patch.object(pmn, "_pid_alive", return_value=False),                 mock.patch.object(pmn, "stop_etw_session") as stop:
             self.assertEqual(pmn.cleanup_stale_sessions(), 1)
