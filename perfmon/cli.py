@@ -168,6 +168,12 @@ def cmd_session(con, a):
     if gp:
         out(f"VRAM gry: dedicated max {cell(gp['vram_dedicated_max_mb'])} MB, shared max {cell(gp['vram_shared_max_mb'])} MB; "
             f"najbardziej obciążony wątek p95 {cell(gp['thread_max_p95'])}%, pamięć prywatna max {cell(gp['private_max_mb'])} MB")
+    d = r.get("disk") or {}
+    if d.get("per_disk"):
+        out(f"### Dyski (gra na {d.get('game_drive') or '?'}: {d.get('game_disk_name') or d.get('game_disk') or '?'}"
+            f"{', ' + d['game_disk_bus'] if d.get('game_disk_bus') else ''}; odczyt gry śr. "
+            f"{cell((d.get('game_read') or {}).get('avg_mbs'))} / max {cell((d.get('game_read') or {}).get('max_mbs'))} MB/s)")
+        table(d["per_disk"])
     if r.get("gpu_background"):
         out("### Procesy w tle na GPU")
         table(r["gpu_background"])
@@ -301,7 +307,14 @@ def cmd_sysinfo(con, a):
         return dump({"ts": rows[0]["ts"], "info": cur})
     out(f"## Konfiguracja systemu (migawka {an.fmt_ts(rows[0]['ts'])})")
     for k, v in cur.items():
-        out(f"- **{k}**: {cell(v)[:600]}")
+        if k != "disk_health":
+            out(f"- **{k}**: {cell(v)[:600]}")
+    from perfmon import diskinfo
+    if diskinfo.health_rows(cur):
+        out("### Zdrowie dysków (Get-StorageReliabilityCounter)")
+        table(diskinfo.health_rows(cur))
+        for w in diskinfo.health_warnings(cur):
+            out(f"- UWAGA: {w}")
 
 
 def cmd_schema(con, a):

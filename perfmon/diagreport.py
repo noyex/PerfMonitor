@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import crashinfo
+from . import crashinfo, diskinfo
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -33,6 +33,8 @@ class StutterExt:
         self.gpu_ts = [p["ts"] for p in self.gpu]
         vt = con.execute("SELECT MAX(gpu_vram_total_mb) FROM samples WHERE ts BETWEEN ? AND ?", (start, end)).fetchone()[0]
         self.shared_limit = vram_shared_limit(vt)
+        self.resets = [r[0] for r in con.execute("SELECT ts FROM incidents WHERE kind IN ('nvme_reset','disk_retry') "
+                                                 "AND ts BETWEEN ? AND ? ORDER BY ts", (start - 15, end + 15))]
 
     def _win(self, ts_list, items, a, b):
         return items[bisect.bisect_left(ts_list, a):bisect.bisect_right(ts_list, b)]
@@ -55,6 +57,10 @@ class StutterExt:
 
     def refine(self, ts, win, causes):
         """Add the extra causes to the list from analyze._causes_for_stutter (before its unknown fallback)."""
+        if self._win(self.resets, self.resets, ts - 15, ts + 15):
+            causes.insert(0, "disk_reset")
+        if any((s.get("pagefile_pct") or 0) > 60 and (s.get("hard_faults_s") or 0) > 200 for s in win):
+            causes.append("pagefile")
         if self.vram_shared(ts):
             causes.append("vram_shared")
         causes += [f"background_gpu:{n}" for n in self.background_gpu(ts)]
@@ -99,6 +105,7 @@ def extend(con, rep, row, start, end):
     rep["crash"] = summ.get("crash") or (crashinfo.build(con, row["exe"], end, start, read_files=False)
                                          if row["end_reason"] == "crash" else None)
     rep["game_proc"] = game_proc_summary(con, row["id"])
+    rep["disk"] = diskinfo.session_disk(con, start, end, row["path"], row["id"])
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
 
 
@@ -112,6 +119,11 @@ def findings(rep, row):
         add("warning", f"{cc['vram_shared']} stutterów przy VRAM przelewającym się do RAM",
             f"Gra trzymała do {gp.get('vram_shared_max_mb')} MB w pamięci współdzielonej (system RAM). Obniż jakość "
             "tekstur / rozdzielczość tekstur, wyłącz pakiet tekstur HD - VRAM przelewa się do RAM.")
+    if cc.get("pagefile", 0) >= 3:
+        add("warning", f"{cc['pagefile']} stutterów przy intensywnym czytaniu z pliku wymiany",
+            "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
+            "plik wymiany zarządzany przez system na Samsung 990 PRO.")
+    f += diskinfo.findings(rep)
     bgc = {k.split(":", 1)[1]: v for k, v in cc.items() if k.startswith("background_gpu:")}
     heavy = [b for b in rep.get("gpu_background") or [] if (b["avg_pct"] or 0) >= 10 or (b["max_pct"] or 0) >= 30]
     if bgc or heavy:
@@ -120,4 +132,23 @@ def findings(rep, row):
         add("warning", "Procesy w tle obciążające GPU",
             f"{names}. Przeglądarka z wideo, Wallpaper Engine, nagrywanie/overlaye zabierają GPU grze - zamknij je "
             "lub wyłącz akcelerację sprzętową na czas grania.")
+    return f
+
+
+def health_findings(con, rep):
+    """Extra `pm health` findings: disk resets / health from incidents and the latest system_info."""
+    f = []
+    bk = rep.get("incidents_by_kind") or {}
+    n = sum(bk.get(k, 0) for k in ("nvme_reset", "disk_retry", "disk_removed"))
+    if n:
+        f.append({"severity": "serious", "title": f"{n}x reset kontrolera / ponowienie I/O / odłączenie dysku",
+                  "detail": "Zdarzenia stornvme 129 / disk 153 / disk 157 - firmware SSD, osadzenie M.2 / kabel SATA, "
+                            "ASPM (Link State Power Management) w planie zasilania. Lista: pm incidents --kind nvme_reset"})
+    r = con.execute("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
+    for w in diskinfo.health_warnings(an._json(r[0]) if r else {}):
+        f.append({"severity": "warning", "title": "Zdrowie dysku", "detail": w})
+    if bk.get("disk_health"):
+        f.append({"severity": "serious", "title": f"{bk['disk_health']}x pogorszenie zdrowia dysku",
+                  "detail": "Przybyło błędów nieskorygowanych lub zużycie nośnika przekroczyło 90% - kopia zapasowa, "
+                            "sprawdź pm sysinfo (tabela zdrowia dysków)."})
     return f

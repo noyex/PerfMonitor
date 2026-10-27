@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import win32evtlog
 
+from . import diskinfo
+
 log = logging.getLogger("perfmon.events")
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
@@ -143,6 +145,16 @@ def exe_from_message(m: str, first_field=False) -> str:
     return s.group(1) if s else "?"
 
 
+def data_values(ev):
+    """events.data as a list of strings (dict values in order), [] when absent."""
+    try:
+        d = json.loads(ev.get("data") or "null")
+    except (TypeError, ValueError):
+        return []
+    d = list(d.values()) if isinstance(d, dict) else d
+    return [str(x) for x in d or [] if x is not None]
+
+
 def classify(ev: dict):
     """Returns (kind, severity, title) if the event is an incident, otherwise None."""
     p, i, m = ev["provider"], ev["event_id"], ev["message"] or ""
@@ -162,6 +174,17 @@ def classify(ev: dict):
         return "app_hang", "serious", f"Aplikacja przestała odpowiadać: {exe_from_message(m)}"
     if p == "Microsoft-Windows-Kernel-Processor-Power" and i == 37:
         return "throttle", "warning", "Firmware ograniczył taktowanie CPU (throttling)"
+    if p == "stornvme" and i == 129:
+        n = diskinfo.raidport_disk(m, data_values(ev))
+        return "nvme_reset", "critical", "Reset kontrolera NVMe" + (f" (port {n})" if n is not None else "")
+    if p == "disk" and i in (153, 157):
+        n = diskinfo.raidport_disk(m, data_values(ev))
+        d = f" {n}" if n is not None else ""
+        return (("disk_retry", "serious", f"Ponowienie operacji I/O na dysku{d} (disk 153)") if i == 153 else
+                ("disk_removed", "serious", f"Dysk{d} nieoczekiwanie odłączony (disk 157)"))
+    if p in ("Ntfs", "Microsoft-Windows-Ntfs") and i in (55, 98, 140):
+        v = diskinfo.ntfs_volume(m, data_values(ev))
+        return "disk", "serious", "Uszkodzenie systemu plików NTFS" + (f" (wolumin {v})" if v else "") + f" - Ntfs {i}"
     if p in ("disk", "Ntfs", "stornvme", "storahci", "volmgr", "Microsoft-Windows-Ntfs") and ev["level"] <= 3:
         return "disk", "serious", f"Błąd/ostrzeżenie dysku: {p} {i}"
     if p == "Microsoft-Windows-Resource-Exhaustion-Detector":

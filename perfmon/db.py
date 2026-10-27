@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS samples (            -- every 1 s, whole system
     dwm_ms REAL,                                 -- longest DwmFlush in the last second (window compositor)
     user_idle_s REAL,                            -- seconds since last keyboard/mouse input
     game_session INTEGER,                        -- game session id if running
+    pagefile_pct REAL,                           -- Paging File(_Total) % Usage
     extra TEXT                                   -- JSON: disks separately, disk temperatures etc.
 );
 CREATE TABLE IF NOT EXISTS sessions (           -- game session (from start to exe close)
@@ -92,6 +93,7 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         add_columns(con, "sessions", {"context": "TEXT"})
         add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
         add_columns(con, "events", {"data": "TEXT"})
+        add_columns(con, "samples", {"pagefile_pct": "REAL"})
     con.row_factory = sqlite3.Row
     return con
 

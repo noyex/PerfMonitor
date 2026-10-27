@@ -296,7 +296,7 @@ def session_report(con, session_id):
 
     # --- stutters with causes
     st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
-    samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, "
+    samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, pagefile_pct, "
                          "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
                          "fg_exe FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (start - 3, end + 3))
     procs = _rows(con, "SELECT ts, name, cpu_pct FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? ORDER BY ts",
@@ -759,6 +759,8 @@ def diagnose(rep, con=None, t0=None):
             add("info", "Zmiana konfiguracji tuż przed pierwszym resetem",
                 "; ".join(f"{c['time']}: {', '.join(c.get('changed') or [])}" for c in near[:3]) +
                 ". Porównaj z `pm sysinfo --diff` (sterowniki/BIOS/ustawienia).")
+    if con is not None:
+        f += diagreport.health_findings(con, rep)
     if not f:
         f.append({"severity": "info", "title": "Brak istotnych incydentów", "detail": f"W ostatnich {rep['days']} dniach nic niepokojącego."})
     order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}

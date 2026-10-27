@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, crashinfo, db, gamectx, gpuproc, marks, sysinfo
+from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, sysinfo
 from .events import EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -30,7 +30,7 @@ SAMPLE_COLS = [
     "gpu_clock_mhz", "gpu_mem_clock_mhz", "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w",
     "gpu_fan_rpm", "disk_read_mbs", "disk_write_mbs", "disk_lat_ms", "disk_lat_disk", "disk_queue",
     "disk_busy_pct", "net_rx_kbs", "net_tx_kbs", "fg_exe", "fg_hung", "ui_ms", "dwm_ms",
-    "user_idle_s", "game_session", "extra",
+    "user_idle_s", "game_session", "extra", "pagefile_pct",
 ]
 INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUES ({','.join('?' * len(SAMPLE_COLS))})"
 
@@ -195,6 +195,7 @@ class Collector:
             disk_queue=queue, disk_busy_pct=busy, net_rx_kbs=rx, net_tx_kbs=tx,
             fg_exe=self.pname(fg_pid), fg_hung=int(fg_hung), ui_ms=ui_ms, dwm_ms=dwm_ms,
             user_idle_s=user_idle_s(), game_session=session, extra=json.dumps(extra),
+            pagefile_pct=p.get("pagefile_pct"),
         )
         self.exec(INSERT_SAMPLE, [row[c] for c in SAMPLE_COLS])
         self.detect_live(row)
@@ -495,9 +496,12 @@ class Collector:
         if prev:
             old = json.loads(prev[0])
             changed = {k: {"before": old.get(k), "after": v} for k, v in info.items()
-                       if k not in ("last_boot", "volumes", "background_tools", "pagefile") and old.get(k) != v}
+                       if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health")
+                       and old.get(k) != v}
             if changed:
                 self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)
+            for kind, sev, title, det in diskinfo.health_changes(old, info):
+                self.incident(kind, sev, title, det)
 
     # ---------- self reload ----------
     def check_reload(self, now):
