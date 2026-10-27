@@ -2,13 +2,14 @@
 let current = null;
 
 const route = async () => {
-  const [, name = "now", ...rest] = location.hash.split("/");
+  const [, name = "overview", ...rest] = location.hash.split("/");
   const params = Object.fromEntries(new URLSearchParams(rest.join("/").split("?")[1] || location.hash.split("?")[1] || ""));
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.getAttribute("href").split("/")[1] === name.split("?")[0]));
+  const key = window.Pages[name.split("?")[0]] ? name.split("?")[0] : "overview";  // unknown and old #/now -> overview
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.getAttribute("href").split("/")[1] === key));
   if (current && current.destroy) current.destroy();
   const view = document.getElementById("view");
   view.innerHTML = "";
-  const page = window.Pages[name.split("?")[0]] || window.Pages.now;
+  const page = window.Pages[key];
   current = page;
   try {
     await page.render(view, params);
@@ -17,17 +18,23 @@ const route = async () => {
   }
 };
 
+// The header shows the collector state only when something is wrong.
 const status = async () => {
-  const dot = document.getElementById("st-dot");
+  const box = document.getElementById("status");
   const text = document.getElementById("st-text");
+  let problem = null;
   try {
     const s = await api("latest");
-    const alive = s.collector_alive ?? s.alive;
-    dot.className = `dot ${alive ? "ok" : "bad"}`;
-    text.textContent = alive ? (s.admin === false || s.admin === 0 || s.admin === "0" ? "Zbieranie (bez admina)" : "Zbieranie aktywne") : "Kolektor nie działa";
+    if (s.host) document.getElementById("host").textContent = s.host.toUpperCase();
+    if (!(s.collector_alive ?? s.alive)) problem = ["bad", "Kolektor nie działa"];
+    else if (s.admin === false) problem = ["warn", "Zbieranie bez uprawnień administratora"];
   } catch {
-    dot.className = "dot bad";
-    text.textContent = "Brak danych";
+    problem = ["bad", "Brak danych"];
+  }
+  box.hidden = !problem;
+  if (problem) {
+    box.querySelector(".dot").className = `dot ${problem[0]}`;
+    text.textContent = problem[1];
   }
 };
 

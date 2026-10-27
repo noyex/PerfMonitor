@@ -6,27 +6,34 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/vendor/uPlot.min.css">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/pages/overview.css">
   <link rel="stylesheet" href="/pages/games.css">
   <link rel="stylesheet" href="/pages/compare.css">
   <link rel="stylesheet" href="/pages/problems.css">
 </head>
 <body>
   <header>
-    <div class="brand">PerfMonitor</div>
+    <div class="bar">
+      <a class="brand" href="#/overview" aria-label="PerfMonitor">
+        <svg width="22" height="22" viewBox="0 0 28 28" aria-hidden="true"><circle cx="8" cy="14" r="5.5" fill="currentColor"/><path d="M16 7.5a9 9 0 0 1 0 13" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round"/><path d="M21 3.5a14.5 14.5 0 0 1 0 21" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round" opacity=".45"/></svg>
+      </a>
+      <span class="crumb">/</span>
+      <span class="host" id="host">PerfMonitor</span>
+      <div class="status" id="status" hidden><span class="dot bad"></span><span id="st-text"></span></div>
+    </div>
     <nav>
-      <a href="#/now">Teraz</a>
+      <a href="#/overview">Przegląd</a>
       <a href="#/timeline">Oś czasu</a>
       <a href="#/games">Gry</a>
       <a href="#/compare">Porównania</a>
       <a href="#/problems">Problemy</a>
     </nav>
-    <div class="status"><span class="dot" id="st-dot"></span><span id="st-text">…</span></div>
   </header>
   <main id="view"></main>
   <div class="toast" id="toast"></div>
   <script src="/vendor/uPlot.iife.min.js"></script>
   <script src="/lib.js"></script>
-  <script src="/pages/now.js"></script>
+  <script src="/pages/overview.js"></script>
   <script src="/pages/timeline.js"></script>
   <script src="/pages/games.js"></script>
   <script src="/pages/compare.js"></script>
