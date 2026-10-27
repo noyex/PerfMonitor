@@ -31,12 +31,15 @@ def stop_etw_session(name):
 def cleanup_stale_sessions():
     """Stop PerfMon_<pid>_<n> ETW sessions left behind by collectors that no longer run (called once at start)."""
     try:
-        out = subprocess.run(["logman", "query", "-ets"], capture_output=True, text=True, timeout=30,
-                             creationflags=CREATE_NO_WINDOW).stdout
-    except Exception:
+        # bytes: logman prints localized text in the OEM code page, which text=True cannot decode (stdout was None)
+        raw = subprocess.run(["logman", "query", "-ets"], capture_output=True, timeout=30,
+                             creationflags=CREATE_NO_WINDOW).stdout or b""
+        out = raw.decode("ascii", errors="replace")   # session names are ASCII
+        stale = [m.group(0) for m in re.finditer(r"^PerfMon_(\d+)_\d+(?=\s)", out, re.M)
+                 if int(m.group(1)) != os.getpid() and not _pid_alive(int(m.group(1)))]
+    except Exception as e:
+        log.warning("stale PresentMon ETW session cleanup failed: %s", e)   # never block the collector start
         return 0
-    stale = [m.group(0) for m in re.finditer(r"^PerfMon_(\d+)_\d+(?=\s)", out, re.M)
-             if int(m.group(1)) != os.getpid() and not _pid_alive(int(m.group(1)))]
     for name in stale:
         stop_etw_session(name)
     if stale:

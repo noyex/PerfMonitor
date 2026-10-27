@@ -191,5 +191,19 @@ class PresentAnalysisTest(unittest.TestCase):
         self.assertIn("IFlip", present.describe(p))
 
 
+class StaleSessionCleanupTest(unittest.TestCase):
+    def test_localized_logman_output_does_not_crash(self):
+        out = "Zbiór danych
+PerfMon_999999_3                Trace    Running
+".encode("cp852")
+        run = mock.Mock(return_value=mock.Mock(stdout=out))
+        with mock.patch.object(pmn.subprocess, "run", run), mock.patch.object(pmn, "_pid_alive", return_value=False),                 mock.patch.object(pmn, "stop_etw_session") as stop:
+            self.assertEqual(pmn.cleanup_stale_sessions(), 1)
+        stop.assert_called_once_with("PerfMon_999999_3")
+
+    def test_logman_failure_is_swallowed(self):
+        with mock.patch.object(pmn.subprocess, "run", side_effect=OSError("no logman")):
+            self.assertEqual(pmn.cleanup_stale_sessions(), 0)
+
 if __name__ == "__main__":
     unittest.main()
