@@ -46,6 +46,8 @@ DEFAULTS = {
         "upc.exe", "ubisoftconnect.exe", "gamebar.exe", "gamingservices.exe", "xboxpcapp.exe",
         "msedgewebview2.exe", "cefsharp.browsersubprocess.exe", "uninstall.exe", "unins000.exe",
         "redistributable.exe", "vc_redist.x64.exe", "dxsetup.exe", "launcher.exe", "presentmon.exe",
+        "wallpaper32.exe", "wallpaper64.exe", "wallpaperservice32.exe", "wallpaperui.exe", "webwallpaper32.exe",
+        "steamerrorreporter.exe",
     ],
 }
 
