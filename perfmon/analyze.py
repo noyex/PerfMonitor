@@ -8,11 +8,12 @@ import bisect
 import json
 import math
 import re
+import socket
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import crashinfo, diagreport, marks
+from . import bottleneck, crashinfo, diagreport, marks
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -133,11 +134,50 @@ def latest(con):
         "sample_age_s": _r(now - s["ts"]) if s else None,
         "collector_alive": bool(s and now - s["ts"] < 5),
         "admin": meta.get("admin") == "1",
+        "host": socket.gethostname(),
         "collector_started": float(meta["collector_started"]) if meta.get("collector_started") else None,
         "collector_stopped": float(meta["collector_stopped"]) if meta.get("collector_stopped") else None,
         "hw": _json(meta.get("hw")),
         "open_session": sess,
         "counts": cnt,
+    }
+
+
+# share of session time behind each bottleneck kind (metrics key from bottleneck.compute)
+_BOTTLENECK_SHARE = {"gpu": "gpu_bound_pct", "gpu_power": "gpu_bound_pct", "cpu": "cpu_bound_pct",
+                     "cpu_thread": "cpu_bound_pct", "limit": "limit_pct", "vram": "vram_shared_over_pct"}
+
+
+def overview(con, recent=5):
+    """Overview screen: the running game session, else the last one with frames, plus the latest sessions.
+
+    `current` adds stutter timestamps, the last stutter and the bottleneck ({kind, share, advice}); for a running
+    session the bottleneck is computed live, for a finished one it comes from the summary (computed if missing)."""
+    now = time.time()
+    s = _one(con, "SELECT ts FROM samples ORDER BY ts DESC LIMIT 1")
+    rows = sessions(con, recent + 10)
+    cur = next((r for r in rows if r["running"]), None) or next((r for r in rows if r.get("frames")), None)
+    if cur:
+        sid = cur["id"]
+        st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? ORDER BY ts DESC LIMIT 500", (sid,))]
+        cur["stutter_ts"] = st[::-1]
+        cur["last_stutter_ts"] = st[0] if st else None
+        b = None if cur["running"] else (_json(_one(con, "SELECT summary FROM sessions WHERE id=?", (sid,))["summary"])
+                                         or {}).get("bottleneck")
+        if not b:
+            b = bottleneck.compute(con, sid, cur["start_ts"], cur["end_ts"] or now)
+        if b:
+            share = (b.get("metrics") or {}).get(_BOTTLENECK_SHARE.get(b["kind"]))
+            cur["bottleneck"] = {"kind": b["kind"], "share": share, "advice": b.get("advice")}
+        else:
+            cur["bottleneck"] = None
+    return {
+        "now": now,
+        "collector_alive": bool(s and now - s["ts"] < 5),
+        "current": cur,
+        # sessions without frames that ended normally are launchers / short starts, not games played
+        "recent": [r for r in rows if not r["running"] and r is not cur
+                   and (r.get("frames") or r["end_reason"] != "exit")][:recent],
     }
 
 

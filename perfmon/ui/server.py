@@ -28,6 +28,7 @@ def _since(q, default="14d"):
 
 ROUTES = {
     "latest": lambda con, q: analyze.latest(con),
+    "overview": lambda con, q: analyze.overview(con),
     "series": lambda con, q: analyze.series(con, _f(q, "from"), _f(q, "to", time.time()),
                                             [c for c in q.get("cols", "").split(",") if c],
                                             int(q.get("points", 1500))),
