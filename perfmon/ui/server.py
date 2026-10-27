@@ -52,6 +52,10 @@ ROUTES = {
 }
 
 
+def _local_host(host):
+    return urlparse(f"//{host}").hostname in ("127.0.0.1", "localhost")
+
+
 def _pid(q):
     return int(q["profile"]) if q.get("profile") else None
 
@@ -61,7 +65,7 @@ def save_profile(con, body):
     pid = body.get("id")
     args = {k: body.get(k) for k in ("name", "cpu", "gpu", "notes", "status")}
     if pid:
-        ocanalyze.update_profile(con, int(pid), **args)
+        ocanalyze.update_profile(con, int(pid), **args, replace=True)
     else:
         pid = ocanalyze.create_profile(con, args["name"], args["cpu"], args["gpu"], args["notes"],
                                        args["status"] or "testing")
@@ -88,6 +92,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         origin = self.headers.get("Origin")
         host = self.headers.get("Host", "")
+        if not _local_host(host):
+            return self._send(403, b'{"error":"forbidden"}', "application/json")
         if u.path != "/api/oc_profile":
             return self._send(404, b'{"error":"not found"}', "application/json")
         if not self.headers.get("Content-Type", "").startswith("application/json") or (
@@ -112,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path.startswith("/api/"):
+            if not _local_host(self.headers.get("Host", "")):   # DNS rebinding: only 127.0.0.1 / localhost
+                return self._send(403, b'{"error":"forbidden"}', "application/json")
             name = u.path[5:]
             fn = ROUTES.get(name)
             if not fn:

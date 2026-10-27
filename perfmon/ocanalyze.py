@@ -98,7 +98,9 @@ def create_profile(con, name, cpu=None, gpu=None, notes=None, status="testing"):
     return cur.lastrowid
 
 
-def update_profile(con, pid, name=None, cpu=None, gpu=None, notes=None, status=None):
+def update_profile(con, pid, name=None, cpu=None, gpu=None, notes=None, status=None, replace=False):
+    """cpu/gpu None = keep. replace=False merges the given keys (CLI flags); replace=True takes the dicts as the
+    complete new settings (UI editor), so cleared fields are removed."""
     p = profile(con, pid)
     if not p:
         raise ValueError(f"Nie ma profilu #{pid}")
@@ -106,8 +108,10 @@ def update_profile(con, pid, name=None, cpu=None, gpu=None, notes=None, status=N
         raise ValueError(f"status: {'|'.join(STATUSES)}")
     cpu, gpu = validate(cpu, gpu)
     con.execute("UPDATE oc_profiles SET name=?, status=?, cpu=?, gpu=?, notes=? WHERE id=?",
-                ((name or p["name"]).strip(), status or p["status"], json.dumps(_merge(p["cpu"], cpu)),
-                 json.dumps(_merge(p["gpu"], gpu)), p["notes"] if notes is None else notes, int(pid)))
+                ((name or p["name"]).strip(), status or p["status"],
+                 json.dumps(p["cpu"] if cpu is None else cpu if replace else _merge(p["cpu"], cpu)),
+                 json.dumps(p["gpu"] if gpu is None else gpu if replace else _merge(p["gpu"], gpu)),
+                 p["notes"] if notes is None else notes, int(pid)))
     con.commit()
 
 
@@ -116,6 +120,9 @@ def activate(con, pid, ts=None, source="manual"):
     if not profile(con, pid):
         raise ValueError(f"Nie ma profilu #{pid}")
     ts = time.time() if ts is None else float(ts)
+    last = con.execute("SELECT MAX(ts) FROM oc_profile_log").fetchone()[0]
+    if last is not None and ts < last:
+        raise ValueError(f"Aktywację można cofnąć najwyżej do ostatniej zmiany profilu ({fmt_ts(last)})")
     con.execute("INSERT INTO oc_profile_log(ts, profile_id, source) VALUES (?,?,?)", (ts, int(pid), source))
     retag_sessions(con)
     con.commit()

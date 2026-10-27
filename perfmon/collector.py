@@ -44,7 +44,6 @@ TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100, "vrm_tem
 VSOC_MAX = 1.30       # V: upper safe limit of Zen 4 SoC voltage
 OC_ALERT_S = 5        # UV/OC alerts fire only after the condition held this long
 STRETCH_MAX = 0.97    # effective / reference clock of a fully loaded core below this = clock stretching
-GPU_OD_POLL_S = 60
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -99,7 +98,8 @@ class Collector:
         self.last_detail = 0.0
         self.oc_since = {}             # UV/OC alert key -> ts the condition started (debounce)
         self.gpu_clk_hist = []         # (ts, MHz) of the GPU core clock under full load, last 60 s
-        self.gpu_od = ocmon.GpuOverdrive(self.hw.gpu.Name if self.hw.gpu is not None else None)
+        self.gpu_od = (ocmon.GpuOverdrive(self.hw.gpu.Name if self.hw.gpu is not None else None)
+                       if self.cfg["gpu_od_poll_s"] else None)
         self.last_gpu_od = 0.0
         self.last_oc_stats = 0.0
         self.vacuuming = False
@@ -370,6 +370,9 @@ class Collector:
             except Exception:
                 exe = None
             stress = ocmon.stress_kind(name, exe, self.cfg)
+            if stress and any(g.get("stress") == stress[0] for g in self.games.values()):
+                self.not_games.add(key)   # helper exe of a test that already has a session
+                continue
             if stress:
                 self.start_game(pid, name, exe, stress=stress)
                 alive.add(pid)
@@ -409,7 +412,8 @@ class Collector:
         cap = None
         if os.path.exists(self.cfg["presentmon_exe"]) and (not stress or stress[1]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
-        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time()}
+        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time(),
+                           "stress": stress[0] if stress else None}
         log.info("game start %s pid=%s session=%s", name, pid, sid)
 
     def on_frame_second(self, r):
@@ -455,6 +459,7 @@ class Collector:
                 keep.append((sid, exe, end))
             elif self._crash_event(exe, end):
                 self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,))
+                self.exec("DELETE FROM oc_session_stats WHERE session=?", (sid,))   # re-aggregated with the crash
                 log.info("session %s reclassified as crash (late WER event)", sid)
         self.pending_crash_checks = keep
 
@@ -492,7 +497,7 @@ class Collector:
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             self.name_cache.clear()
             self.detail_retention(now)
-        if now - self.last_gpu_od > GPU_OD_POLL_S:
+        if self.gpu_od and now - self.last_gpu_od > self.cfg["gpu_od_poll_s"]:
             self.last_gpu_od = now
             self.check_gpu_od(now)
         if now - self.last_oc_stats > 60:
@@ -503,8 +508,8 @@ class Collector:
     def check_gpu_od(self, now):
         """Store the Adrenalin tuning when it changes; a change = incident asking to tag the profile."""
         cur = self.gpu_od.read()
-        if not cur:
-            return
+        if not cur or (self.gpu_od.ok and "named" not in cur):
+            return   # ADL failed this time (driver busy / after a TDR): not a settings change
         prev = self.exec("SELECT settings FROM gpu_od_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
         prev = json.loads(prev[0]) if prev else None
         diffs = ocmon.describe_change(prev, cur) if prev else []
@@ -515,21 +520,21 @@ class Collector:
                           "(pm oc add / activate)", {"changes": diffs, "settings": cur.get("named")}, ts=now)
 
     def save_oc_stats(self):
-        """Per-session UV/OC aggregates of finished sessions (they outlive the pruned hw_detail)."""
+        """Per-session UV/OC aggregates of finished sessions (they outlive the pruned hw_detail). Waits until
+        late crash events / incidents had time to arrive (crash re-check, event polls)."""
         rows = self.exec(
-            "SELECT id FROM sessions s WHERE end_ts IS NOT NULL AND start_ts > ? AND NOT EXISTS "
-            "(SELECT 1 FROM oc_session_stats o WHERE o.session=s.id) ORDER BY id DESC LIMIT 5",
-            (time.time() - self.cfg["detail_retention_days"] * 86400,)).fetchall()
-        for (sid,) in rows:
+            "SELECT id, exe, start_ts, end_ts, kind, profile_id FROM sessions s WHERE end_ts IS NOT NULL AND end_ts < ? "
+            "AND NOT EXISTS (SELECT 1 FROM oc_session_stats o WHERE o.session=s.id) ORDER BY id DESC LIMIT 5",
+            (time.time() - 180,)).fetchall()
+        for sid, exe, start, end, kind, profile in rows:
             try:
                 with self.lock:
                     st = ocanalyze.session_stats(self.con, sid)
-                    self.con.execute("INSERT OR REPLACE INTO oc_session_stats VALUES (?,?,?,?,?,?,?)",
-                                     (sid, st["profile_id"], st["kind"], st["exe"], st["start_ts"], st["end_ts"],
-                                      json.dumps(st["stats"])))
-                    self.con.commit()
-            except Exception:
-                log.exception("oc stats for session %s", sid)
+                row = (sid, st["profile_id"], st["kind"], st["exe"], st["start_ts"], st["end_ts"], json.dumps(st["stats"]))
+            except Exception as e:
+                log.warning("oc stats for session %s: %s", sid, e)   # stored as an error so it is not retried forever
+                row = (sid, profile, kind or "game", exe, start, end, json.dumps({"error": str(e)}))
+            self.exec("INSERT OR REPLACE INTO oc_session_stats VALUES (?,?,?,?,?,?,?)", row)
 
     def detail_retention(self, now):
         days = self.cfg["detail_retention_days"]
@@ -545,7 +550,8 @@ class Collector:
         self.exec("DELETE FROM hw_detail WHERE ts < ?", (now - days * 86400,))
         with self.lock:
             last = float(db.get_meta(self.con, "last_vacuum", 0))
-        if now - last > 7 * 86400 and not self.vacuuming:
+        incremental = self.exec("PRAGMA auto_vacuum").fetchone()[0] == 2
+        if incremental and now - last > 7 * 86400 and not self.vacuuming:
             self.vacuuming = True
             threading.Thread(target=self._incremental_vacuum, daemon=True).start()
 

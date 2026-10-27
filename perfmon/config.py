@@ -20,6 +20,7 @@ DEFAULTS = {
     "detail_interval_s": 10.0,          # hw_detail outside game/stress sessions (1 s inside them)
     "db_guard_gb": 2.0,                 # above this perf.db size: warning incident + detail retention cut to 14 days
     "apic_ids_per_core": 2,             # WHEA APIC ID -> core (7700X with SMT: 2 threads per core)
+    "gpu_od_poll_s": 600,               # Adrenalin tuning readout via ADL; 0 = never touch ADL
     "ui_port": 8765,
     "lhm_dir": str(_WINGET / "LibreHardwareMonitor.LibreHardwareMonitor_Microsoft.Winget.Source_8wekyb3d8bbwe"),
     "presentmon_exe": str(_WINGET / "Intel.PresentMon.Console_Microsoft.Winget.Source_8wekyb3d8bbwe" / "presentmon.exe"),

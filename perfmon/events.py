@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import win32evtlog
 
+from . import config
 from .ocmon import parse_whea
 
 log = logging.getLogger("perfmon.events")
@@ -129,11 +130,12 @@ def classify(ev: dict):
     if i == 6008 and p == "EventLog":
         return "unclean_shutdown", "critical", "Poprzednie zamknięcie systemu było nieoczekiwane (6008)"
     if p.startswith("Microsoft-Windows-WHEA"):
+        apc = config.load().get("apic_ids_per_core", 2)
         if i == 19:
-            core = parse_whea(m).get("core")
+            core = parse_whea(m, apc).get("core")
             return "whea_corrected", "serious", "Skorygowany błąd CPU WHEA 19" + (f" (rdzeń {core})" if core is not None else "")
         if i == 18:
-            core = parse_whea(m).get("core")
+            core = parse_whea(m, apc).get("core")
             return "whea_fatal", "critical", "Krytyczny błąd CPU WHEA 18" + (f" (rdzeń {core})" if core is not None else "")
         if i == 17:
             return "whea_pcie", "serious", "Skorygowany błąd PCIe WHEA 17"
