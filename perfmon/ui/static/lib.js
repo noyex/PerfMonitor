@@ -34,6 +34,14 @@ const fmtDur = (s) => {
   return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${pad(m % 60)} min`;
 };
 const gameName = (exe) => (exe || "").replace(/\.exe$/i, "");
+// Session's game title: the Steam name when the session context has one, else the exe name.
+const gameTitle = (s) => ((s.context && s.context.steam && s.context.steam.name) || "").replace(/[®™]/g, "").trim() || gameName(s.exe);
+// Polish plural: plural(n, "przycięcie", "przycięcia", "przycięć") -> 1 / 2-4, 22-24... / 0, 5-21, 25...
+const plural = (n, one, few, many) => {
+  if (n === 1) return one;
+  const d = n % 10, t = n % 100;
+  return d >= 2 && d <= 4 && (t < 12 || t > 14) ? few : many;
+};
 
 // ---------- DOM ----------
 const h = (tag, attrs = {}, ...children) => {
@@ -105,7 +113,7 @@ const markersPlugin = (getMarkers) => ({
         const x = Math.round(u.valToPos(m.ts, "x", true));
         if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
         ctx.strokeStyle = m.color || css(`--${m.severity || "muted"}`) || css("--muted");
-        ctx.globalAlpha = 0.75;
+        ctx.globalAlpha = ms.length > 40 ? 0.3 : 0.75;  // hundreds of incidents would paint a solid block
         ctx.setLineDash(m.dash ? [4 * devicePixelRatio, 4 * devicePixelRatio] : []);
         ctx.beginPath();
         ctx.moveTo(x, top);
@@ -185,7 +193,7 @@ const chart = (container, opt, data) => {
     stroke: css("--muted"),
     grid: { stroke: css("--grid"), width: 1 },
     ticks: { show: false },
-    font: `11px system-ui, "Segoe UI", sans-serif`,
+    font: `13px Geist, system-ui, sans-serif`,
   };
   const u = new uPlot(
     {

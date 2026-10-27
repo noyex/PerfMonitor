@@ -3,8 +3,8 @@
 .games-table tbody tr:hover { background: var(--surface-2); }
 .games-table td.muted { color: var(--muted); }
 .games-table .sev { margin-left: 10px; }
-.games-table .chip { margin-left: 10px; padding: 1px 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 11px; color: var(--muted); }
-.games-table .live { color: var(--good); font-size: 12px; margin-left: 10px; }
+.games-table .chip { margin-left: 10px; padding: 1px 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--muted); }
+.games-table .live { color: var(--good); font-size: 13px; margin-left: 10px; }
 .page-head .back { color: var(--muted); text-decoration: none; font-size: 13px; }
 .page-head .back:hover { color: var(--ink); }
 .page-head a.btn { text-decoration: none; }
