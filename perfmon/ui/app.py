@@ -24,7 +24,7 @@ def main():
     try:
         import webview
         webview.create_window("PerfMonitor", url, width=1440, height=920, min_size=(1000, 700),
-                              background_color="#0d0d0d")
+                              background_color="#000000")
         webview.start()
     except Exception:
         webbrowser.open(url)
