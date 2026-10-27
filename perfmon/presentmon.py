@@ -13,6 +13,27 @@ from collections import Counter, deque
 log = logging.getLogger("perfmon.presentmon")
 
 CREATE_NO_WINDOW = 0x08000000
+FALLBACK_WINDOW_S = 15     # PresentMon exiting this soon without rows = it rejected an option (retry without it)
+# FrameType values that are not generated frames (AMD AFMF / Intel XeFG / ... are)
+NATIVE_FRAME_TYPES = {"", "NotSet", "Unspecified", "Application", "Repeated"}
+
+
+def _s(row, *names):
+    for n in names:
+        v = row.get(n)
+        if v not in (None, "", "NA"):
+            return v
+    return None
+
+
+def _mode(values):
+    c = Counter(v for v in values if v is not None)
+    return c.most_common(1)[0][0] if c else None
+
+
+def _avg(values):
+    v = [x for x in values if x is not None]
+    return sum(v) / len(v) if v else None
 
 
 def _f(row, *names):
@@ -51,25 +72,40 @@ class FrameCapture:
         self.prev_t = None
         self.error = None
         self.lines = 0
-        args = [exe_path, "--process_id", str(pid), "--output_stdout", "--no_console_stats",
-                # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
-                "--session_name", f"PerfMon_{os.getpid()}_{session_id}", "--stop_existing_session",
-                "--terminate_on_proc_exit"]
+        self.stopped = False
+        self.track_frame_type = True
+        self.fields = None
+        # whole-capture present stats for summary()["present"] (frame counts and sums)
+        self.p_modes, self.p_runtime, self.p_sync = Counter(), Counter(), Counter()
+        self.p = Counter()
+        self.p_lock = threading.Lock()
+        self.base_args = [exe_path, "--process_id", str(pid), "--output_stdout", "--no_console_stats",
+                          # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
+                          "--session_name", f"PerfMon_{os.getpid()}_{session_id}", "--stop_existing_session",
+                          "--terminate_on_proc_exit"]
+        self.proc = None
+        if not self._spawn():
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True, name=f"pm-{game_exe}")
+        self.thread.start()
+
+    def _spawn(self):
+        args = self.base_args + (["--track_frame_type"] if self.track_frame_type else [])
         try:
+            self.started = time.time()
             self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          creationflags=CREATE_NO_WINDOW)
         except Exception as e:
             self.proc = None
             self.error = str(e)
             log.warning("PresentMon start: %s", e)
-            return
-        self.thread = threading.Thread(target=self._run, daemon=True, name=f"pm-{game_exe}")
-        self.thread.start()
-        threading.Thread(target=self._stderr, daemon=True).start()
+            return False
+        threading.Thread(target=self._stderr, args=(self.proc,), daemon=True).start()
+        return True
 
-    def _stderr(self):
+    def _stderr(self, proc):
         try:
-            for line in io.TextIOWrapper(self.proc.stderr, encoding="utf-8", errors="replace"):
+            for line in io.TextIOWrapper(proc.stderr, encoding="utf-8", errors="replace"):
                 line = line.strip()
                 if line:
                     log.info("PresentMon: %s", line[:300])
@@ -94,21 +130,40 @@ class FrameCapture:
         return self.offset + rel
 
     def _run(self):
-        reader = csv.DictReader(io.TextIOWrapper(self.proc.stdout, encoding="utf-8", errors="replace"))
+        while True:
+            proc = self.proc
+            self._read(proc)
+            try:
+                rc = proc.wait(5)
+            except Exception:
+                rc = None
+            # a PresentMon that does not know --track_frame_type exits at once with a usage error and no rows
+            if (self.stopped or not self.track_frame_type or self.lines or not rc
+                    or time.time() - self.started > FALLBACK_WINDOW_S):
+                break
+            log.warning("PresentMon exited (%s) without rows, retrying without --track_frame_type", rc)
+            self.track_frame_type = False
+            self.error = None
+            if not self._spawn():
+                break
+            if self.stopped:   # stop() ran while spawning and only saw the old process
+                self.stop()
+                break
+        self._flush()
+
+    def _read(self, proc):
+        reader = csv.DictReader(io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace"))
         try:
             for row in reader:
+                if self.fields is None:
+                    self.fields = set(reader.fieldnames or ())
+                    log.info("PresentMon columns: %s", ",".join(reader.fieldnames or ()))
                 self.lines += 1
                 ft = _f(row, "FrameTime", "MsBetweenPresents")
                 if ft is None or ft <= 0 or ft > 60000:
                     continue
                 ts = self._row_time(row, ft)
-                frame = dict(
-                    ft=ft,
-                    cpu=_f(row, "CPUBusy", "MsCPUBusy"),
-                    gpu=_f(row, "GPUBusy", "MsGPUActive", "GPUTime"),
-                    disp=_f(row, "DisplayLatency", "MsUntilDisplayed"),
-                    mode=row.get("PresentMode") or "",
-                )
+                frame = self._frame(row, ft)
                 self.all_ft.append(ft)
                 self._stutter_check(ts, ft)
                 self.recent.append(ft)
@@ -121,7 +176,30 @@ class FrameCapture:
                 self.bucket.append(frame)
         except Exception as e:
             log.warning("PresentMon read: %s", e)
-        self._flush()
+
+    def _frame(self, row, ft):
+        """Per-frame fields; a column this PresentMon version does not write stays None."""
+        f = self.fields
+        displayed = None
+        if "DisplayedTime" in f:   # v2: NA / 0 = the frame never reached the screen
+            displayed = (_f(row, "DisplayedTime") or 0) > 0
+        elif "Dropped" in f:       # v1
+            displayed = _f(row, "Dropped") != 1
+        sync, tear = _f(row, "SyncInterval"), _f(row, "AllowsTearing")
+        return dict(
+            ft=ft,
+            cpu=_f(row, "CPUBusy", "MsCPUBusy"),
+            gpu=_f(row, "GPUBusy", "MsGPUActive", "GPUTime"),
+            disp=_f(row, "DisplayLatency", "MsUntilDisplayed"),
+            mode=row.get("PresentMode") or "",
+            runtime=_s(row, "PresentRuntime", "Runtime"),
+            sync=int(sync) if sync is not None else None,
+            tearing=int(tear) if tear is not None else None,
+            displayed=displayed,
+            click=_f(row, "ClickToPhotonLatency", "MsClickToPhotonLatency"),
+            input=_f(row, "AllInputToPhotonLatency", "MsAllInputToPhotonLatency"),
+            ftype=row.get("FrameType") if "FrameType" in f else None,
+        )
 
     def _stutter_check(self, ts, ft):
         if len(self.recent) < 30:
@@ -148,13 +226,52 @@ class FrameCapture:
                 bound = "CPU"
             else:
                 bound = "limit"  # neither CPU nor GPU is busy the full time: FPS limit / vsync / waiting
+        disp = [f["displayed"] for f in b if f["displayed"] is not None]
+        typed = [f["ftype"] for f in b if f["ftype"] is not None]
+        gen = sum(1 for t in typed if t not in NATIVE_FRAME_TYPES)
+        clicks = [f["click"] for f in b if f["click"] is not None]
+        inputs = [f["input"] for f in b if f["input"] is not None]
+        tear = [f["tearing"] for f in b if f["tearing"] is not None]
         self.on_second(dict(
             ts=float(self.bucket_sec), session=self.session_id, frames=len(fts),
             fps=1000.0 * len(fts) / total if total else None, ft_avg=ft_avg,
             ft_p99=percentile(fts, 0.99), ft_max=fts[-1], cpu_busy=cpu, gpu_busy=gpu,
             display_lat=avg("disp"), present_mode=Counter(f["mode"] for f in b).most_common(1)[0][0],
             bound=bound,
+            runtime=_mode(f["runtime"] for f in b), sync_interval=_mode(f["sync"] for f in b),
+            tearing=_mode(tear), dropped=sum(1 for d in disp if not d) if disp else None,
+            click_lat=_avg(clicks), input_lat=_avg(inputs),
+            frame_gen_pct=100.0 * gen / len(typed) if typed else None,
         ))
+        with self.p_lock:   # summary() reads these from the collector thread
+            self.p_modes.update(f["mode"] for f in b if f["mode"])
+            self.p_runtime.update(f["runtime"] for f in b if f["runtime"])
+            self.p_sync.update(f["sync"] for f in b if f["sync"] is not None)
+            for k, v in (("tear_n", len(tear)), ("tearing", sum(tear)), ("disp_n", len(disp)),
+                         ("dropped", sum(1 for d in disp if not d)), ("typed", len(typed)), ("gen", gen),
+                         ("click_n", len(clicks)), ("click", sum(clicks)), ("input_n", len(inputs)),
+                         ("input", sum(inputs))):
+                self.p[k] += v
+
+    def present_summary(self):
+        """How the game presented over the whole capture (frame-weighted)."""
+        with self.p_lock:
+            p, modes = dict(self.p), self.p_modes.most_common()
+            runtime, sync = self.p_runtime.most_common(1), self.p_sync.most_common(1)
+        nm = sum(c for _, c in modes)
+        if not nm:
+            return None
+        ratio = lambda a, b, k=1: round(100 * p[a] / p[b], k) if p[b] else None
+        return {
+            "runtime": runtime[0][0] if runtime else None,
+            "modes": {m: round(100 * c / nm, 1) for m, c in modes},
+            "sync_interval": sync[0][0] if sync else None,
+            "tearing_pct": ratio("tearing", "tear_n"),
+            "dropped_pct": ratio("dropped", "disp_n", 2),
+            "click_lat_avg": round(p["click"] / p["click_n"], 1) if p["click_n"] else None,
+            "input_lat_avg": round(p["input"] / p["input_n"], 1) if p["input_n"] else None,
+            "frame_gen_pct": ratio("gen", "typed"),
+        }
 
     def summary(self) -> dict:
         fts = sorted(self.all_ft)
@@ -172,12 +289,14 @@ class FrameCapture:
             "ft_p99": round(p99, 2),
             "ft_max": round(fts[-1], 1),
             "error": self.error,
+            "present": self.present_summary(),
         }
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
     def stop(self):
+        self.stopped = True
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()

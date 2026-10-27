@@ -14,7 +14,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from perfmon import analyze as an  # noqa: E402
-from perfmon import config, db  # noqa: E402
+from perfmon import config, db, present  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -131,7 +131,7 @@ def cmd_sessions(con, a):
         r["start"], r["end"] = an.fmt_ts(r["start_ts"]), an.fmt_ts(r["end_ts"])
         r["min"] = round((r["duration_s"] or 0) / 60, 1)
     table(rows, ["id", "exe", "start", "min", "end_reason", "fps_avg", "fps_1low", "fps_01low", "stutters",
-                 "gpu_driver", "game_version"])
+                 "present", "gpu_driver", "game_version"])
 
 
 def cmd_session(con, a):
@@ -149,6 +149,8 @@ def cmd_session(con, a):
             "limit %": r["bound_pct"].get("limit")}, "Wąskie gardło")
     if r["fps_timeline"]:
         kv(r["fps_timeline"], "FPS w czasie")
+    if r.get("present"):
+        out(f"Prezentacja: {present.describe(r['present'])}")
     st = r["stutters"]
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
         "przyczyny": st["cause_counts"]}, "Stuttery")
@@ -517,7 +519,7 @@ def build():
     add("sql", cmd_sql).add_argument("query")
     s = add("compare", cmd_compare)
     s.add_argument("--exe")
-    s.add_argument("--by", default="week", choices=["week", "day", "month", "driver", "game_version", "session"])
+    s.add_argument("--by", default="week", choices=["week", "day", "month", "driver", "game_version", "session", "present_mode"])
     s.add_argument("--since", default="90d")
     s = add("markers", cmd_markers)
     s.add_argument("--exe")

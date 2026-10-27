@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import config, crashinfo, diskinfo, procwatch
+from . import config, crashinfo, diskinfo, present, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -111,6 +111,13 @@ def extend(con, rep, row, start, end):
     rep["disk"] = diskinfo.session_disk(con, start, end, row["path"], row["id"])
     rep["proc_events"] = procwatch.session_proc_events(con, start, end, row["exe"], config.load().get("background_culprits"))
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
+    rep["present"] = present.session_present(con, row, summ)
+
+
+def session_extras(con, ids):
+    """{session id: {...}} extra per-session columns for session lists and comparisons."""
+    pres = present.labels(con, ids)
+    return {sid: {"present": pres.get(sid)} for sid in ids}
 
 
 # ---------- findings ----------
@@ -128,6 +135,7 @@ def findings(rep, row):
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
     f += diskinfo.findings(rep)
+    f += present.findings(rep)
     f += procwatch.findings(rep)
     bgc = {k.split(":", 1)[1]: v for k, v in cc.items() if k.startswith("background_gpu:")}
     heavy = [b for b in rep.get("gpu_background") or [] if (b["avg_pct"] or 0) >= 10 or (b["max_pct"] or 0) >= 30]

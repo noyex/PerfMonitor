@@ -394,7 +394,7 @@ class Collector:
 
     def save_summary(self, g):
         summ = g["capture"].summary() if g["capture"] else {"error": "PresentMon niedostępny"}
-        self.exec("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ), g["session"]))
+        self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)
 
     def end_game(self, pid, reason):
         g = self.games.pop(pid)

@@ -207,7 +207,8 @@ def sessions(con, limit=20):
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     ends = _eff_ends(con, rows)
-    return [_flatten_session(r, st.get(r["id"], 0), ends) for r in rows]
+    ext = diagreport.session_extras(con, ids)
+    return [{**_flatten_session(r, st.get(r["id"], 0), ends), **ext.get(r["id"], {})} for r in rows]
 
 
 def game_list(con):
@@ -792,6 +793,7 @@ def _session_metrics(con, exe=None, since=None):
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     out = []
     ends = _eff_ends(con, rows)
+    ext = diagreport.session_extras(con, ids)
     for r in rows:
         f = _flatten_session(r, ends=ends)
         end = ends[r["id"]] or time.time()
@@ -810,7 +812,7 @@ def _session_metrics(con, exe=None, since=None):
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
             "_g": (x["g"] or 0) if x else 0, "_c": (x["c"] or 0) if x else 0, "_l": (x["l"] or 0) if x else 0,
             "_n": x["n"] if x else 0,
-            "_secs": x["secs"] if x else 0,
+            "_secs": x["secs"] if x else 0, **ext.get(r["id"], {}),
         })
     return out
 
@@ -824,14 +826,14 @@ def session_points(con, exe=None, since=None):
 
 def compare(con, exe=None, group_by="week", since=None):
     """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe."""
-    if group_by not in ("week", "day", "month", "driver", "game_version", "session"):
-        raise ValueError("group_by must be week|day|month|driver|game_version|session")
+    if group_by not in ("week", "day", "month", "driver", "game_version", "session", "present_mode"):
+        raise ValueError("group_by must be week|day|month|driver|game_version|session|present_mode")
     groups = {}
     for s in _session_metrics(con, exe, since):
         d = datetime.fromtimestamp(s["start_ts"])
         key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
                "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
-               "session": f"#{s['id']}"}[group_by]
+               "session": f"#{s['id']}", "present_mode": s.get("present") or "?"}[group_by]
         groups.setdefault((s["exe"], key), []).append(s)
     rows = []
     for (e, key), ss in groups.items():

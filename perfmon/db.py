@@ -109,6 +109,8 @@ def migrate(con):
     add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
     add_columns(con, "events", {"data": "TEXT"})
     add_columns(con, "samples", {"pagefile_pct": "REAL"})
+    add_columns(con, "frames", {"runtime": "TEXT", "sync_interval": "INTEGER", "tearing": "INTEGER", "dropped": "INTEGER",
+                                "click_lat": "REAL", "input_lat": "REAL", "frame_gen_pct": "REAL"})
 
 
 def _columns(con, table, schema="main"):
