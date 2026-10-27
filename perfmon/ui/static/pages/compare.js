@@ -1,5 +1,5 @@
 ﻿// "Porównania": FPS per session over time + groups table (week / day / month / driver / game version) for one game.
-// Deep link: #/compare?exe=cod.exe&by=driver
+// Deep link: #/compare?exe=cod.exe&by=driver, or with a split point: #/compare?exe=cod.exe&split=m3 (before/after marker m3)
 Pages.compare = (() => {
   let plot = null;
 
@@ -27,6 +27,12 @@ Pages.compare = (() => {
     return v ? v[1] : (m.label.split("->").pop() || "").replace(/\)\s*$/, "").trim();
   };
   const shortDate = (ts) => fmtDate(ts).slice(0, 5);
+
+  const SPLIT_LABEL = { przed: "Przed", po: "Po" };
+  const topBottleneck = (g) => {
+    const t = Object.entries(g.bottleneck || {}).sort((a, b) => b[1] - a[1])[0];
+    return t ? `${BOTTLENECK[t[0]] || t[0]} ${fmt(t[1])}%` : "–";
+  };
 
   const groupLabel = (g, by) => {
     if (by === "week") return `${g.group.replace(/^\d+-/, "")} · ${shortDate(g.from)} – ${shortDate(g.to)}`;
@@ -107,19 +113,20 @@ Pages.compare = (() => {
     return h("p", { class: "headline" }, `Po ${what} ${g.group}: `, parts[0], parts[1] ? ", " : null, parts[1] || null);
   };
 
-  const table = (groups, by) => {
-    const first = { week: "Tydzień", day: "Dzień", month: "Miesiąc", driver: "Sterownik", game_version: "Wersja gry" }[by];
+  const table = (groups, by, split) => {
+    const first = split ? "Okres" : { week: "Tydzień", day: "Dzień", month: "Miesiąc", driver: "Sterownik", game_version: "Wersja gry" }[by];
     const time = by === "week" || by === "day" || by === "month";
     const extra = [];
-    if (time) extra.push(["Sterownik", (g) => g.drivers.join(", ")], ["Wersja gry", (g) => g.game_versions.join(", ")]);
+    if (split) extra.push(["Sterownik", (g) => g.drivers.join(", ")], ["Wersja gry", (g) => g.game_versions.join(", ")], ["Wąskie gardło", topBottleneck]);
+    else if (time) extra.push(["Sterownik", (g) => g.drivers.join(", ")], ["Wersja gry", (g) => g.game_versions.join(", ")]);
     else if (by === "driver") extra.push(["Wersja gry", (g) => g.game_versions.join(", ")]);
     else extra.push(["Sterownik", (g) => g.drivers.join(", ")]);
 
     const head = h("tr", {}, h("th", {}, first), h("th", { class: "num" }, "Sesje"), h("th", { class: "num" }, "Minuty"), h("th", { class: "num" }, "Śr. FPS"), h("th", { class: "num" }, "Δ"), h("th", { class: "num" }, "1% low"), h("th", { class: "num" }, "Δ"), h("th", { class: "num" }, "Stutter/min"), extra.map(([l]) => h("th", {}, l)));
     const body = groups.map((g) => {
-      const small = g.minutes < MIN_MINUTES;
+      const small = g.small_sample ?? g.minutes < MIN_MINUTES;
       return h("tr", { class: small ? "small" : "", onclick: () => (location.hash = `#/games?id=${g.session_ids[0]}`) },
-        h("td", {}, groupLabel(g, by), small ? h("span", { class: "note" }, "mała próba") : null),
+        h("td", {}, split ? SPLIT_LABEL[g.group] || g.group : groupLabel(g, by), small ? h("span", { class: "note" }, "mała próba") : null),
         h("td", { class: "num" }, fmt(g.sessions)),
         h("td", { class: "num" }, fmt(g.minutes)),
         h("td", { class: "num" }, fmt(g.fps_avg, 1)),
@@ -140,20 +147,27 @@ Pages.compare = (() => {
     }
     let exe = exes.includes(params.exe) ? params.exe : exes[0];
     let by = BY.some(([v]) => v === params.by) ? params.by : "week";
+    let split = params.split || "";
 
     const select = h("select", { class: "btn" }, exes.map((e) => h("option", { value: e }, gameName(e))));
     select.value = exe;
     select.onchange = () => {
       exe = select.value;
+      split = "";
       load();
     };
     const seg = segmented(BY, by, (v) => {
       by = v;
       load();
     });
+    const splitSel = h("select", { class: "btn" });
+    splitSel.onchange = () => {
+      split = splitSel.value;
+      load();
+    };
     view.append(
-      h("div", { class: "page-head" }, h("h1", {}, "Porównania"), select, seg, h("div", { class: "spacer" }),
-        h("button", { class: "btn", onclick: () => askAgent(`Porównaj wydajność ${gameName(exe)} (pm compare --exe ${exe} --by ${by}). Co się zmieniło i czy coś wymaga optymalizacji?`) }, "Zapytaj agenta"))
+      h("div", { class: "page-head" }, h("h1", {}, "Porównania"), select, seg, splitSel, h("div", { class: "spacer" }),
+        h("button", { class: "btn", onclick: () => askAgent(`Porównaj wydajność ${gameName(exe)} (pm compare --exe ${exe} ${split ? `--before ${split}` : `--by ${by}`}). Co się zmieniło i czy coś wymaga optymalizacji?`) }, "Zapytaj agenta"))
     );
     const content = h("div");
     view.append(content);
@@ -161,12 +175,19 @@ Pages.compare = (() => {
     let token = 0;
     const load = async () => {
       const mine = ++token;
-      history.replaceState(null, "", `#/compare?exe=${encodeURIComponent(exe)}&by=${by}`);
-      const [groups, pts, marks] = await Promise.all([
-        api("compare", { exe, by, since: SINCE }),
-        api("points", { exe, since: SINCE }),
-        api("markers", { exe, since: SINCE }),
-      ]);
+      const marks = await api("markers", { exe, since: SINCE });
+      if (mine !== token) return;
+      // Split points are the numbered change markers of this game
+      splitSel.replaceChildren(
+        h("option", { value: "" }, "Bez podziału"),
+        ...marks.filter((m) => m.n).map((m) => h("option", { value: `m${m.n}` }, `m${m.n} · ${shortDate(m.ts)} · ${m.label.length > 50 ? `${m.label.slice(0, 49)}…` : m.label}`))
+      );
+      if (![...splitSel.options].some((o) => o.value === split)) split = "";
+      splitSel.value = split;
+      splitSel.style.display = splitSel.options.length > 1 ? "" : "none";
+      seg.style.display = split ? "none" : "";
+      history.replaceState(null, "", `#/compare?exe=${encodeURIComponent(exe)}&by=${by}${split ? `&split=${split}` : ""}`);
+      const [groups, pts] = await Promise.all([api("compare", { exe, by, since: SINCE, before: split }), api("points", { exe, since: SINCE })]);
       if (mine !== token) return;
       plot && plot.destroy();
       plot = null;
@@ -175,12 +196,12 @@ Pages.compare = (() => {
         content.append(h("div", { class: "empty" }, "Brak sesji tej gry w tym okresie"));
         return;
       }
-      const hl = headline(groups, by);
+      const hl = split ? null : headline(groups, by);
       if (hl) content.append(hl);
       const wrap = h("div", { class: "charts" });
       content.append(wrap);
       plot = plotFps(wrap, pts, marks.filter((m) => MARKER_KINDS[m.kind]));
-      content.append(h("h2", {}, "Grupy"), table(groups, by));
+      content.append(h("h2", {}, "Grupy"), table(groups, by, split));
     };
     await load();
   };

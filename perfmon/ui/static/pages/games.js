@@ -11,8 +11,17 @@ Pages.games = (() => {
     dpc: "Sterownik (DPC)",
     thermal: "Temperatura",
     shader_or_unknown: "Kompilacja shaderów / nieznane",
+    vram_shared: "VRAM przelewa się do RAM",
+    disk_reset: "Reset dysku",
+    pagefile: "Plik wymiany",
+    shader_compile: "Kompilacja shaderów",
+    "background_scan:defender": "Skan Defendera",
   };
-  const causeLabel = (c) => (c.startsWith("background:") ? `Proces w tle: ${c.slice(11)}` : CAUSES[c] || c);
+  const CAUSE_PREFIX = { "background:": "Proces w tle", "background_start:": "Start procesu", "background_gpu:": "GPU w tle" };
+  const causeLabel = (c) => {
+    const p = Object.keys(CAUSE_PREFIX).find((k) => c.startsWith(k));
+    return p ? `${CAUSE_PREFIX[p]}: ${c.slice(p.length)}` : CAUSES[c] || c;
+  };
 
   const END = { crash: ["critical", "Crash"], unknown: ["serious", "Nieznany koniec"] };
 
@@ -44,7 +53,8 @@ Pages.games = (() => {
             h("td", { class: "muted" }, fmtTime(s.start_ts)),
             h("td", {}, gameName(s.exe),
               s.running ? h("span", { class: "live" }, "trwa") : null,
-              end ? h("span", { class: `sev ${end[0]}` }, end[1]) : null),
+              end ? h("span", { class: `sev ${end[0]}` }, end[1]) : null,
+              BOTTLENECK[s.bottleneck] && s.bottleneck !== "mixed" ? h("span", { class: "chip" }, BOTTLENECK[s.bottleneck]) : null),
             h("td", { class: "num" }, s.duration_s > 0 || s.running ? fmtDur(s.duration_s) : "–"),
             h("td", { class: "num" }, fmt(s.fps_avg)),
             h("td", { class: "num" }, fmt(s.fps_1low)))
@@ -112,6 +122,22 @@ Pages.games = (() => {
       );
     }
 
+    const cr = d.crash;
+    if (cr) {
+      const ip = cr.interpretation || {};
+      const rows = [
+        ["Moduł", [cr.module, cr.module_version].filter(Boolean).join(" ")],
+        ["Kod", [cr.exception_code, cr.exception_name].filter(Boolean).join(" ")],
+        ["Wersja gry", cr.app_version],
+        ["Interpretacja", ip.verdict ? `${ip.verdict}${ip.confidence ? ` (pewność: ${ip.confidence})` : ""}` : null],
+      ].filter(([, v]) => v);
+      view.append(
+        h("h2", {}, "Crash"),
+        h("div", { class: "kv" }, rows.flatMap(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "v" }, v)])),
+        (ip.next_steps || []).length ? h("div", { class: "list static" }, ip.next_steps.map((x) => h("div", { class: "row" }, h("span", { class: "title" }, x)))) : null
+      );
+    }
+
     if ((d.findings || []).length) {
       view.append(
         h("h2", {}, "Wnioski"),
@@ -130,17 +156,44 @@ Pages.games = (() => {
     if (!known) {
       wrap.append(h("div", { class: "empty" }, "Brak danych sesji"));
     } else {
+      const [sr, diag, gp] = await Promise.all([
+        api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 }),
+        diagMarkers(t0, t1),
+        api("game_proc", { session: id, points: 1200 }),
+      ]);
       const worst = (st.worst || []).map((w) => ({ ts: w.ts, severity: "serious" }));
-      const markers = () => worst;
+      const markers = () => [...worst, ...diag.lines];
+      const diagLines = () => diag.lines;
       const xRange = [t0, t1];
-      const sr = await api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 });
       if (hasFrames) {
         charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: false, xRange }, cols(f, ["fps"])));
-        charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, onSelect: zoom, xRange }, cols(f, ["ft_avg", "ft_p99"])));
+        charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(f, ["ft_avg", "ft_p99"])));
       } else {
         wrap.append(h("div", { class: "empty" }, "Brak danych o klatkach (PresentMon)"));
       }
-      if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, onSelect: zoom, xRange }, cols(sr, def.keys)));
+      if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(sr, def.keys)));
+      if (diag.legend && charts.length) charts[0].el.append(diag.legend);
+
+      // Game VRAM: toggled on demand, only when the session has per-process data
+      if ((gp.ts || []).length) {
+        let vram = null;
+        view.append(
+          h("button", {
+            class: "btn more",
+            onclick: () => {
+              if (vram) {
+                vram.destroy();
+                vram.el.remove();
+                charts = charts.filter((c) => c !== vram);
+                vram = null;
+                return;
+              }
+              vram = chart(wrap, { title: "VRAM gry", unit: "MB", series: [{ label: "Dedykowana" }, { label: "Współdzielona" }], height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(gp, ["vram_dedicated_mb", "vram_shared_mb"]));
+              charts.push(vram);
+            },
+          }, "VRAM gry")
+        );
+      }
     }
 
     // Stutters
@@ -165,8 +218,29 @@ Pages.games = (() => {
     }
 
     const b = d.bound_pct;
-    if (b && hasFrames) {
+    const bn = d.bottleneck;
+    if (bn) {
+      view.append(h("div", { class: "line" }, `Wąskie gardło: ${BOTTLENECK[bn.kind] || bn.kind} – ${[bn.why, bn.advice].filter(Boolean).join(". ")}`));
+    } else if (b && hasFrames) {
       view.append(h("div", { class: "line" }, `Ograniczenie: GPU ${fmt(b.GPU)}% · CPU ${fmt(b.CPU)}% · limit FPS ${fmt(b.limit)}% czasu`));
+    }
+
+    const p = d.present;
+    if (p) {
+      const lat = p.click_lat_avg ?? p.input_lat_avg;
+      const parts = [
+        p.label,
+        p.runtime,
+        p.composed_pct > 0 ? `przez DWM ${fmt(p.composed_pct)}%` : null,
+        lat != null ? `opóźnienie klik→obraz ${fmt(lat)} ms` : null,
+        p.frame_gen_pct > 0 ? `generowane klatki ${fmt(p.frame_gen_pct)}%` : null,
+      ].filter(Boolean);
+      if (parts.length) view.append(h("div", { class: "line" }, `Prezentacja: ${parts.join(" · ")}`));
+    }
+
+    const mg = d.mem_growth;
+    if (mg) {
+      view.append(h("div", { class: "line" }, `Pamięć gry: ${fmt(mg.private_start_mb)} → ${fmt(mg.private_end_mb)} MB (${mg.mem_growth_mb_h > 0 ? "+" : ""}${fmt(mg.mem_growth_mb_h)} MB/h)${mg.leak ? " – możliwy wyciek" : ""}`));
     }
 
     const inc = d.incidents || [];
@@ -192,7 +266,7 @@ Pages.games = (() => {
       ["BIOS", c.bios],
     ].filter(([, v]) => v);
     if (kv.length) {
-      view.append(h("h2", {}, "Środowisko"), h("div", { class: "kv" }, kv.map(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "v" }, v)])));
+      view.append(h("h2", {}, "Środowisko"), h("div", { class: "kv" }, kv.flatMap(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "v" }, v)])));
     }
   };
 

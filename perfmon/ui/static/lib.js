@@ -88,6 +88,8 @@ const segmented = (options, value, onChange) => {
 
 const sevLabel = { critical: "Krytyczne", serious: "Poważne", warning: "Ostrzeżenie", info: "Info" };
 
+const BOTTLENECK = { vram: "VRAM", gpu_power: "Limit mocy GPU", cpu_thread: "Wątek CPU", cpu: "CPU", limit: "Limit FPS", gpu: "GPU", mixed: "Mieszane" };
+
 // ---------- charts ----------
 // Vertical markers (incidents, driver updates). marker = {ts, severity|color}
 const markersPlugin = (getMarkers) => ({
@@ -114,6 +116,23 @@ const markersPlugin = (getMarkers) => ({
     },
   },
 });
+
+// User marks, Defender scans and background process starts within [t0, t1]: chart lines + a one-row legend (null if none).
+const DIAG = { mark: ["--s3", false], scan: ["--muted", true], start: ["--warning", true] };
+const diagMarkers = async (t0, t1) => {
+  const ms = (await api("diag_markers", { from: t0, to: t1 })).filter((m) => DIAG[m.kind]);
+  const item = (kind, text) => h("span", { class: "mark" }, h("i", { class: DIAG[kind][1] ? "dash" : "", style: `border-left-color:var(${DIAG[kind][0]})` }), text);
+  const has = (kind) => ms.some((m) => m.kind === kind);
+  const legend = [
+    ...ms.filter((m) => m.kind === "mark").slice(-6).map((m) => item("mark", `${fmtTime(m.ts, t1 - t0 > 86400)} ${m.label}`)),
+    has("scan") ? item("scan", "Skan Defendera") : null,
+    has("start") ? item("start", "Start procesu w tle") : null,
+  ].filter(Boolean);
+  return {
+    lines: ms.map((m) => ({ ts: m.ts, color: css(DIAG[m.kind][0]), dash: DIAG[m.kind][1] })),
+    legend: legend.length ? h("div", { class: "marks" }, legend) : null,
+  };
+};
 
 const syncKey = "pm";
 

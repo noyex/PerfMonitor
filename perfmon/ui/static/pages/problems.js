@@ -70,6 +70,18 @@ Pages.problems = (() => {
   };
 
   // ---------- Zawieszenia ----------
+  // List capped at FREEZE_LIMIT rows with a "show all" button; row(item) builds a row.
+  const limited = (items, row) => {
+    const box = h("div");
+    const draw = (all) => {
+      box.innerHTML = "";
+      box.append(h("div", { class: "list" }, (all ? items : items.slice(0, FREEZE_LIMIT)).map(row)));
+      if (!all && items.length > FREEZE_LIMIT) box.append(h("button", { class: "btn more", onclick: () => draw(true) }, `Pokaż wszystkie (${items.length})`));
+    };
+    draw(false);
+    return box;
+  };
+
   const freezesList = (freezes) => {
     // ui_freeze + dwm_stall at the same moment are one event.
     const groups = new Map();
@@ -79,26 +91,24 @@ Pages.problems = (() => {
       groups.set(f.time, g);
     }
     const events = [...groups.values()].sort((a, b) => (a.time < b.time ? 1 : -1));
-    const box = h("div");
-    const draw = (all) => {
-      box.innerHTML = "";
-      const list = h("div", { class: "list" });
-      for (const g of all ? events : events.slice(0, FREEZE_LIMIT)) {
-        const ts = localTs(g.time);
-        const dur = g.items.map((i) => i.duration_s).find((d) => d != null);
-        const title = g.items.some((i) => i.kind === "app_not_responding") ? g.items[0].title : g.items.map((i) => KIND[i.kind] || i.title).join(" · ");
-        list.append(
-          h("div", { class: "row", onclick: () => around(ts, 300) },
-            h("span", { class: "time" }, fmtTime(ts)),
-            h("span", { class: "title" }, title),
-            h("span", { class: "aside" }, dur != null ? fmtDur(dur) : g.items.some((i) => i.until_reset) ? "do resetu" : "–")));
-      }
-      box.append(list);
-      if (!all && events.length > FREEZE_LIMIT) box.append(h("button", { class: "btn more", onclick: () => draw(true) }, `Pokaż wszystkie (${events.length})`));
-    };
-    draw(false);
-    return box;
+    return limited(events, (g) => {
+      const ts = localTs(g.time);
+      const dur = g.items.map((i) => i.duration_s).find((d) => d != null);
+      const title = g.items.some((i) => i.kind === "app_not_responding") ? g.items[0].title : g.items.map((i) => KIND[i.kind] || i.title).join(" · ");
+      return h("div", { class: "row", onclick: () => around(ts, 300) },
+        h("span", { class: "time" }, fmtTime(ts)),
+        h("span", { class: "title" }, title),
+        h("span", { class: "aside" }, dur != null ? fmtDur(dur) : g.items.some((i) => i.until_reset) ? "do resetu" : "–"));
+    });
   };
+
+  // ---------- Znaczniki, dyski i skany ----------
+  const diagList = (items) =>
+    limited(items.slice().sort((a, b) => b.ts - a.ts), (i) =>
+      h("div", { class: "row", onclick: () => around(i.ts, 300) },
+        h("span", { class: "time" }, fmtTime(i.ts)),
+        h("span", { class: "title" }, i.title),
+        h("span", { class: `sev ${i.severity}` }, sevLabel[i.severity] || i.severity)));
 
   // ---------- Powtarzające się crashe ----------
   const crashesTable = (crashes) =>
@@ -170,6 +180,7 @@ Pages.problems = (() => {
       add("Wnioski", d.findings, findingsList);
       add("Twarde resety", d.unclean_shutdowns, resetsList);
       add("Zawieszenia", d.freezes, freezesList);
+      add("Znaczniki, dyski i skany", d.diag_incidents, diagList);
       add("Powtarzające się crashe", d.recurring_crashes, crashesTable);
       add("Zmiany konfiguracji", d.config_changes, configList);
 

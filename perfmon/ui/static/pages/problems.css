@@ -6,4 +6,3 @@
 .row.finding .detail { color: var(--muted); font-size: 13px; }
 tbody tr.click { cursor: pointer; }
 tbody tr.click:hover { background: var(--surface-2); }
-.btn.more { margin-top: 10px; }
