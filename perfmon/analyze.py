@@ -123,6 +123,10 @@ def latest(con):
         sess["running_s"] = round(now - sess["start_ts"])
     if s:
         s["extra"] = _json(s.get("extra"))
+    net = None
+    if _has_net(con):
+        net = _one(con, "SELECT ts, gw_ms, inet_ms, inet_loss, game_ms FROM net_samples WHERE ts>=? ORDER BY ts DESC LIMIT 1",
+                   (now - 10,))
     cnt = _one(con, "SELECT (SELECT COUNT(*) FROM incidents) AS incidents, (SELECT COUNT(*) FROM sessions) AS sessions,"
                     " (SELECT MIN(ts) FROM samples) AS first_sample")
     return {
@@ -135,6 +139,7 @@ def latest(con):
         "collector_stopped": float(meta["collector_stopped"]) if meta.get("collector_stopped") else None,
         "hw": _json(meta.get("hw")),
         "open_session": sess,
+        "net": net,
         "counts": cnt,
     }
 
