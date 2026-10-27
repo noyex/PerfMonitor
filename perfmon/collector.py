@@ -84,6 +84,7 @@ class Collector:
         self.src_stamp = source_stamp()
         self.last_reload_check = time.time()
         self.reload_deferred_logged = False
+        self.import_check = None       # {"requested", "err"} while the new code is being import-checked
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -128,9 +129,9 @@ class Collector:
             # Close sessions left open by a previous crash of the collector
             # (end = last data we have for them, e.g. right before a hard reset)
             self.con.execute(
-                "UPDATE sessions SET end_reason='unknown', end_ts=COALESCE("
-                "(SELECT MAX(ts) FROM frames WHERE session=sessions.id), "
-                "(SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), start_ts) WHERE end_ts IS NULL")
+                "UPDATE sessions SET end_reason='unknown', end_ts=MAX(start_ts, "
+                "COALESCE((SELECT MAX(ts) FROM frames WHERE session=sessions.id), 0), "
+                "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL")
             self.con.commit()
         log.info("collector start, admin=%s", is_admin())
 
@@ -440,19 +441,31 @@ class Collector:
             return
         if not requested and now - stamp < 10:
             return  # files may still be mid-save (an edit session touches several files)
-        if self.games or self.pending_crash_checks:
-            # Restarting would split the game session in two / lose the late crash re-check
+        if (self.games or self.pending_crash_checks) and not requested:
+            # Restarting would split the game session in two / lose the late crash re-check.
+            # An explicit `pm collector reload` goes through anyway (e.g. a misdetected "game").
             if not self.reload_deferred_logged:
                 log.info("reload pending, deferred until the game session ends")
                 self.reload_deferred_logged = True
             return
-        self.src_stamp = stamp
-        RELOAD_FLAG.unlink(missing_ok=True)
-        err = self._import_check()
-        if err:
-            log.error("reload aborted, new code does not import:\n%s", err)
+        if self.import_check is None:
+            # Import-check off the sampling thread (spawning an interpreter takes seconds)
+            self.src_stamp = stamp
+            RELOAD_FLAG.unlink(missing_ok=True)
+            chk = self.import_check = {"requested": requested}
+            threading.Thread(target=lambda: chk.update(err=self._import_check()), daemon=True).start()
+
+    def finish_reload(self):
+        chk = self.import_check
+        if chk is None or "err" not in chk:
+            return  # still checking
+        if not chk["requested"] and (self.games or self.pending_crash_checks):
+            return  # a game started meanwhile (keep the result for later)
+        self.import_check = None
+        if chk["err"]:
+            log.error("reload aborted, new code does not import:\n%s", chk["err"])
             return
-        log.info("reloading collector (%s)", "requested" if requested else "source changed")
+        log.info("reloading collector (%s)", "requested" if chk["requested"] else "source changed")
         self.reload = True
         self.running = False
 
@@ -491,6 +504,7 @@ class Collector:
                     self.recheck_crashes(now)
                 self.housekeeping(now)
                 self.check_reload(now)
+                self.finish_reload()
             except Exception:
                 log.exception("loop error")
             nxt += interval
@@ -502,6 +516,10 @@ class Collector:
     def shutdown(self):
         for pid in list(self.games):
             self.end_game(pid, "collector_stop")
+        # Close ongoing incidents: an open one would later read as "lasted until the next reset"
+        for iid in self.open_incidents.values():
+            self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
+        self.open_incidents.clear()
         self.wd.stop()
         self.hw.close()
         with self.lock:
