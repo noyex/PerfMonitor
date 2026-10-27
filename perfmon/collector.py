@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
+from . import bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, presentmon, procwatch, shadercache, sysinfo
 from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -149,6 +149,7 @@ class Collector:
                 "COALESCE((SELECT MAX(ts) FROM frames WHERE session=sessions.id), 0), "
                 "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL")
             self.con.commit()
+        presentmon.cleanup_stale_sessions()   # ETW sessions leaked by earlier collectors block new captures
         log.info("collector start, admin=%s", is_admin())
 
     # ---------- per-second sample ----------
@@ -326,13 +327,14 @@ class Collector:
         """procs rows kind='gpu' (top 5 without the game) + game_proc rows of running games."""
         gpu = self.gpu_procs.read()
         for pid, g in self.games.items():
-            r = self.game_sampler.sample(pid, g["session"], gpu.get(pid), now)
+            spid = next(reversed(g.get("children", {})), pid)   # the child that presents (sp26-cod.exe), not the launcher
+            r = self.game_sampler.sample(spid, g["session"], gpu.get(spid), now)
             if r:
                 if pid == self.shader_pid:
                     r["shader_bytes"] = self.shader.latest()[1]
                 game_rows.append(r)
         out = []
-        for pid, d in gpuproc.top_background(gpu, set(self.games)):
+        for pid, d in gpuproc.top_background(gpu, self.game_pids()):
             r = by_pid.get(pid)
             out.append((now, "gpu", r[0] if r else self.pname(pid), pid, round(r[2], 2) if r else None,
                         round(r[3], 1) if r else None, None, round(d["gpu"], 1),
@@ -351,8 +353,23 @@ class Collector:
             return False  # store apps that are not games
         return any(m in pl for m in self.cfg["game_path_markers"])
 
+    def game_pids(self):
+        """PIDs of every running game process, children included."""
+        return set(self.games).union(*(g.get("children", {}) for g in self.games.values()))
+
+    def game_ancestor(self, pr):
+        """PID of the running game this process descends from (cod.exe -> sp26-cod.exe), else None."""
+        try:
+            for p in pr.parents()[:6]:
+                if p.pid in self.games:
+                    return p.pid
+        except psutil.Error:
+            pass
+        return None
+
     def check_games(self):
         alive, live_pids = set(), set()
+        children = {c for g in self.games.values() for c in g["children"]}
         for pr in psutil.process_iter(["pid", "name", "create_time"]):
             try:
                 pid, name = pr.info["pid"], pr.info["name"]
@@ -363,6 +380,8 @@ class Collector:
             if pid in self.games:
                 alive.add(pid)
                 continue
+            if pid in children:
+                continue   # attached to a game below
             if key in self.not_games:
                 continue  # already ruled out; skip the costly exe lookup
             try:
@@ -378,12 +397,38 @@ class Collector:
                     continue
             except Exception:
                 continue
+            parent = self.game_ancestor(pr)
+            if parent is not None:
+                # a game process spawned by a running game is part of its session, not a session of its own
+                # (CoD: cod.exe is the launcher, the child sp26-cod.exe renders; PresentMon must follow it)
+                self.attach_child(parent, pid, name)
+                children.add(pid)
+                continue
             self.start_game(pid, name, exe)
             alive.add(pid)
         self.not_games &= live_pids
-        for pid in list(self.games):
+        live = {k[0] for k in live_pids}
+        for pid, g in list(self.games.items()):
             if pid not in alive:
                 self.end_game(pid, "exit")
+                continue
+            gone = [c for c in g["children"] if c not in live]
+            for c in gone:
+                del g["children"][c]
+                self.game_sampler.forget(c)
+                log.info("game child end pid=%s session=%s", c, g["session"])
+            if gone:
+                self.retarget(g)
+
+    def attach_child(self, parent_pid, pid, name):
+        g = self.games[parent_pid]
+        g["children"][pid] = name
+        log.info("game child start %s pid=%s session=%s", name, pid, g["session"])
+        self.retarget(g)
+
+    def retarget(self, g):
+        if g["capture"]:
+            g["capture"].retarget([g["pid"], *g["children"]])
 
     def start_game(self, pid, name, exe):
         try:
@@ -397,7 +442,7 @@ class Collector:
         if os.path.exists(self.cfg["presentmon_exe"]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
         self.games[pid] = {"session": sid, "capture": cap, "exe": name, "path": exe, "start": start,
-                           "last_summary": time.time()}
+                           "last_summary": time.time(), "pid": pid, "children": {}}
         self.shader.set_game(exe)   # the newest game: usually the only one
         self.shader_pid = pid
         log.info("game start %s pid=%s session=%s", name, pid, sid)
@@ -429,7 +474,8 @@ class Collector:
 
     def end_game(self, pid, reason):
         g = self.games.pop(pid)
-        self.game_sampler.forget(pid)
+        for c in (pid, *g["children"]):
+            self.game_sampler.forget(c)
         if pid == self.shader_pid:
             self.shader_pid = next(iter(self.games), None)
             self.shader.set_game(self.games[self.shader_pid]["path"] if self.shader_pid else None)

@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+import re
 import statistics
 import subprocess
 import threading
@@ -16,6 +17,39 @@ CREATE_NO_WINDOW = 0x08000000
 FALLBACK_WINDOW_S = 15     # PresentMon exiting this soon without rows = it rejected an option (retry without it)
 # FrameType values that are not generated frames (AMD AFMF / Intel XeFG / ... are)
 NATIVE_FRAME_TYPES = {"", "NotSet", "Unspecified", "Application", "Repeated"}
+
+
+def stop_etw_session(name):
+    """Stop a PresentMon ETW session by name. A PresentMon killed with TerminateProcess leaves its session running;
+    after ~10 of them new ones fail with 'error code 1450' (not enough system resources) and no frames are captured."""
+    try:
+        subprocess.run(["logman", "stop", name, "-ets"], capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW)
+    except Exception as e:
+        log.debug("stop ETW session %s: %s", name, e)
+
+
+def cleanup_stale_sessions():
+    """Stop PerfMon_<pid>_<n> ETW sessions left behind by collectors that no longer run (called once at start)."""
+    try:
+        out = subprocess.run(["logman", "query", "-ets"], capture_output=True, text=True, timeout=30,
+                             creationflags=CREATE_NO_WINDOW).stdout
+    except Exception:
+        return 0
+    stale = [m.group(0) for m in re.finditer(r"^PerfMon_(\d+)_\d+(?=\s)", out, re.M)
+             if int(m.group(1)) != os.getpid() and not _pid_alive(int(m.group(1)))]
+    for name in stale:
+        stop_etw_session(name)
+    if stale:
+        log.info("stopped %d stale PresentMon ETW sessions", len(stale))
+    return len(stale)
+
+
+def _pid_alive(pid):
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:
+        return True
 
 
 def _s(row, *names):
@@ -57,10 +91,17 @@ def percentile(sorted_vals, p):
 
 
 class FrameCapture:
-    """One instance per game session. Calls on_second(row) and on_stutter(row) from the reading thread."""
+    """One instance per game session. Calls on_second(row) and on_stutter(row) from the reading thread.
+
+    The target is a set of PIDs (the game and its child game processes, e.g. cod.exe -> sp26-cod.exe, which is the one
+    that actually presents); retarget() restarts PresentMon when the set changes."""
 
     def __init__(self, exe_path: str, game_exe: str, pid: int, session_id: int, on_second, on_stutter):
         self.session_id = session_id
+        self.exe_path = exe_path
+        self.pids = [pid]
+        self.retarget_pending = False
+        self.session_name = f"PerfMon_{os.getpid()}_{session_id}"
         self.on_second = on_second
         self.on_stutter = on_stutter
         self.all_ft = array("f")       # all session frametimes (for 1% / 0.1% low)
@@ -79,18 +120,21 @@ class FrameCapture:
         self.p_modes, self.p_runtime, self.p_sync = Counter(), Counter(), Counter()
         self.p = Counter()
         self.p_lock = threading.Lock()
-        self.base_args = [exe_path, "--process_id", str(pid), "--output_stdout", "--no_console_stats",
-                          # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
-                          "--session_name", f"PerfMon_{os.getpid()}_{session_id}", "--stop_existing_session",
-                          "--terminate_on_proc_exit"]
         self.proc = None
         if not self._spawn():
             return
         self.thread = threading.Thread(target=self._run, daemon=True, name=f"pm-{game_exe}")
         self.thread.start()
 
+    def _args(self):
+        pid_args = [a for p in self.pids for a in ("--process_id", str(p))]
+        return [self.exe_path, *pid_args, "--output_stdout", "--no_console_stats",
+                # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
+                "--session_name", self.session_name, "--stop_existing_session",
+                "--terminate_on_proc_exit"] + (["--track_frame_type"] if self.track_frame_type else [])
+
     def _spawn(self):
-        args = self.base_args + (["--track_frame_type"] if self.track_frame_type else [])
+        args = self._args()
         try:
             self.started = time.time()
             self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -137,6 +181,14 @@ class FrameCapture:
                 rc = proc.wait(5)
             except Exception:
                 rc = None
+            if self.retarget_pending and not self.stopped:
+                self.retarget_pending = False
+                self._flush()
+                self.offset = self.prev_t = self.time_unit = None   # PresentMon time restarts with the new trace
+                log.info("PresentMon retarget -> pids %s", self.pids)
+                if self._spawn():
+                    continue
+                break
             # a PresentMon that does not know --track_frame_type exits at once with a usage error and no rows
             if (self.stopped or not self.track_frame_type or self.lines or not rc
                     or time.time() - self.started > FALLBACK_WINDOW_S):
@@ -150,6 +202,8 @@ class FrameCapture:
                 self.stop()
                 break
         self._flush()
+        if self.stopped:
+            stop_etw_session(self.session_name)
 
     def _read(self, proc):
         reader = csv.DictReader(io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace"))
@@ -292,14 +346,26 @@ class FrameCapture:
             "present": self.present_summary(),
         }
 
-    def alive(self):
-        return self.proc is not None and self.proc.poll() is None
+    def retarget(self, pids):
+        """Capture exactly these PIDs from now on (restarts PresentMon; a second or two of frames is lost)."""
+        pids = sorted(set(pids))
+        if not pids or pids == sorted(self.pids) or self.stopped:
+            return
+        self.pids = pids
+        self.retarget_pending = True
+        self._kill()
 
-    def stop(self):
-        self.stopped = True
+    def _kill(self):
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()
                 self.proc.wait(5)
             except Exception:
                 pass
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        self.stopped = True
+        self._kill()

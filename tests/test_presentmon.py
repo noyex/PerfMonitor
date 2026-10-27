@@ -3,6 +3,7 @@ import time
 import sqlite3
 import threading
 import unittest
+from unittest import mock
 from collections import Counter, deque
 from array import array
 
@@ -46,10 +47,16 @@ def capture():
     c.lines, c.stopped, c.track_frame_type = 0, False, True
     c.p_modes, c.p_runtime, c.p_sync, c.p, c.p_lock = Counter(), Counter(), Counter(), Counter(), threading.Lock()
     c.started = 0
+    c.retarget_pending, c.pids, c.session_name = False, [1], "PerfMon_1_1"
     return c
 
 
 class PresentMonParseTest(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(pmn, "stop_etw_session")   # would run logman
+        self.etw_stop = p.start()
+        self.addCleanup(p.stop)
+
     def test_v2_columns_per_second(self):
         rows = [v2_row(i * 10.0, 10.0) for i in range(100)]       # 1 s of 100 fps
         rows[5] = v2_row(50.0, 10.0, displayed="NA")                # one frame never shown
@@ -102,6 +109,32 @@ class PresentMonParseTest(unittest.TestCase):
         self.assertEqual(spawned, [False])
         self.assertFalse(c.track_frame_type)
         self.assertGreater(len(c.seconds), 0)
+
+    def test_retarget_restarts_with_all_pids(self):
+        c = capture()
+        c.exe_path, c.session_name, c.pids, c.retarget_pending = "pm.exe", "PerfMon_1_1", [10], False
+        c.proc = FakeProc("")      # the first process ends because retarget() terminated it
+        argv = []
+
+        def spawn():
+            argv.append(c._args())
+            c.proc = FakeProc(V2_HEADER + "\n" + "\n".join(v2_row(i * 10.0, 10.0) for i in range(100)) + "\n")
+            c.started = time.time()
+            return True
+        c._spawn = spawn
+        c.retarget([10, 20])
+        c.retarget([20, 10])       # same set again: no second restart
+        c.proc = FakeProc("")
+        c._run()
+        self.assertEqual(len(argv), 1)
+        a = argv[0]
+        self.assertEqual([a[i + 1] for i, x in enumerate(a) if x == "--process_id"], ["10", "20"])
+        self.assertEqual(c.seconds[0]["frames"], 100)   # frames of the new trace are kept
+        self.assertFalse(c.retarget_pending)
+        c.stopped = True
+        c.proc = FakeProc("")
+        c._run()
+        self.etw_stop.assert_called_once_with("PerfMon_1_1")   # a stopped capture must not leak its ETW session
 
     def test_no_fallback_after_rows_or_stop(self):
         c = capture()
