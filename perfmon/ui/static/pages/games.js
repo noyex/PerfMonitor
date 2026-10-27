@@ -133,7 +133,10 @@ Pages.games = (() => {
       const worst = (st.worst || []).map((w) => ({ ts: w.ts, severity: "serious" }));
       const markers = () => worst;
       const xRange = [t0, t1];
-      const sr = await api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 });
+      const [sr, net] = await Promise.all([
+        api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 }),
+        api("net_series", { from: t0, to: t1, points: 1200 }),
+      ]);
       if (hasFrames) {
         charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: false, xRange }, cols(f, ["fps"])));
         charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, onSelect: zoom, xRange }, cols(f, ["ft_avg", "ft_p99"])));
@@ -141,7 +144,7 @@ Pages.games = (() => {
         wrap.append(h("div", { class: "empty" }, "Brak danych o klatkach (PresentMon)"));
       }
       if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, onSelect: zoom, xRange }, cols(sr, def.keys)));
-      const ping = pingChart(wrap, await api("net_series", { from: t0, to: t1, points: 1200 }), { height: 130, onSelect: zoom, xRange });
+      const ping = pingChart(wrap, net, { height: 130, onSelect: zoom, xRange });
       if (ping) charts.push(ping);
     }
 
