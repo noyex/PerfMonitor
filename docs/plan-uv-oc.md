@@ -1,6 +1,6 @@
 # Plan: dane do undervoltingu i podkręcania (CPU + GPU)
 
-Status: **do akceptacji** (nic z tego nie jest jeszcze zaimplementowane).
+Status: **do akceptacji** (nic z tego nie jest jeszcze zaimplementowane). Moje propozycje do decyzji: sekcja „Rekomendacje” na końcu.
 
 ## 1. Co faktycznie da się odczytać (zrzut `pm sensors dump`, admin, 2026-10-27)
 
@@ -70,8 +70,47 @@ Zen 4 (CO per rdzeń, PBO limity, EXPO/SoC), RDNA4 (undervolt w Adrenalin, power
 6. ekran „Podkręcanie”
 7. playbook w skillu
 
-## Decyzje do podjęcia
+## 10. Dodatkowe propozycje
 
-1. **TDC/EDC i telemetria SVI3 CPU**: LHM ich nie daje. Opcje: (a) bez nich — Package ≈ PPT + Vcore z płyty (domyślnie, zero instalacji); (b) doinstalować AMD Ryzen Master i czytać przez jego Monitoring SDK (PPT/TDC/EDC z limitami, napięcia rdzeni).
-2. **Retencja szczegółowych danych**: 30 dni (~400 MB) czy inaczej?
-3. Profil GPU: wystarczy, że spróbuję ADL i w razie porażki zostanie wpis ręczny?
+### 10.1 Najpierw baza, potem UV/OC
+- Zanim cokolwiek zmienisz: profil **„Stock”** (ustawienia BIOS jak teraz + EXPO) jako punkt odniesienia — min. ~10 h gry i kilka dni pracy. Bez tego nie da się powiedzieć, czy UV/OC coś poprawiło lub zepsuło.
+- **Nie zaczynać UV/OC, dopóki trwają twarde resety i zawieszenia DWM** (historia 20–27.10). Niestabilność OC wyglądałaby identycznie i zamazałaby diagnozę. Kolejność: najpierw ustalić przyczynę zawieszeń (eksperymenty z monitorami / MPO / sterownikiem), potem tuning.
+- Pierwszy eksperyment po stronie sprzętu, jeśli resety wrócą: profil **„EXPO off”** (JEDEC 4800) na kilka dni — najtańszy test, czy resety to pamięć/SoC.
+
+### 10.2 Kolejność tuningu (do playbooka)
+1. **GPU undervolt w Adrenalin** (offset napięcia, potem power limit, na końcu VRAM) — najbezpieczniejsze, cofa się jednym kliknięciem.
+2. **CPU Curve Optimizer** per rdzeń (start −10 all-core, potem per rdzeń wg stretchingu i WHEA 19).
+3. **PBO limity** (PPT/TDC/EDC, scalar, boost override) — tylko jeśli temperatury i moc na to pozwalają.
+4. **RAM / SoC** na końcu i osobno (najtrudniej wykryć błędy, najgroźniejsze dla danych).
+- Jedna zmiana naraz, każda jako nowy profil w `pm oc`.
+
+### 10.3 Kryteria „stabilny”
+Profil dostaje status `stable` dopiero gdy łącznie:
+- 0 × WHEA 19/18, 0 × reset sterownika GPU, 0 × Kernel-Power 41, 0 × crash gry niewyjaśniony innym powodem,
+- ≥ 10 h gry + ≥ 3 dni zwykłej pracy (w tym bezczynność — za mocny CO często wysypuje się na biegu jałowym),
+- zaliczone: CoreCycler (min. 1 h/rdzeń dla CO), y-cruncher, OCCT (CPU + VRAM dla GPU), 3DMark Steel Nomad stress (GPU).
+`pm oc stability` liczy te warunki i mówi, czego jeszcze brakuje.
+
+### 10.4 Test bezczynności i ręczne sesje testowe
+- `pm stress start "nazwa"` / `pm stress stop` — sesja testu bez znanego exe (np. benchmark wbudowany w grę, test ręczny).
+- Rodzaj sesji `idle_soak`: oznacza okres celowej bezczynności (1–2 h) — do wyłapywania resetów przy niskim obciążeniu.
+
+### 10.5 Progi i alerty (incydenty)
+- CPU: Tctl ≥ 95 °C, VRM MOS ≥ 100 °C, **Vcore SoC > 1,30 V** (górna granica bezpieczeństwa Zen 4), stretching > 3% przy pełnym obciążeniu rdzenia.
+- GPU: hotspot ≥ 105 °C, VRAM ≥ 100 °C, nagły spadek zegara przy tym samym obciążeniu.
+- Alert tylko gdy przekroczenie trwa ≥ 5 s (bez szumu).
+
+### 10.6 Rozmiar bazy
+- Retencja szczegółów + **cotygodniowy `incremental_vacuum`** (bez blokowania kolektora na długo).
+- Strażnik: jeśli `perf.db` > 2 GB → incydent ostrzegawczy i automatyczne skrócenie retencji szczegółów do 14 dni.
+- `pm status` pokaże rozmiar bazy.
+
+### 10.7 FPS/W
+Liczone z mocy **CPU Package + GPU Package** (czujniki, bez reszty systemu i strat zasilacza) — dobre do porównań profili, nie do rachunku za prąd. Pokazywane tylko dla tej samej gry i porównywalnej długości sesji.
+
+## Rekomendacje do decyzji (moje propozycje)
+
+1. **TDC/EDC i telemetria SVI3 — bez Ryzen Master (na razie).** Ryzen Master instaluje własny sterownik jądra; w trakcie szukania przyczyny zawieszeń/resetów nie chcę dokładać zmiennej. Package ≈ PPT + Vcore z płyty + stretching + WHEA 19 per rdzeń wystarczą do Curve Optimizera. Wrócimy do tego, jeśli CO per rdzeń okaże się trudne do dostrojenia.
+2. **Retencja szczegółów 30 dni (~400 MB)**, agregaty sesji bez limitu, strażnik 2 GB (10.6).
+3. **Profil GPU: próba ADL Overdrive8, w razie porażki wpis ręczny** + wykrywanie zmian po presetach z rejestru i skoku napięcia przy tym samym zegarze → incydent „oznacz profil”.
+4. Wdrożenie zacznę od kroków 1–2 z sekcji 9 (czujniki + stabilność) — dają wartość od razu, także dla diagnozy obecnych resetów — a profile/ekran dopiero potem.
