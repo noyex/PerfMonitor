@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS system_info (        -- config snapshot (drivers, BIO
     ts REAL, info TEXT
 );
 CREATE TABLE IF NOT EXISTS net_samples (        -- network quality every 1 s (perfmon/netmon.py)
-    ts REAL PRIMARY KEY, session INTEGER,        -- game session id if running
+    ts REAL PRIMARY KEY,
+    session INTEGER,                             -- game session id if running
     gw_ms REAL, gw_loss REAL,                    -- ping to the router (default gateway); loss = 0..1 this second
     isp_ms REAL, isp_loss REAL,                  -- ping to the first operator router behind it
     inet_ms REAL, inet_loss REAL,                -- ping to internet targets (1.1.1.1, 8.8.8.8 averaged)
