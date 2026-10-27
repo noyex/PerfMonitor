@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, db, gamectx, gpuproc, marks, sysinfo
+from . import config, crashinfo, db, gamectx, gpuproc, marks, sysinfo
 from .events import EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -42,6 +42,7 @@ SRC_DIR = Path(__file__).resolve().parent
 RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
 DUMP_FLAG = config.DATA_DIR / "sensors_dump.request"   # touched by `pm sensors dump`
 DUMP_PATH = config.DATA_DIR / "sensors_dump.json"
+DUMPS_FLAG = config.DATA_DIR / "dumps.request"   # `pm dumps enable|disable` (WER LocalDumps, HKLM)
 RELOAD_CHECK_S = 5
 MUTEX_NAME = os.environ.get("PERFMON_MUTEX", "Global\\PerfMonitorCollector")   # env override: tests
 
@@ -395,12 +396,35 @@ class Collector:
         if reason == "exit":
             if self._crash_event(g["exe"], end):
                 reason = "crash"
-            else:
-                # WER writes 1000/1002 seconds after the process dies and we poll the log every 30 s
-                self.pending_crash_checks.append((g["session"], g["exe"], end))
+            # WER writes 1000/1002 (and the report) seconds after the process dies and we poll the log every 30 s
+            self.pending_crash_checks.append((g["session"], g["exe"], end))
         self.save_summary(g)
         self.exec("UPDATE sessions SET end_ts=?, end_reason=? WHERE id=?", (end, reason, g["session"]))
+        if reason == "crash":
+            self.save_crash(g["session"], g["exe"], end)
         log.info("game end %s session=%s reason=%s", g["exe"], g["session"], reason)
+
+    def merge_summary(self, sid, extra):
+        with self.lock:
+            r = self.con.execute("SELECT summary FROM sessions WHERE id=?", (sid,)).fetchone()
+            try:
+                summ = json.loads(r[0]) if r and r[0] else {}
+            except ValueError:
+                summ = {}
+            summ.update(extra)
+            self.con.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ, ensure_ascii=False), sid))
+            self.con.commit()
+
+    def save_crash(self, sid, exe, end):
+        try:
+            with self.lock:
+                start = self.con.execute("SELECT start_ts FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+                crash = crashinfo.build(self.con, exe, end, start, CRASH_LATE_S)
+            if crash:
+                self.merge_summary(sid, {"crash": crash})
+                log.info("session %s crash: %s %s", sid, crash.get("module"), crash.get("exception_code"))
+        except Exception:
+            log.exception("crash details for session %s", sid)
 
     def _crash_event(self, exe, end):
         """A crash/hang event for this exe around the exit means it did not exit cleanly."""
@@ -416,8 +440,9 @@ class Collector:
             if now - end < CRASH_LATE_S:
                 keep.append((sid, exe, end))
             elif self._crash_event(exe, end):
-                self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,))
-                log.info("session %s reclassified as crash (late WER event)", sid)
+                if self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,)).rowcount:
+                    log.info("session %s reclassified as crash (late WER event)", sid)
+                self.save_crash(sid, exe, end)   # now with the late WER 1001 / Report.wer
         self.pending_crash_checks = keep
 
     # ---------- event log ----------
@@ -434,11 +459,22 @@ class Collector:
                 if cur.rowcount:
                     c = classify(ev)
                     if c:
-                        self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
-                                                         "message": ev["message"][:1500]}, ts=ev["ts"])
+                        iid = self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
+                                                               "message": ev["message"][:1500]}, ts=ev["ts"])
+                        if c[0] == "bsod" and os.path.exists(crashinfo.CDB):
+                            threading.Thread(target=self._bsod_cause, args=(iid,), daemon=True).start()
         with self.lock:
             db.set_meta(self.con, "events_since", newest)
             self.con.commit()
+
+    def _bsod_cause(self, iid):
+        """Optional: `cdb !analyze -v` on the newest minidump (only when Debugging Tools are installed)."""
+        r = crashinfo.bsod_cause()
+        if r:
+            with self.lock:
+                d = json.loads(self.con.execute("SELECT details FROM incidents WHERE id=?", (iid,)).fetchone()[0] or "{}")
+            d.update(r)
+            self.exec("UPDATE incidents SET details=? WHERE id=?", (json.dumps(d, ensure_ascii=False), iid))
 
     # ---------- housekeeping ----------
     def housekeeping(self, now):
@@ -478,6 +514,14 @@ class Collector:
                                       ensure_ascii=False, indent=1), encoding="utf-8")
             tmp.replace(DUMP_PATH)
             log.info("sensor dump written to %s", DUMP_PATH)
+        if DUMPS_FLAG.exists():
+            action = DUMPS_FLAG.read_text(encoding="utf-8").strip()
+            DUMPS_FLAG.unlink(missing_ok=True)
+            if action in ("enable", "disable"):
+                try:
+                    log.info("WER LocalDumps %s: %s", action, crashinfo.set_local_dumps(action == "enable"))
+                except OSError as e:
+                    log.error("WER LocalDumps %s failed: %s", action, e)
         requested = RELOAD_FLAG.exists()
         stamp = source_stamp()
         if stamp == self.src_stamp and not requested:

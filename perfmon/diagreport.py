@@ -5,6 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
+from . import crashinfo
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -94,6 +95,9 @@ def gpu_background(con, start, end, exe):
 
 def extend(con, rep, row, start, end):
     """Extra sections of session_report."""
+    summ = rep.get("summary") or {}
+    rep["crash"] = summ.get("crash") or (crashinfo.build(con, row["exe"], end, start, read_files=False)
+                                         if row["end_reason"] == "crash" else None)
     rep["game_proc"] = game_proc_summary(con, row["id"])
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
 

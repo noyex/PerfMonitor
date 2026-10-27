@@ -12,7 +12,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import diagreport, marks
+from . import crashinfo, diagreport, marks
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -362,8 +362,7 @@ def _session_findings(rep, row):
     n_st = st.get("count", 0)
 
     if row["end_reason"] == "crash":
-        add("critical", f"{exe} zakończył się crashem",
-            "Sesja zakończyła się awarią gry - sprawdź zdarzenia 1000/1001 (Application Error / WER) w sekcji events.")
+        add("critical", *crashinfo.finding(rep.get("crash"), exe))
     if row["end_reason"] == "unknown":
         add("serious", "Sesja zakończona w nieznany sposób",
             "Kolektor nie zapisał końca sesji - możliwy twardy reset/zawieszenie komputera podczas gry.")
@@ -685,6 +684,7 @@ def health_overview(con, days=14):
     for c in crashes:
         c["first"], c["last"] = fmt_ts(c.pop("first_ts")), fmt_ts(c.pop("last_ts"))
         c["app"] = c["title"].split(":", 1)[-1].strip()
+    crashinfo.annotate_recurring(con, crashes, t0)
     cfg = incidents_between(con, t0, time.time(), kinds="config_change")
     for c in cfg:
         d = c.get("details")
@@ -739,6 +739,7 @@ def diagnose(rep, con=None, t0=None):
             add("warning", f"{c['app']} {('crashuje' if c['kind'] == 'app_crash' else 'wiesza się')} {c['n']}x",
                 f"Od {c['first']} do {c['last']}. " + (
                     "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
+                    else f"Moduł {c['module']}, kod {c['code']}: {c['verdict']}." if c.get("verdict")
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
     for k, name, desc in (
             ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),

@@ -115,7 +115,7 @@ def cmd_health(con, a):
             "power_btn": u.get("power_button_ts"), "notes": "; ".join(u.get("interpretation", [])) or u.get("source"),
             "last_sample": (u.get("last_sample_before") or {}).get("time")} for u in h["unclean_shutdowns"]], maxw=200)
     out("### Powtarzające się crashe / zawieszenia aplikacji")
-    table(h["recurring_crashes"], ["app", "kind", "n", "first", "last"])
+    table(h["recurring_crashes"], ["app", "kind", "n", "first", "last", "module", "code", "modules", "verdict"], maxw=160)
     out("### Freezy zarejestrowane przez kolektor")
     table(h["freezes"])
     out("### Zmiany konfiguracji")
@@ -155,6 +155,14 @@ def cmd_session(con, a):
     if st["worst"]:
         table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])}
                for w in st["worst"]])
+    if r.get("crash"):
+        c = r["crash"]
+        it = c.get("interpretation") or {}
+        kv({"moduł": c.get("module") and f"{c['module']} {c.get('module_version') or ''}".strip(),
+            "kod wyjątku": c.get("exception_code") and f"{c['exception_code']} {c.get('exception_name') or ''}".strip(),
+            "offset": c.get("offset"), "wersja gry": c.get("app_version"), "raport WER": c.get("report_path"),
+            "zrzut": c.get("dump_path"), "interpretacja": f"{it.get('verdict')} [pewność: {it.get('confidence')}]",
+            "kroki": "; ".join(it.get("next_steps") or [])}, "Crash")
     kv(r["hardware"], "Sprzęt (szczyty/średnie)")
     gp = r.get("game_proc")
     if gp:
@@ -395,6 +403,27 @@ def cmd_sensors(con, a):
     table(d["sensors"], ["hardware", "type", "name", "value", "min", "max"])
 
 
+def cmd_dumps(con, a):
+    """WER LocalDumps (user-mode minidumps of crashing games): the elevated collector changes HKLM on request."""
+    from perfmon import crashinfo
+    if a.action == "status":
+        st = crashinfo.local_dumps_status()
+        if a.json:
+            return dump(st)
+        out("Minidumpy aplikacji (WER LocalDumps): " + ("WŁĄCZONE" if st["enabled"] else "wyłączone"))
+        return kv({k: v for k, v in st.items() if k != "enabled"})
+    flag = config.DATA_DIR / "dumps.request"
+    flag.write_text(a.action, encoding="utf-8")
+    want = a.action == "enable"
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        if not flag.exists() and crashinfo.local_dumps_status()["enabled"] == want:
+            return out(f"Minidumpy {'włączone' if want else 'wyłączone'}"
+                       + (f" - zapis do {crashinfo.CRASH_DUMPS} (max 5 na aplikację)" if want else ""))
+        time.sleep(0.5)
+    out("Kolektor nie wykonał zmiany w 15 s (czy działa jako admin? pm status, data/collector.log)")
+
+
 def cmd_freeze_check(con, a):
     from perfmon import freezecheck
     r = freezecheck.run(con)
@@ -469,6 +498,8 @@ def build():
     add("collector", cmd_collector, help="restart the running collector").add_argument("action", choices=["reload"])
     add("sensors", cmd_sensors, help="dump every hardware sensor").add_argument("action", choices=["dump"])
     add("freeze-check", cmd_freeze_check, help="live diagnosis while the desktop is frozen")
+    add("dumps", cmd_dumps, help="WER minidumps of crashing apps (HKLM, via the collector)").add_argument(
+        "action", choices=["status", "enable", "disable"])
     return p
 
 
