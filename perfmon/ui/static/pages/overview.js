@@ -2,10 +2,6 @@
 Pages.overview = (() => {
   const LIVE_WINDOW = 120;
   const CHART_H = 240;
-  const LIMIT = {
-    gpu: "Karta graficzna", gpu_power: "Limit mocy karty", cpu: "Procesor", cpu_thread: "Jeden wątek procesora",
-    limit: "Limit FPS", vram: "Pamięć VRAM", mixed: "Różne",
-  };
   const ENDED = { crash: ["critical", "Awaria"], unknown: ["warning", "Przerwana"] };
   const DAYS = ["niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."];
 
@@ -143,7 +139,7 @@ Pages.overview = (() => {
       : `1 na ${fmtDur(s.duration_s / n)}`;
     r.low.textContent = s.fps_1low != null ? `${fmt(s.fps_1low)} fps` : "–";
     const b = s.bottleneck;
-    r.limit.replaceChildren(b ? LIMIT[b.kind] || b.kind : "–", b && b.share != null && b.kind !== "mixed" ? h("span", { class: "m" }, `${fmt(b.share)}% czasu`) : "");
+    r.limit.replaceChildren(b ? BOTTLENECK[b.kind] || b.kind : "–", b && b.share != null && b.kind !== "mixed" ? h("span", { class: "m" }, `${fmt(b.share)}% czasu`) : "");
     r.advice.textContent = b && b.kind !== "mixed" ? b.advice : "";
     const ref = live ? now : s.start_ts;
     state.stutters = (s.stutter_ts || []).map((t) => t - ref);
@@ -191,14 +187,18 @@ Pages.overview = (() => {
           ? [h("div", { class: "ov-lh" }, h("h2", {}, "Ostatnie sesje"), h("a", { href: "#/games" }, "Wszystkie sesje →")), rows(o.recent)]
           : []));
       }
-      if (!s) return;
+      // a finished session's data doesn't change: fill once, then only watch for a game to start
+      if (!s || (!s.running && card.filled)) return;
       const t0 = s.running ? o.now - LIVE_WINDOW : s.start_ts;
       const t1 = s.running ? o.now : s.end_ts;
       const [f, dm] = await Promise.all([
         api("frames", { from: t0, to: t1, session: s.id, points: s.running ? LIVE_WINDOW * 2 : 600 }),
         api("diag_markers", { from: t0, to: t1 }),
       ]);
-      if (me === run && card && card.plot) fill(card, s, f, dm.filter((m) => m.kind === "mark"), o.now);
+      if (me === run && card && card.plot) {
+        fill(card, s, f, dm.filter((m) => m.kind === "mark"), o.now);
+        card.filled = true;
+      }
     };
 
     const me = run;
@@ -206,7 +206,7 @@ Pages.overview = (() => {
       try {
         await tick();
       } catch (e) {
-        if (me === run && !card) view.replaceChildren(h("div", { class: "empty" }, `Błąd: ${e.message}`));
+        if (me === run && !card) top.replaceChildren(h("div", { class: "empty" }, `Błąd: ${e.message}`));
       }
       if (me !== run) return;
       // live: refresh every 2 s; otherwise only watch for a game to start

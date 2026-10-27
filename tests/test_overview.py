@@ -24,6 +24,7 @@ class OverviewTest(unittest.TestCase):
         add_open_session(con, 2, now - 120)
         con.executemany("INSERT INTO stutters(ts, session, ft_ms, median_ms, causes) VALUES (?,?,?,?,?)",
                         [(now - 90, 2, 40, 7, "[]"), (now - 30, 2, 50, 7, "[]")])
+        con.execute("INSERT INTO samples(ts) VALUES (?)", (now - 1,))   # collector alive
         o = an.overview(con)
         cur = o["current"]
         self.assertEqual(cur["id"], 2)
@@ -52,11 +53,20 @@ class OverviewTest(unittest.TestCase):
         self.assertIsNotNone(o["current"]["bottleneck"])
         self.assertEqual([r["id"] for r in o["recent"]], [2])
 
+    def test_stale_open_session_falls_back_to_last_finished(self):
+        con = new_db()
+        now = time.time()
+        add_session(con, 1, now - 7200, minutes=2)
+        con.execute("UPDATE sessions SET summary=? WHERE id=1", (json.dumps({"frames": 7200}),))
+        add_open_session(con, 2, now - 3600)          # frames an hour old, no samples: collector is dead
+        o = an.overview(con)
+        self.assertEqual(o["current"]["id"], 1)
+        self.assertEqual(o["recent"], [])
+
     def test_empty_db(self):
         o = an.overview(new_db())
         self.assertIsNone(o["current"])
         self.assertEqual(o["recent"], [])
-        self.assertFalse(o["collector_alive"])
 
 
 if __name__ == "__main__":

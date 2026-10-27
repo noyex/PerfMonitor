@@ -148,32 +148,55 @@ _BOTTLENECK_SHARE = {"gpu": "gpu_bound_pct", "gpu_power": "gpu_bound_pct", "cpu"
                      "cpu_thread": "cpu_bound_pct", "limit": "limit_pct", "vram": "vram_shared_over_pct"}
 
 
+_OVERVIEW_LIVE_S = 130          # stutters sent for a running session (chart shows the last 2 minutes)
+_BOTTLENECK_TTL_S = 30          # live bottleneck refresh; finished sessions are cached for good
+_bottleneck_cache = {}          # session id -> (computed at, result)
+
+
+def _overview_bottleneck(con, cur, now):
+    sid = cur["id"]
+    if not cur["running"]:
+        b = (_json(_one(con, "SELECT summary FROM sessions WHERE id=?", (sid,))["summary"]) or {}).get("bottleneck")
+        if b:
+            return b
+    hit = _bottleneck_cache.get(sid)
+    if hit and (not cur["running"] or now - hit[0] < _BOTTLENECK_TTL_S):
+        return hit[1]
+    b = bottleneck.compute(con, sid, cur["start_ts"], cur["end_ts"] or now)
+    _bottleneck_cache[sid] = (now, b)
+    return b
+
+
 def overview(con, recent=5):
     """Overview screen: the running game session, else the last one with frames, plus the latest sessions.
 
-    `current` adds stutter timestamps, the last stutter and the bottleneck ({kind, share, advice}); for a running
-    session the bottleneck is computed live, for a finished one it comes from the summary (computed if missing)."""
+    A running session counts only while the collector is alive and the game renders (a frame in the last 30 s, or
+    started under a minute ago), so a stale row after a crash or a launcher without frames doesn't take the card.
+    `current` adds stutter timestamps, the last stutter and the bottleneck ({kind, share, advice})."""
     now = time.time()
     s = _one(con, "SELECT ts FROM samples ORDER BY ts DESC LIMIT 1")
+    alive = bool(s and now - s["ts"] < 5)
     rows = sessions(con, recent + 10)
-    cur = next((r for r in rows if r["running"]), None) or next((r for r in rows if r.get("frames")), None)
+    live = next((r for r in rows if r["running"]), None)
+    if live and not (alive and (now - live["start_ts"] < 60 or _one(
+            con, "SELECT 1 AS x FROM frames WHERE session=? AND ts>?", (live["id"], now - 30)))):
+        live = None
+    cur = live or next((r for r in rows if not r["running"] and r.get("frames")), None)
     if cur:
         sid = cur["id"]
-        st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? ORDER BY ts DESC LIMIT 500", (sid,))]
-        cur["stutter_ts"] = st[::-1]
-        cur["last_stutter_ts"] = st[0] if st else None
-        b = None if cur["running"] else (_json(_one(con, "SELECT summary FROM sessions WHERE id=?", (sid,))["summary"])
-                                         or {}).get("bottleneck")
-        if not b:
-            b = bottleneck.compute(con, sid, cur["start_ts"], cur["end_ts"] or now)
-        if b:
-            share = (b.get("metrics") or {}).get(_BOTTLENECK_SHARE.get(b["kind"]))
-            cur["bottleneck"] = {"kind": b["kind"], "share": share, "advice": b.get("advice")}
+        if cur["running"]:
+            st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? AND ts>? ORDER BY ts",
+                                               (sid, now - _OVERVIEW_LIVE_S))]
+            last = _one(con, "SELECT MAX(ts) AS ts FROM stutters WHERE session=?", (sid,))["ts"]
         else:
-            cur["bottleneck"] = None
+            st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? ORDER BY ts", (sid,))]
+            last = st[-1] if st else None
+        cur["stutter_ts"], cur["last_stutter_ts"] = st, last
+        b = _overview_bottleneck(con, cur, now)
+        cur["bottleneck"] = {"kind": b["kind"], "share": (b.get("metrics") or {}).get(_BOTTLENECK_SHARE.get(b["kind"])),
+                             "advice": b.get("advice")} if b else None
     return {
         "now": now,
-        "collector_alive": bool(s and now - s["ts"] < 5),
         "current": cur,
         # sessions without frames that ended normally are launchers / short starts, not games played
         "recent": [r for r in rows if not r["running"] and r is not cur
