@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import bottleneck, config, crashinfo, diskinfo, memleak, present, procwatch
+from . import bottleneck, config, crashinfo, diskinfo, etwbox, memleak, present, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -149,6 +149,10 @@ def extend(con, rep, row, start, end):
     rep["present"] = present.session_present(con, row, summ)
     rep["shader"] = shader_summary(con, row)
     rep["mem_growth"] = memleak.assess(con, row["id"], start, end)
+    win = etwbox.settings(config.load())["dump_last_s"]
+    for w in (rep.get("stutters") or {}).get("worst") or []:
+        if "dpc" in w["causes"]:
+            w["etw_capture"] = etwbox.nearest_capture(con, w["ts"], win)
     rep["bottleneck"] = bottleneck.compute(con, row["id"], start, end, (rep.get("hardware") or {}).get("vram_total_mb"))
 
 

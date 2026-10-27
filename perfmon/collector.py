@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import bottleneck, config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
+from . import bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
 from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -76,6 +76,9 @@ class Collector:
         self.shader = shadercache.ShaderWatch(self.cfg.get("shader_cache_dirs") or shadercache.DEFAULT_DIRS,
                                               self.cfg.get("shader_scan_interval_s", 10))
         self.shader_pid = None         # game whose shader caches ShaderWatch measures
+        self.etw = etwbox.EtwBox(self.cfg, self.save_etw_capture)
+        self.etw_pending = []          # (due ts, capture id) waiting for analysis
+        self.etw_proc = None           # running analysis process
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -203,12 +206,15 @@ class Collector:
         )
         self.exec(INSERT_SAMPLE, [row[c] for c in SAMPLE_COLS])
         self.detect_live(row)
+        self.etw.on_sample(row["ts"], row["dpc_pct"], session)
 
     # ---------- live incident detection ----------
     def _ongoing(self, kind, active, severity, title, row, details_fn):
         iid = self.open_incidents.get(kind)
         if active and iid is None:
             self.open_incidents[kind] = self.incident(kind, severity, title, details_fn(), ts=row["ts"])
+            if kind in ("ui_freeze", "dwm_stall"):
+                self.etw.trigger(kind)
         elif not active and iid is not None:
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
             del self.open_incidents[kind]
@@ -258,6 +264,7 @@ class Collector:
                 det = marks.context(self.con, r["ts"], session=session)
             det.update(text=r["text"], source=r["source"], top_procs=self.snapshot_procs())
             self.incident("user_mark", "info", marks.title(r["text"]), det, ts=r["ts"])
+            self.etw.trigger("user_mark", session)
 
     # ---------- processes ----------
     def sample_procs(self):
@@ -400,6 +407,7 @@ class Collector:
     def on_stutter(self, s):
         self.exec("INSERT INTO stutters(ts, session, ft_ms, median_ms) VALUES (?,?,?,?)",
                   (s["ts"], s["session"], s["ft_ms"], s["median_ms"]))
+        self.etw.on_stutter(s["ts"], s["session"])
 
     def save_summary(self, g):
         summ = g["capture"].summary() if g["capture"] else {"error": "PresentMon niedostępny"}
@@ -457,6 +465,29 @@ class Collector:
                 self.incident("game_mem_leak", "warning", memleak.title(exe, m), dict(m, session=sid), ts=end)
         except Exception:
             log.exception("memory growth for session %s", sid)
+
+    # ---------- ETW black box ----------
+    def save_etw_capture(self, row):
+        """etwbox worker thread: store the dump, queue its analysis."""
+        row = dict(row, summary=json.dumps(row["summary"], ensure_ascii=False))
+        cid = self.exec("INSERT INTO etw_captures(ts, trigger, session, path, size_mb, status, summary) "
+                        "VALUES (:ts,:trigger,:session,:path,:size_mb,:status,:summary)", row).lastrowid
+        if row["status"] == "captured" and self.etw.s["analyze"]:
+            self.etw_pending.append((time.time() + etwbox.ANALYZE_DELAY_S, cid))
+
+    def etw_tick(self, now):
+        for action in etwbox.take_requests():
+            log.info("ETW request: %s", action)
+            self.etw.control(action)
+        self.etw.ensure(bool(self.games), now)
+        if self.etw_proc is not None and self.etw_proc.poll() is None:
+            return
+        self.etw_proc = None
+        due = [p for p in self.etw_pending if p[0] <= now]
+        if due and (not self.games or self.etw.s["analyze_during_game"]):
+            self.etw_pending.remove(due[0])
+            self.etw_proc = etwbox.spawn_analysis(due[0][1])
+            log.info("ETW capture %s: analysis started", due[0][1])
 
     def save_crash(self, sid, exe, end):
         try:
@@ -542,8 +573,11 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "etw_captures"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
+            with self.lock:
+                if etwbox.retention(self.con, self.etw.s, now):
+                    self.con.commit()
             self.name_cache.clear()
 
     def _sysinfo(self):
@@ -651,6 +685,7 @@ class Collector:
                     self.poll_events()
                     self.recheck_crashes(now)
                 self.process_marks()
+                self.etw_tick(now)
                 self.housekeeping(now)
                 self.check_reload(now)
                 self.finish_reload()
@@ -671,6 +706,7 @@ class Collector:
         self.open_incidents.clear()
         self.hotkey.stop()
         self.shader.stop()
+        self.etw.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

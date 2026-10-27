@@ -25,6 +25,10 @@ DEFAULTS = {
     "shader_cache_dirs": [r"%LOCALAPPDATA%\AMD\DxCache", r"%LOCALAPPDATA%\AMD\DxcCache", r"%LOCALAPPDATA%\AMD\VkCache",
                           r"%LOCALAPPDATA%\AMD\OglCache", r"%LOCALAPPDATA%\AMD\DX9Cache", "{steam}"],
     "shader_scan_interval_s": 10,
+    # ETW black box (perfmon/etwbox.py): kernel trace in memory, dumped on these triggers; mode game|always|off
+    "etw": {"mode": "game", "buffer_mb": 256, "dump_last_s": 60,
+            "triggers": {"dwm_stall": True, "ui_freeze": True, "user_mark": True, "stutter_burst": 5, "dpc_pct": 8},
+            "analyze": True, "analyze_during_game": False, "retention_days": 14, "max_gb": 2},
     # Process start/stop log: these are ignored outside game sessions (inside only conhost/dllhost/WmiPrvSE)
     "proc_events_ignore": ["conhost.exe", "cmd.exe", "powershell.exe", "svchost.exe", "RuntimeBroker.exe",
                            "backgroundTaskHost.exe", "dllhost.exe", "WmiPrvSE.exe", "taskhostw.exe"],

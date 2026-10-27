@@ -164,8 +164,8 @@ def cmd_session(con, a):
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
         "przyczyny": st["cause_counts"]}, "Stuttery")
     if st["worst"]:
-        table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])}
-               for w in st["worst"]])
+        table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])
+                + (f" (pm etw show {w['etw_capture']})" if w.get("etw_capture") else "")} for w in st["worst"]])
     if r.get("crash"):
         c = r["crash"]
         it = c.get("interpretation") or {}
@@ -476,6 +476,56 @@ def cmd_dumps(con, a):
     out("Kolektor nie wykonał zmiany w 15 s (czy działa jako admin? pm status, data/collector.log)")
 
 
+def cmd_etw(con, a):
+    """ETW black box: captures list/details, analysis, manual start/stop (via the elevated collector)."""
+    from perfmon import etwbox
+    s = etwbox.settings(config.load())
+    if a.action in ("start", "stop"):
+        etwbox.request(a.action)
+        return out(f"Wysłano do kolektora: {a.action} (stan: data/collector.log, 'ETW black box ...')")
+    if a.action in ("show", "analyze") and a.id is None:
+        sys.exit(f"pm etw {a.action} ID")
+    if a.action == "analyze":
+        rw = db.connect()
+        try:
+            summ = etwbox.analyze(rw, a.id)
+        finally:
+            rw.close()
+        out(f"Zrzut {a.id}: analiza {summ['analysis_s']} s (tracerpt {summ['convert_s']} s, CSV {summ['csv_mb']} MB)")
+        a.action = "show"
+    if a.action == "show":
+        r = an._one(con, "SELECT * FROM etw_captures WHERE id=?", (a.id,))
+        if not r:
+            sys.exit(f"Brak zrzutu {a.id}")
+        r["summary"] = an._json(r["summary"]) or {}
+        if a.json:
+            return dump(r)
+        sm = r["summary"]
+        out(f"## Zrzut ETW #{r['id']} - {an.fmt_ts(r['ts'])}, wyzwalacz {r['trigger']}, sesja {r['session'] or '-'}, "
+            f"{r['status']}")
+        kv({"plik": r["path"] or "(usunięty)", "MB": r["size_mb"], "okno s": sm.get("window_s"),
+            "zdarzenia": sm.get("events"), "utracone": sm.get("events_lost"), "analiza s": sm.get("analysis_s"),
+            "błąd": sm.get("error")})
+        for key, title in (("dpc_top", "DPC wg sterownika"), ("isr_top", "ISR wg sterownika"),
+                           ("disk_top", "Dysk wg procesu (MB)"), ("disk_slowest", "Najwolniejsze I/O wg procesu")):
+            if sm.get(key):
+                out(f"### {title}")
+                table(sm[key])
+        return
+    rows = an._rows(con, "SELECT id, ts, trigger, session, size_mb, status, summary FROM etw_captures "
+                         "ORDER BY ts DESC LIMIT ?", (a.limit,))
+    for r in rows:
+        r["time"] = an.fmt_ts(r["ts"])
+        sm = an._json(r.pop("summary")) or {}
+        r["result"] = etwbox.headline(sm)[1] if r["status"] == "analyzed" else sm.get("error") or ""
+    if a.json:
+        return dump(rows)
+    t = etwbox.tools_available()
+    out(f"## Czarna skrzynka ETW (tryb {s['mode']}, bufor {s['buffer_mb']} MB, analiza ostatnich {s['dump_last_s']} s; "
+        f"wpr {'jest' if t['wpr'] else 'BRAK'}, tracerpt {'jest' if t['tracerpt'] else 'BRAK'})")
+    table(rows, ["id", "time", "trigger", "session", "size_mb", "status", "result"], maxw=160)
+
+
 def cmd_freeze_check(con, a):
     from perfmon import freezecheck
     r = freezecheck.run(con)
@@ -553,6 +603,10 @@ def build():
     add("collector", cmd_collector, help="restart the running collector").add_argument("action", choices=["reload"])
     add("sensors", cmd_sensors, help="dump every hardware sensor").add_argument("action", choices=["dump"])
     add("freeze-check", cmd_freeze_check, help="live diagnosis while the desktop is frozen")
+    s = add("etw", cmd_etw, help="ETW black box: kernel trace dumps on freezes / marks / DPC storms")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "show", "analyze", "start", "stop"])
+    s.add_argument("id", nargs="?", type=int)
+    s.add_argument("--limit", type=int, default=30)
     add("dumps", cmd_dumps, help="WER minidumps of crashing apps (HKLM, via the collector)").add_argument(
         "action", choices=["status", "enable", "disable"])
     return p

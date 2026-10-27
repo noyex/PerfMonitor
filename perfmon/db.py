@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS proc_events (        -- processes started/stopped (di
     session INTEGER,                             -- game session id if running
     path TEXT                                    -- exe path, only for starts during a game session
 );
+CREATE TABLE IF NOT EXISTS etw_captures (       -- ETW black box dumps (perfmon/etwbox.py)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, trigger TEXT, session INTEGER,      -- user_mark | dwm_stall | ui_freeze | dpc_pct | stutter_burst
+    path TEXT, size_mb REAL,                     -- path NULL once the file is deleted by retention
+    status TEXT,                                 -- captured | analyzed | failed
+    summary TEXT                                 -- JSON: top DPC/ISR drivers, disk I/O per process, timings
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
