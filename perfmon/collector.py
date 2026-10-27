@@ -269,7 +269,8 @@ class Collector:
                     continue
                 out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2)))
         with self.lock:
-            self.con.executemany("INSERT INTO procs VALUES (?,?,?,?,?,?,?)", out)
+            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs) "
+                                 "VALUES (?,?,?,?,?,?,?)", out)
             self.con.commit()
 
     # ---------- games ----------

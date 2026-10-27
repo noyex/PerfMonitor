@@ -42,8 +42,9 @@ CREATE TABLE IF NOT EXISTS stutters (           -- individual frame stutters
     ts REAL, session INTEGER, ft_ms REAL, median_ms REAL, causes TEXT
 );
 CREATE TABLE IF NOT EXISTS procs (              -- top processes every ~5 s
-    ts REAL, kind TEXT, name TEXT, pid INTEGER,  -- kind: cpu | mem | io
-    cpu_pct REAL, mem_mb REAL, io_mbs REAL
+    ts REAL, kind TEXT, name TEXT, pid INTEGER,  -- kind: cpu | mem | io | gpu
+    cpu_pct REAL, mem_mb REAL, io_mbs REAL,
+    gpu_pct REAL, vram_mb REAL                   -- GPU engines load (sum, %) / dedicated VRAM (kind gpu)
 );
 CREATE TABLE IF NOT EXISTS events (             -- Windows event log (errors, warnings, selected info)
     ts REAL, log TEXT, provider TEXT, event_id INTEGER, level INTEGER, record_id INTEGER,
@@ -56,6 +57,17 @@ CREATE TABLE IF NOT EXISTS incidents (          -- detected problems (freeze, cr
 );
 CREATE TABLE IF NOT EXISTS system_info (        -- config snapshot (drivers, BIOS, settings)
     ts REAL, info TEXT
+);
+CREATE TABLE IF NOT EXISTS game_proc (          -- the game process itself every ~5 s (perfmon/gpuproc.py)
+    ts REAL, session INTEGER, pid INTEGER,
+    rss_mb REAL, private_mb REAL,                -- working set / private bytes (memory growth = leak)
+    thread_max_pct REAL,                         -- busiest thread, % of one core over the interval
+    threads INTEGER, handles INTEGER,
+    io_read_mbs REAL,                            -- game reads from disk (asset streaming)
+    gpu_pct REAL,                                -- GPU engines load of the game (3D+Compute+Copy+Video)
+    vram_dedicated_mb REAL, vram_shared_mb REAL, -- shared > ~0.5 GB = VRAM spills into system RAM
+    shader_bytes INTEGER,                        -- size of the driver/Steam shader caches (growth = compiling)
+    PRIMARY KEY (session, ts)
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
@@ -75,11 +87,18 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
         con.executescript(SCHEMA)
-        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
-        if "context" not in cols:  # migrate DBs created before the context column existed
-            con.execute("ALTER TABLE sessions ADD COLUMN context TEXT")
+        # migrate DBs created before these columns existed
+        add_columns(con, "sessions", {"context": "TEXT"})
+        add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
     con.row_factory = sqlite3.Row
     return con
+
+
+def add_columns(con, table, cols):
+    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    for c, t in cols.items():
+        if c not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {c} {t}")
 
 
 def get_meta(con, k, default=None):
