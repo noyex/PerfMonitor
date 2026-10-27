@@ -808,7 +808,8 @@ def _session_metrics(con, exe=None, since=None):
             "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            "_g": x["g"] if x else 0, "_c": x["c"] if x else 0, "_l": x["l"] if x else 0, "_n": x["n"] if x else 0,
+            "_g": (x["g"] or 0) if x else 0, "_c": (x["c"] or 0) if x else 0, "_l": (x["l"] or 0) if x else 0,
+            "_n": x["n"] if x else 0,
             "_secs": x["secs"] if x else 0,
         })
     return out
