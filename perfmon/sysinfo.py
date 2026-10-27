@@ -2,6 +2,8 @@
 import json
 import subprocess
 
+from .diskinfo import DISK_MAP_PS, HEALTH_PS
+
 PS = r"""
 $ErrorActionPreference='SilentlyContinue'
 function RegV($p,$n){ (Get-ItemProperty -Path $p -Name $n).$n }
@@ -33,6 +35,7 @@ $plan=(powercfg /getactivescheme) -replace '.*:\s*',''
  monitors = @(Get-CimInstance -Namespace root\wmi WmiMonitorID | % { ($_.UserFriendlyName | ? {$_ -ne 0} | % {[char]$_}) -join '' })
 } | ConvertTo-Json -Depth 4 -Compress
 """
+PS = PS.replace("\n} | ConvertTo-Json", f"\n {HEALTH_PS}\n {DISK_MAP_PS}\n}} | ConvertTo-Json")
 
 
 def collect() -> dict:

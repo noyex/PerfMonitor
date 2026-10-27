@@ -9,13 +9,14 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from pathlib import Path
 
 import psutil
 
-from . import config, db, gamectx, sysinfo
-from .events import EventReader, classify
+from . import bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
+from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
 from .watchdog import Watchdog, foreground, user_idle_s
@@ -29,18 +30,21 @@ SAMPLE_COLS = [
     "gpu_clock_mhz", "gpu_mem_clock_mhz", "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w",
     "gpu_fan_rpm", "disk_read_mbs", "disk_write_mbs", "disk_lat_ms", "disk_lat_disk", "disk_queue",
     "disk_busy_pct", "net_rx_kbs", "net_tx_kbs", "fg_exe", "fg_hung", "ui_ms", "dwm_ms",
-    "user_idle_s", "game_session", "extra",
+    "user_idle_s", "game_session", "extra", "pagefile_pct",
 ]
 INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUES ({','.join('?' * len(SAMPLE_COLS))})"
 
 FREEZE_MS = 2000      # shell/DWM unresponsive this long = freeze incident
 TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
+BSOD_LOCK = threading.Lock()
+BOTTLENECK_EVERY_S = 300   # summary.bottleneck refresh while a game runs (and once at its end)
 
 SRC_DIR = Path(__file__).resolve().parent
 RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
 DUMP_FLAG = config.DATA_DIR / "sensors_dump.request"   # touched by `pm sensors dump`
 DUMP_PATH = config.DATA_DIR / "sensors_dump.json"
+DUMPS_FLAG = config.DATA_DIR / "dumps.request"   # `pm dumps enable|disable` (WER LocalDumps, HKLM)
 RELOAD_CHECK_S = 5
 MUTEX_NAME = os.environ.get("PERFMON_MUTEX", "Global\\PerfMonitorCollector")   # env override: tests
 
@@ -67,6 +71,16 @@ class Collector:
         self.pdh = PdhCounters()
         self.wd = Watchdog()
         self.events = EventReader()
+        self.gpu_procs = gpuproc.GpuProcs()
+        self.game_sampler = gpuproc.GameProcSampler()
+        self.last_gpu_proc = 0.0
+        self.procwatch = procwatch.ProcWatch(self.cfg)
+        self.shader = shadercache.ShaderWatch(self.cfg.get("shader_cache_dirs") or shadercache.DEFAULT_DIRS,
+                                              self.cfg.get("shader_scan_interval_s", 10))
+        self.shader_pid = None         # game whose shader caches ShaderWatch measures
+        self.etw = etwbox.EtwBox(self.cfg, self.save_etw_capture)
+        self.etw_pending = []          # (due ts, capture id) waiting for analysis
+        self.etw_proc = None           # running analysis process
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -85,6 +99,8 @@ class Collector:
         self.last_reload_check = time.time()
         self.reload_deferred_logged = False
         self.import_check = None       # {"requested", "err"} while the new code is being import-checked
+        self.mark_queue = deque()      # hotkey presses (ts), filled by the hotkey thread
+        self.hotkey = marks.Hotkey(self.cfg.get("hotkey_mark"), self.mark_queue.append, self.cfg.get("hotkey_beep", True))
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -188,15 +204,19 @@ class Collector:
             disk_queue=queue, disk_busy_pct=busy, net_rx_kbs=rx, net_tx_kbs=tx,
             fg_exe=self.pname(fg_pid), fg_hung=int(fg_hung), ui_ms=ui_ms, dwm_ms=dwm_ms,
             user_idle_s=user_idle_s(), game_session=session, extra=json.dumps(extra),
+            pagefile_pct=p.get("pagefile_pct"),
         )
         self.exec(INSERT_SAMPLE, [row[c] for c in SAMPLE_COLS])
         self.detect_live(row)
+        self.etw.on_sample(row["ts"], row["dpc_pct"], session)
 
     # ---------- live incident detection ----------
     def _ongoing(self, kind, active, severity, title, row, details_fn):
         iid = self.open_incidents.get(kind)
         if active and iid is None:
             self.open_incidents[kind] = self.incident(kind, severity, title, details_fn(), ts=row["ts"])
+            if kind in ("ui_freeze", "dwm_stall"):
+                self.etw.trigger(kind)
         elif not active and iid is not None:
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
             del self.open_incidents[kind]
@@ -234,16 +254,33 @@ class Collector:
         self._ongoing("commit_full", bool(cl and r["commit_gb"] / cl > 0.92), "serious",
                       "Pamięć zadeklarowana (commit) >92% limitu", r, ctx)
 
+    # ---------- user marks ----------
+    def process_marks(self):
+        reqs = []
+        while self.mark_queue:
+            reqs.append({"ts": self.mark_queue.popleft(), "text": None, "source": "hotkey"})
+        reqs += marks.take_requests()
+        for r in reqs:
+            session = next(iter(self.games.values()))["session"] if self.games else None
+            with self.lock:
+                det = marks.context(self.con, r["ts"], session=session)
+            det.update(text=r["text"], source=r["source"], top_procs=self.snapshot_procs())
+            self.incident("user_mark", "info", marks.title(r["text"]), det, ts=r["ts"])
+            self.etw.trigger("user_mark", session)
+
     # ---------- processes ----------
     def sample_procs(self):
         now = time.time()
         rows, cur = [], {}
         ncpu = psutil.cpu_count()
-        for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info"]):
+        snap = {}   # pid -> (create_time, name, ppid) for the process start/stop log
+        for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info", "ppid", "create_time"]):
             try:
                 i = pr.info
                 if i["pid"] == 0:
                     continue  # "System Idle Process": idle time, not load
+                if i["create_time"] is not None:   # psutil gives None when it cannot read it
+                    snap[i["pid"]] = (i["create_time"], i["name"], i["ppid"])
                 ct = i["cpu_times"]
                 cpu_s = ct.user + ct.system
                 try:
@@ -267,10 +304,40 @@ class Collector:
             for name, pid, c, m, io in sorted(rows, key=lambda x: -x[key])[:n]:
                 if kind == "io" and io < 0.5:
                     continue
-                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2)))
+                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2), None, None))
+        session = next(iter(self.games.values()))["session"] if self.games else None
+        pe = self.procwatch.update(now, snap, session)
+        game_rows = []
+        if now - self.last_gpu_proc >= self.cfg.get("gpu_proc_interval_s", 5) - 0.5:
+            self.last_gpu_proc = now
+            out += self.sample_gpu(now, {r[1]: r for r in rows}, game_rows)
         with self.lock:
-            self.con.executemany("INSERT INTO procs VALUES (?,?,?,?,?,?,?)", out)
+            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs, gpu_pct, vram_mb) "
+                                 "VALUES (?,?,?,?,?,?,?,?,?)", out)
+            if pe:
+                self.con.executemany("INSERT INTO proc_events(ts, pid, name, ppid, parent_name, action, session, path) "
+                                     "VALUES (:ts,:pid,:name,:ppid,:parent_name,:action,:session,:path)", pe)
+            for g in game_rows:
+                self.con.execute(f"INSERT OR REPLACE INTO game_proc ({','.join(g)}) VALUES ({','.join('?' * len(g))})",
+                                 list(g.values()))
             self.con.commit()
+
+    def sample_gpu(self, now, by_pid, game_rows):
+        """procs rows kind='gpu' (top 5 without the game) + game_proc rows of running games."""
+        gpu = self.gpu_procs.read()
+        for pid, g in self.games.items():
+            r = self.game_sampler.sample(pid, g["session"], gpu.get(pid), now)
+            if r:
+                if pid == self.shader_pid:
+                    r["shader_bytes"] = self.shader.latest()[1]
+                game_rows.append(r)
+        out = []
+        for pid, d in gpuproc.top_background(gpu, set(self.games)):
+            r = by_pid.get(pid)
+            out.append((now, "gpu", r[0] if r else self.pname(pid), pid, round(r[2], 2) if r else None,
+                        round(r[3], 1) if r else None, None, round(d["gpu"], 1),
+                        round(d["ded_mb"]) if d["ded_mb"] is not None else None))
+        return out
 
     # ---------- games ----------
     def is_game(self, name, path):
@@ -323,12 +390,16 @@ class Collector:
             ctx = gamectx.collect(exe, self.hw.gpu.Name if self.hw.gpu is not None else None)
         except Exception as e:
             ctx = {"error": str(e)}
+        start = time.time()
         sid = self.exec("INSERT INTO sessions(exe, path, pid, start_ts, context) VALUES (?,?,?,?,?)",
-                        (name, exe, pid, time.time(), json.dumps(ctx))).lastrowid
+                        (name, exe, pid, start, json.dumps(ctx))).lastrowid
         cap = None
         if os.path.exists(self.cfg["presentmon_exe"]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
-        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time()}
+        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "path": exe, "start": start,
+                           "last_summary": time.time()}
+        self.shader.set_game(exe)   # the newest game: usually the only one
+        self.shader_pid = pid
         log.info("game start %s pid=%s session=%s", name, pid, sid)
 
     def on_frame_second(self, r):
@@ -339,25 +410,101 @@ class Collector:
     def on_stutter(self, s):
         self.exec("INSERT INTO stutters(ts, session, ft_ms, median_ms) VALUES (?,?,?,?)",
                   (s["ts"], s["session"], s["ft_ms"], s["median_ms"]))
+        self.etw.on_stutter(s["ts"], s["session"])
 
-    def save_summary(self, g):
+    def save_summary(self, g, final=False):
         summ = g["capture"].summary() if g["capture"] else {"error": "PresentMon niedostępny"}
-        self.exec("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ), g["session"]))
+        now = time.time()
+        if final or now - g.get("last_bottleneck", 0) >= BOTTLENECK_EVERY_S:
+            g["last_bottleneck"] = now
+            try:
+                with self.lock:   # ~30 ms for a 3 h session
+                    b = bottleneck.compute(self.con, g["session"], g["start"], now)
+                if b:
+                    summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
+                    summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
+            except Exception:
+                log.exception("bottleneck for session %s", g["session"])
+        self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)
 
     def end_game(self, pid, reason):
         g = self.games.pop(pid)
+        self.game_sampler.forget(pid)
+        if pid == self.shader_pid:
+            self.shader_pid = next(iter(self.games), None)
+            self.shader.set_game(self.games[self.shader_pid]["path"] if self.shader_pid else None)
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
         if reason == "exit":
             if self._crash_event(g["exe"], end):
                 reason = "crash"
-            else:
-                # WER writes 1000/1002 seconds after the process dies and we poll the log every 30 s
-                self.pending_crash_checks.append((g["session"], g["exe"], end))
-        self.save_summary(g)
+            # WER writes 1000/1002 (and the report) seconds after the process dies and we poll the log every 30 s
+            self.pending_crash_checks.append((g["session"], g["exe"], end))
+        self.save_summary(g, final=True)
+        self.save_mem_growth(g["session"], g["exe"], end)
         self.exec("UPDATE sessions SET end_ts=?, end_reason=? WHERE id=?", (end, reason, g["session"]))
+        if reason == "crash":
+            self.save_crash(g["session"], g["exe"], end)
         log.info("game end %s session=%s reason=%s", g["exe"], g["session"], reason)
+
+    def merge_summary(self, sid, extra):
+        with self.lock:
+            r = self.con.execute("SELECT summary FROM sessions WHERE id=?", (sid,)).fetchone()
+            try:
+                summ = json.loads(r[0]) if r and r[0] else {}
+            except ValueError:
+                summ = {}
+            summ.update(extra)
+            self.con.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ, ensure_ascii=False), sid))
+            self.con.commit()
+
+    def save_mem_growth(self, sid, exe, end):
+        try:
+            with self.lock:
+                start = self.con.execute("SELECT start_ts FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+                m = memleak.assess(self.con, sid, start, end)
+            if not m:
+                return
+            self.merge_summary(sid, {"mem_growth_mb_h": m["mem_growth_mb_h"], "mem_growth_r2": m["mem_growth_r2"]})
+            if m["leak"]:
+                self.incident("game_mem_leak", "warning", memleak.title(exe, m), dict(m, session=sid), ts=end)
+        except Exception:
+            log.exception("memory growth for session %s", sid)
+
+    # ---------- ETW black box ----------
+    def save_etw_capture(self, row):
+        """etwbox worker thread: store the dump, queue its analysis."""
+        row = dict(row, summary=json.dumps(row["summary"], ensure_ascii=False))
+        cid = self.exec("INSERT INTO etw_captures(ts, trigger, session, path, size_mb, status, summary) "
+                        "VALUES (:ts,:trigger,:session,:path,:size_mb,:status,:summary)", row).lastrowid
+        if row["status"] == "captured" and self.etw.s["analyze"]:
+            self.etw_pending.append((time.time() + etwbox.ANALYZE_DELAY_S, cid))
+
+    def etw_tick(self, now):
+        for action in etwbox.take_requests():
+            log.info("ETW request: %s", action)
+            self.etw.control(action)
+        self.etw.ensure(bool(self.games), now)
+        if self.etw_proc is not None and self.etw_proc.poll() is None:
+            return
+        self.etw_proc = None
+        due = [p for p in self.etw_pending if p[0] <= now]
+        if due and (not self.games or self.etw.s["analyze_during_game"]):
+            self.etw_pending.remove(due[0])
+            self.etw_proc = etwbox.spawn_analysis(due[0][1])
+            log.info("ETW capture %s: analysis started", due[0][1])
+
+    def save_crash(self, sid, exe, end):
+        try:
+            with self.lock:
+                start = self.con.execute("SELECT start_ts FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+                crash = crashinfo.build(self.con, exe, end, start, CRASH_LATE_S)
+            if crash:
+                self.merge_summary(sid, {"crash": crash})
+                log.info("session %s crash: %s %s", sid, crash.get("module"), crash.get("exception_code"))
+        except Exception:
+            log.exception("crash details for session %s", sid)
 
     def _crash_event(self, exe, end):
         """A crash/hang event for this exe around the exit means it did not exit cleanly."""
@@ -373,8 +520,9 @@ class Collector:
             if now - end < CRASH_LATE_S:
                 keep.append((sid, exe, end))
             elif self._crash_event(exe, end):
-                self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,))
-                log.info("session %s reclassified as crash (late WER event)", sid)
+                if self.exec("UPDATE sessions SET end_reason='crash' WHERE id=? AND end_reason='exit'", (sid,)).rowcount:
+                    log.info("session %s reclassified as crash (late WER event)", sid)
+                self.save_crash(sid, exe, end)   # now with the late WER 1001 / Report.wer
         self.pending_crash_checks = keep
 
     # ---------- event log ----------
@@ -383,19 +531,49 @@ class Collector:
             last = db.get_meta(self.con, "events_since")
         since = float(last) if last else time.time() - 14 * 86400
         newest = since
-        for logname in ("System", "Application"):
+        for logname in LOGS:
             for ev in self.events.read_since(logname, since):
                 newest = max(newest, ev["ts"])
-                cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message) "
-                                "VALUES (:ts,:log,:provider,:event_id,:level,:record_id,:message)", ev)
+                cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message, data) "
+                                "VALUES (:ts,:log,:provider,:event_id,:level,:record_id,:message,:data)", ev)
+                if cur.rowcount and logname == procwatch.DEFENDER_LOG_NAME:
+                    self.defender_event(ev)
                 if cur.rowcount:
                     c = classify(ev)
                     if c:
-                        self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
-                                                         "message": ev["message"][:1500]}, ts=ev["ts"])
+                        iid = self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
+                                                               "message": ev["message"][:1500]}, ts=ev["ts"])
+                        if c[0] == "bsod" and os.path.exists(crashinfo.CDB):
+                            threading.Thread(target=self._bsod_cause, args=(iid, ev["ts"]), daemon=True).start()
         with self.lock:
             db.set_meta(self.con, "events_since", newest)
             self.con.commit()
+
+    def defender_event(self, ev):
+        """Defender scan start (1000) opens a defender_scan incident, its 1001/1002 (same Scan ID) closes it."""
+        info = procwatch.defender_scan_info(ev)
+        if not info:
+            return
+        sid = procwatch.defender_scan(ev)[1]
+        if info["kind"] == "start":
+            kind = {"1": "szybki", "2": "pełny", "3": "niestandardowy"}.get(str(info["params_index"]), "")
+            self.incident("defender_scan", "info", f"Skan Windows Defender {kind}".strip(), {"scan_id": sid}, ts=ev["ts"])
+        else:
+            self.exec("UPDATE incidents SET end_ts=? WHERE kind='defender_scan' AND end_ts IS NULL AND details LIKE ?",
+                      (ev["ts"], f'%"{sid}"%'))
+
+    def _bsod_cause(self, iid, ts):
+        """Optional: `cdb !analyze -v` on the minidump of this BSOD (only when Debugging Tools are installed)."""
+        dump = crashinfo.minidump_near(ts)
+        if not dump:
+            return
+        with BSOD_LOCK:   # a backfill can find several BSODs at once
+            r = crashinfo.bsod_cause(dump)
+        if r:
+            with self.lock:
+                d = json.loads(self.con.execute("SELECT details FROM incidents WHERE id=?", (iid,)).fetchone()[0] or "{}")
+            d.update(r)
+            self.exec("UPDATE incidents SET details=? WHERE id=?", (json.dumps(d, ensure_ascii=False), iid))
 
     # ---------- housekeeping ----------
     def housekeeping(self, now):
@@ -405,8 +583,13 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
+            with self.lock:
+                etwbox.retention(self.con, self.etw.s, now)
+                # rows outlive their trace file (kept for the analysis) until the general retention
+                self.con.execute("DELETE FROM etw_captures WHERE ts < ? AND path IS NULL", (cutoff,))
+                self.con.commit()
             self.name_cache.clear()
 
     def _sysinfo(self):
@@ -416,9 +599,12 @@ class Collector:
         if prev:
             old = json.loads(prev[0])
             changed = {k: {"before": old.get(k), "after": v} for k, v in info.items()
-                       if k not in ("last_boot", "volumes", "background_tools", "pagefile") and old.get(k) != v}
+                       if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health", "disk_map")
+                       and old.get(k) != v}
             if changed:
                 self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)
+            for kind, sev, title, det in diskinfo.health_changes(old, info):
+                self.incident(kind, sev, title, det)
 
     # ---------- self reload ----------
     def check_reload(self, now):
@@ -435,6 +621,14 @@ class Collector:
                                       ensure_ascii=False, indent=1), encoding="utf-8")
             tmp.replace(DUMP_PATH)
             log.info("sensor dump written to %s", DUMP_PATH)
+        if DUMPS_FLAG.exists():
+            action = DUMPS_FLAG.read_text(encoding="utf-8").strip()
+            DUMPS_FLAG.unlink(missing_ok=True)
+            if action in ("enable", "disable"):
+                try:
+                    log.info("WER LocalDumps %s: %s", action, crashinfo.set_local_dumps(action == "enable"))
+                except OSError as e:
+                    log.error("WER LocalDumps %s failed: %s", action, e)
         requested = RELOAD_FLAG.exists()
         stamp = source_stamp()
         if stamp == self.src_stamp and not requested:
@@ -502,6 +696,8 @@ class Collector:
                     self.last_events = now
                     self.poll_events()
                     self.recheck_crashes(now)
+                self.process_marks()
+                self.etw_tick(now)
                 self.housekeeping(now)
                 self.check_reload(now)
                 self.finish_reload()
@@ -520,6 +716,9 @@ class Collector:
         for iid in self.open_incidents.values():
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
         self.open_incidents.clear()
+        self.hotkey.stop()
+        self.shader.stop()
+        self.etw.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

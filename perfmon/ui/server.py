@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import analyze, config, db
+from .. import analyze, config, db, diagreport
 
 STATIC = Path(__file__).parent / "static"
 
@@ -35,14 +35,18 @@ ROUTES = {
                                                   int(q["session"]) if q.get("session") else None,
                                                   int(q.get("points", 1500))),
     "sessions": lambda con, q: analyze.sessions(con, int(q.get("limit", 50))),
+    "diag_markers": lambda con, q: diagreport.diag_markers(con, _f(q, "from"), _f(q, "to", time.time())),
+    "game_proc": lambda con, q: diagreport.game_series(con, int(q["session"]), int(q.get("points", 1500))),
     "games": lambda con, q: analyze.game_list(con),
     "session": lambda con, q: analyze.session_report(con, int(q["id"])),
     "range": lambda con, q: analyze.range_report(con, _f(q, "from"), _f(q, "to", time.time())),
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts"), int(q.get("window", 30))),
     "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
     "health": lambda con, q: analyze.health_overview(con, int(q.get("days", 14))),
-    "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d")),
-    "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d")),
+    "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d"),
+                                              q.get("before") or None, q.get("after") or None),
+    "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d"),
+                                                       diag=q.get("diag") == "1"),
     "points": lambda con, q: analyze.session_points(con, q.get("exe") or None, _since(q, "180d")),
 }
 

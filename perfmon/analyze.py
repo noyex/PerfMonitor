@@ -12,6 +12,8 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
+from . import crashinfo, diagreport, marks
+
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
 # --------------------------------------------------------------------------
@@ -205,7 +207,8 @@ def sessions(con, limit=20):
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     ends = _eff_ends(con, rows)
-    return [_flatten_session(r, st.get(r["id"], 0), ends) for r in rows]
+    ext = diagreport.session_extras(con, rows)
+    return [{**_flatten_session(r, st.get(r["id"], 0), ends), **ext.get(r["id"], {})} for r in rows]
 
 
 def game_list(con):
@@ -214,7 +217,7 @@ def game_list(con):
                       "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
 
 
-def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
+def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=None):
     ts = st["ts"]
     causes = []
     lo, hi = bisect.bisect_left(samples_ts, ts - 2), bisect.bisect_right(samples_ts, ts + 2)
@@ -252,6 +255,8 @@ def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe):
             causes.append("dpc")
         if (mx("cpu_temp") or 0) > 90 or (mx("gpu_hotspot") or 0) > 100:
             causes.append("thermal")
+    if ext is not None:
+        causes = ext.refine(ts, win, causes)
     if not causes:
         causes.append("shader_or_unknown")
     return causes
@@ -292,7 +297,7 @@ def session_report(con, session_id):
 
     # --- stutters with causes
     st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
-    samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, "
+    samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, pagefile_pct, "
                          "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
                          "fg_exe FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (start - 3, end + 3))
     procs = _rows(con, "SELECT ts, name, cpu_pct FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? ORDER BY ts",
@@ -300,8 +305,9 @@ def session_report(con, session_id):
     s_ts, p_ts = [s["ts"] for s in samples], [p["ts"] for p in procs]
     cause_counts = Counter()
     bg_counts = Counter()
+    ext = diagreport.StutterExt(con, row, start, end)
     for s in st:
-        cs = _causes_for_stutter(s, s_ts, samples, p_ts, procs, exe)
+        cs = _causes_for_stutter(s, s_ts, samples, p_ts, procs, exe, ext)
         s["causes"] = cs
         for c in cs:
             cause_counts[c] += 1
@@ -339,6 +345,8 @@ def session_report(con, session_id):
                                "ORDER BY ts LIMIT 60", (start, end + 60))
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
+    rep["marks"] = marks.report(con, start, end + 5, exe)
+    diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
     return rep
 
@@ -355,8 +363,7 @@ def _session_findings(rep, row):
     n_st = st.get("count", 0)
 
     if row["end_reason"] == "crash":
-        add("critical", f"{exe} zakończył się crashem",
-            "Sesja zakończyła się awarią gry - sprawdź zdarzenia 1000/1001 (Application Error / WER) w sekcji events.")
+        add("critical", *crashinfo.finding(rep.get("crash"), exe))
     if row["end_reason"] == "unknown":
         add("serious", "Sesja zakończona w nieznany sposób",
             "Kolektor nie zapisał końca sesji - możliwy twardy reset/zawieszenie komputera podczas gry.")
@@ -442,6 +449,7 @@ def _session_findings(rep, row):
     for inc in rep.get("incidents") or []:
         if inc["kind"] in ("gpu_driver", "whea", "bsod"):
             add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
+    f += diagreport.findings(rep, row)
     if not f:
         add("info", "Brak wykrytych problemów", "Sesja wygląda zdrowo.")
     order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
@@ -520,6 +528,7 @@ def range_report(con, t0, t1):
     for e in ev:
         e["time"] = fmt_ts(e["ts"])
     rep["events"] = ev
+    rep["marks"] = marks.report(con, t0, t1)
     rep["top_procs"] = {
         "cpu": _rows(con, "SELECT name, ROUND(AVG(cpu_pct),2) AS avg_cpu_pct, ROUND(MAX(cpu_pct),1) AS max_cpu_pct, "
                           "COUNT(*) AS appearances FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? "
@@ -676,6 +685,7 @@ def health_overview(con, days=14):
     for c in crashes:
         c["first"], c["last"] = fmt_ts(c.pop("first_ts")), fmt_ts(c.pop("last_ts"))
         c["app"] = c["title"].split(":", 1)[-1].strip()
+    crashinfo.annotate_recurring(con, crashes, t0)
     cfg = incidents_between(con, t0, time.time(), kinds="config_change")
     for c in cfg:
         d = c.get("details")
@@ -689,6 +699,7 @@ def health_overview(con, days=14):
         "freezes": _freezes(con, freezes),
         "sample_coverage": {"first": fmt_ts(cov["first"]), "last": fmt_ts(cov["last"]), "samples": cov["n"]} if cov and cov["n"] else None,
     }
+    rep["diag_incidents"] = diagreport.health_incidents(con, t0)
     rep["findings"] = diagnose(rep, con, t0)
     return rep
 
@@ -730,6 +741,7 @@ def diagnose(rep, con=None, t0=None):
             add("warning", f"{c['app']} {('crashuje' if c['kind'] == 'app_crash' else 'wiesza się')} {c['n']}x",
                 f"Od {c['first']} do {c['last']}. " + (
                     "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
+                    else f"Moduł {c['module']}, kod {c['code']}: {c['verdict']}." if c.get("verdict")
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
     for k, name, desc in (
             ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
@@ -749,6 +761,8 @@ def diagnose(rep, con=None, t0=None):
             add("info", "Zmiana konfiguracji tuż przed pierwszym resetem",
                 "; ".join(f"{c['time']}: {', '.join(c.get('changed') or [])}" for c in near[:3]) +
                 ". Porównaj z `pm sysinfo --diff` (sterowniki/BIOS/ustawienia).")
+    if con is not None:
+        f += diagreport.health_findings(con, rep)
     if not f:
         f.append({"severity": "info", "title": "Brak istotnych incydentów", "detail": f"W ostatnich {rep['days']} dniach nic niepokojącego."})
     order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
@@ -780,6 +794,7 @@ def _session_metrics(con, exe=None, since=None):
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     out = []
     ends = _eff_ends(con, rows)
+    ext = diagreport.session_extras(con, rows)
     for r in rows:
         f = _flatten_session(r, ends=ends)
         end = ends[r["id"]] or time.time()
@@ -796,8 +811,9 @@ def _session_metrics(con, exe=None, since=None):
             "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            "_g": x["g"] if x else 0, "_c": x["c"] if x else 0, "_l": x["l"] if x else 0, "_n": x["n"] if x else 0,
-            "_secs": x["secs"] if x else 0,
+            "_g": (x["g"] or 0) if x else 0, "_c": (x["c"] or 0) if x else 0, "_l": (x["l"] or 0) if x else 0,
+            "_n": x["n"] if x else 0,
+            "_secs": x["secs"] if x else 0, **ext.get(r["id"], {}),
         })
     return out
 
@@ -809,16 +825,46 @@ def session_points(con, exe=None, since=None):
             for s in _session_metrics(con, exe, since)]
 
 
-def compare(con, exe=None, group_by="week", since=None):
-    """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe."""
-    if group_by not in ("week", "day", "month", "driver", "game_version", "session"):
-        raise ValueError("group_by must be week|day|month|driver|game_version|session")
+SMALL_SAMPLE_MIN, SMALL_SAMPLE_SESSIONS = 30, 3   # before/after groups below this: weak evidence
+
+
+def resolve_point(con, s, exe=None):
+    """Split point for before/after: a time (parse_time) or a change marker number 'm3' / '#3' (pm markers)."""
+    m = re.fullmatch(r"\s*(?:#|m|marker:?)(\d+)\s*", str(s), re.I)
+    if not m:
+        return parse_time(s)
+    n = int(m.group(1))
+    for mk in timeline_markers(con, exe):
+        if mk.get("n") == n:
+            return mk["ts"]
+    raise ValueError(f"Brak markera {n} (lista: pm markers{' --exe ' + exe if exe else ''})")
+
+
+def compare(con, exe=None, group_by="week", since=None, before=None, after=None):
+    """Aggregate sessions per period/driver/game version; delta % is vs the previous group of the same exe.
+
+    before/after (time or marker 'm3'): two groups, sessions started before `before` and at/after `after`
+    (default: the same point); sessions in between are left out."""
+    if group_by not in ("week", "day", "month", "driver", "game_version", "session", "present_mode"):
+        raise ValueError("group_by must be week|day|month|driver|game_version|session|present_mode")
+    split = None
+    before = before if before is not None else after
+    if before is not None:
+        b = resolve_point(con, before, exe)
+        split = (b, resolve_point(con, after, exe) if after is not None else b)
     groups = {}
-    for s in _session_metrics(con, exe, since):
-        d = datetime.fromtimestamp(s["start_ts"])
-        key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
-               "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
-               "session": f"#{s['id']}"}[group_by]
+    metrics = _session_metrics(con, exe, None if split else since)
+    diagreport.fill_bottleneck(con, metrics)
+    for s in metrics:
+        if split:
+            key = "przed" if s["start_ts"] < split[0] else "po" if s["start_ts"] >= split[1] else None
+            if key is None:
+                continue
+        else:
+            d = datetime.fromtimestamp(s["start_ts"])
+            key = {"week": d.strftime("%G-W%V"), "day": d.strftime("%Y-%m-%d"), "month": d.strftime("%Y-%m"),
+                   "driver": s["gpu_driver"] or "?", "game_version": s["game_version"] or "?",
+                   "session": f"#{s['id']}", "present_mode": s.get("present") or "?"}[group_by]
         groups.setdefault((s["exe"], key), []).append(s)
     rows = []
     for (e, key), ss in groups.items():
@@ -837,6 +883,7 @@ def compare(con, exe=None, group_by="week", since=None):
             "gpu_bound_pct": _r(100 * sum(s["_g"] for s in ss) / nb) if nb else None,
             "cpu_bound_pct": _r(100 * sum(s["_c"] for s in ss) / nb) if nb else None,
             "limit_pct": _r(100 * sum(s["_l"] for s in ss) / nb) if nb else None,
+            "bottleneck": _shares([(s.get("bottleneck"), s["minutes"] or 0) for s in ss]),
             "drivers": sorted({s["gpu_driver"] for s in ss if s["gpu_driver"]}),
             "game_versions": sorted({s["game_version"] for s in ss if s["game_version"]}),
             "session_ids": [s["id"] for s in ss],
@@ -845,16 +892,35 @@ def compare(con, exe=None, group_by="week", since=None):
     prev = {}
     for r in rows:
         p = prev.get(r["exe"])
-        for k in ("fps_avg", "fps_1low"):
-            r[f"{k}_delta_pct"] = _r(100 * (r[k] - p[k]) / p[k]) if p and p.get(k) and r.get(k) else None
+        for k in ("fps_avg", "fps_1low", "stutters_per_min"):
+            r[f"{k}_delta_pct"] = _r(100 * (r[k] - p[k]) / p[k]) if p and p.get(k) and r.get(k) is not None else None
         prev[r["exe"]] = r
         r["from_time"], r["to_time"] = fmt_ts(r["from"]), fmt_ts(r["to"])
+    if split:
+        small = {r["exe"] for r in rows if (r["minutes"] or 0) < SMALL_SAMPLE_MIN or r["sessions"] < SMALL_SAMPLE_SESSIONS}
+        small |= {e for e in {r["exe"] for r in rows} if sum(1 for r in rows if r["exe"] == e) < 2}
+        for r in rows:
+            r["small_sample"] = r["exe"] in small
     return rows
 
 
-def timeline_markers(con, exe=None, since=None):
-    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions."""
-    t0 = parse_time(since) if since is not None else 0
+def _shares(items):
+    """[(key, weight)] -> {key: % of the total weight}, keys without a value left out."""
+    tot = sum(w for k, w in items if k)
+    acc = Counter()
+    for k, w in items:
+        if k:
+            acc[k] += w
+    return {k: _r(100 * w / tot) for k, w in acc.most_common()} if tot else {}
+
+
+def timeline_markers(con, exe=None, since=None, diag=False):
+    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions, numbered `n`
+    over the whole history (stable whatever `since` is; `pm compare --before m<n>`).
+
+    diag: also user marks and Defender scans (chart markers, not numbered)."""
+    since_ts = parse_time(since) if since is not None else 0
+    t0 = 0
     ss = _session_metrics(con, None, None)   # full history so the first in-range change is detected
     markers = []
 
@@ -897,9 +963,15 @@ def timeline_markers(con, exe=None, since=None):
         for i, (bp, bs, ba, bb, bts) in enumerate(builds):
             if i not in used and bts >= t0:
                 markers.append({"ts": bts, "kind": "game_update", "label": f"{e}: Steam build {ba} -> {bb}", "session": bs["id"]})
-    for i in incidents_between(con, t0, time.time(), kinds="config_change"):
+    for i in incidents_between(con, t0, time.time(), kinds="config_change", limit=100000):
         markers.append({"ts": i["ts"], "kind": "config", "label": i["title"], "session": None})
     markers.sort(key=lambda m: m["ts"])
+    for n, m in enumerate(markers, 1):
+        m["n"] = n
+    markers = [m for m in markers if m["ts"] >= since_ts]
+    if diag:
+        markers += diagreport.diag_markers(con, since_ts, time.time())
+        markers.sort(key=lambda m: m["ts"])
     for m in markers:
         m["time"] = fmt_ts(m["ts"])
     return markers

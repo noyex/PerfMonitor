@@ -156,6 +156,7 @@ class PdhCounters:
         "hard_faults_s": r"\Memory\Pages Input/sec",
         "commit_bytes": r"\Memory\Committed Bytes",
         "commit_limit": r"\Memory\Commit Limit",
+        "pagefile_pct": r"\Paging File(_Total)\% Usage",
     }
     MULTI = {
         "lat": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",

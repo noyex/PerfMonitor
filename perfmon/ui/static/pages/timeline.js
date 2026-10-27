@@ -53,14 +53,15 @@ Pages.timeline = (() => {
       rangeLabel.textContent = `${fmtTime(t0)} – ${fmtTime(t1)}`;
       history.replaceState(null, "", `#/timeline?from=${Math.round(t0)}&to=${Math.round(t1)}`);
       const long = t1 - t0 > 86400;
-      const [s, f, inc] = await Promise.all([
+      const [s, f, inc, diag] = await Promise.all([
         api("series", { from: t0, to: t1, cols: KEYS.join(","), points: 1200 }),
         api("frames", { from: t0, to: t1, points: 1200 }),
         api("incidents", { since: t0 }),
+        diagMarkers(t0, t1),
       ]);
       s.vram_pct = (s.gpu_vram_mb || []).map((v, i) => (v != null && s.gpu_vram_total_mb[i] ? (100 * v) / s.gpu_vram_total_mb[i] : null));
       incidents = (inc.items || inc).filter((i) => i.ts <= t1 && i.kind !== "config_change");
-      const markers = () => incidents.filter((i) => i.severity === "critical" || i.severity === "serious");
+      const markers = () => [...incidents.filter((i) => i.severity === "critical" || i.severity === "serious"), ...diag.lines];
 
       charts.forEach((c) => c.destroy());
       charts = [];
@@ -73,6 +74,7 @@ Pages.timeline = (() => {
       } else {
         for (const d of DEFS) charts.push(chart(wrap, { ...d, height: 130, markers, onSelect: zoom, longRange: long, xRange }, cols(s, d.keys)));
       }
+      if (diag.legend && charts.length) charts[0].el.append(diag.legend);
 
       list.innerHTML = "";
       listHead.style.display = incidents.length ? "" : "none";
