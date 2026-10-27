@@ -48,6 +48,8 @@ Pages.now = (() => {
         tile("VRAM", fmt((x.gpu_vram_mb || 0) / 1024, 1), "GB", vramPct != null ? `${fmt(vramPct)}% z ${fmt(x.gpu_vram_total_mb / 1024)} GB` : ""),
         tile("Dysk", fmt(x.disk_lat_ms, 1), "ms", `${fmt((x.disk_read_mbs || 0) + (x.disk_write_mbs || 0), 1)} MB/s`)
       );
+      const nt = l.net;
+      if (nt) tiles.append(tile("Ping", fmt(nt.inet_ms), "ms", nt.inet_loss > 0 ? `utrata pakietów ${fmt(nt.inet_loss * 100)}%` : ""));
 
       // Charts are created once, then only fed new data
       if (!charts.length) {
