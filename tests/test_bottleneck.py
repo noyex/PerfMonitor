@@ -123,5 +123,11 @@ class BeforeAfterTest(unittest.TestCase):
         self.assertEqual(an.timeline_markers(self.con, "game.exe", since=self.split + 10 * 86400), [])
 
 
+class AfterOnlyTest(BeforeAfterTest):
+    def test_after_alone_splits(self):
+        rows = an.compare(self.con, "game.exe", after=self.split)
+        self.assertEqual([r["group"] for r in rows], ["przed", "po"])
+
+
 if __name__ == "__main__":
     unittest.main()

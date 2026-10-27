@@ -324,3 +324,15 @@ class FindingsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixesTest(unittest.TestCase):
+    def test_start_before_session_and_stale_open_scan(self):
+        con = make_db()
+        ev(con, T0 - 10, "TiWorker.exe")                                          # 10 s before the session
+        con.execute("INSERT INTO incidents(ts,end_ts,kind,severity,title) VALUES (?,?,?,?,?)",
+                    (T0 - pw.SCAN_MAX_S - 100, None, "defender_scan", "info", "never closed"))
+        sc = pw.StartCauses(con, T0, T1, "Game.exe", pw.DEFAULT_CULPRITS)
+        self.assertEqual(sc.causes(T0 + 3), ["background_start:TiWorker.exe"])
+        self.assertEqual(sc.causes(T0 + 600), [])                                 # stale open scan ignored
+        self.assertEqual(pw.session_proc_events(con, T0, T1, "Game.exe")["defender_scans"], [])

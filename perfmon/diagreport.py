@@ -156,12 +156,18 @@ def extend(con, rep, row, start, end):
     rep["bottleneck"] = bottleneck.compute(con, row["id"], start, end, (rep.get("hardware") or {}).get("vram_total_mb"))
 
 
+_BOTTLENECK_CACHE = {}   # (db path, session id, end ts) -> kind; finished sessions do not change
+
+
 def fill_bottleneck(con, metrics):
     """Bottleneck kind of finished sessions recorded before summary.bottleneck existed (comparisons)."""
     for s in metrics:
         if s.get("bottleneck") is None and s.get("end_ts"):
-            b = bottleneck.compute(con, s["id"], s["start_ts"], s["end_ts"])
-            s["bottleneck"] = b["kind"] if b else None
+            key = (str(config.DB_PATH), s["id"], s["end_ts"])
+            if key not in _BOTTLENECK_CACHE:
+                b = bottleneck.compute(con, s["id"], s["start_ts"], s["end_ts"])
+                _BOTTLENECK_CACHE[key] = b["kind"] if b else None
+            s["bottleneck"] = _BOTTLENECK_CACHE[key]
 
 
 def session_extras(con, rows):

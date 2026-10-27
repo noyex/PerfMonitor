@@ -22,6 +22,7 @@ SESSION_IGNORE = {"conhost.exe", "dllhost.exe", "wmiprvse.exe"}  # noise even du
 BURST_MAX = 150        # more start+stop events in one diff = snapshot glitch / resume from sleep, not real activity
 CAUSE_BEFORE_S = 15    # a start this long before the stutter (or...
 CAUSE_AFTER_S = 2      # ...this long after it, timestamps are coarse) can explain it
+SCAN_MAX_S = 4 * 3600  # a Defender scan without its end event (reboot, lost event) counts as over after this
 HEAVY_WINDOW_S = 60    # a started process counts as heavy if it loads CPU/GPU within this time after start
 HEAVY_PCT = 10
 MAX_STARTS = 30
@@ -177,7 +178,7 @@ class StartCauses:
         # (ts, name, strength): culprit starts and starts of processes that got heavy within HEAVY_WINDOW_S
         self.starts = []
         for r in _rows(con, "SELECT ts, name, parent_name FROM proc_events WHERE action='start' AND ts BETWEEN ? AND ? "
-                            "ORDER BY ts", (start - CAUSE_AFTER_S - 1, end + CAUSE_BEFORE_S)):
+                            "ORDER BY ts", (start - CAUSE_BEFORE_S - 1, end + CAUSE_AFTER_S + 1)):
             n = (r["name"] or "").lower()
             if not n or n in skip or (self.exe and (r["parent_name"] or "").lower() == self.exe):
                 continue  # the game itself / its own helpers are not "background"
@@ -185,15 +186,14 @@ class StartCauses:
             if n in self.culprits or pct:
                 self.starts.append((r["ts"], r["name"], pct or 0))
         self.starts_ts = [s[0] for s in self.starts]
-        self.scans = [(r["ts"], r["end_ts"]) for r in _rows(
-            con, "SELECT ts, end_ts FROM incidents WHERE kind='defender_scan' AND ts<=? AND (end_ts IS NULL OR end_ts>=?)",
-            (end + CAUSE_AFTER_S, start - CAUSE_AFTER_S))]
+        self.scans = [(r["ts"], r["end_ts"] if r["end_ts"] is not None else r["ts"] + SCAN_MAX_S)
+                      for r in scans_between(con, start - CAUSE_AFTER_S, end + CAUSE_AFTER_S)]
 
     def _heavy(self, con, start, end):
         h = {}
         for r in _rows(con, "SELECT ts, name, kind, cpu_pct, gpu_pct FROM procs WHERE ((kind='cpu' AND cpu_pct>?) OR "
                             "(kind='gpu' AND gpu_pct>?)) AND ts BETWEEN ? AND ? ORDER BY ts",
-                       (HEAVY_PCT, HEAVY_PCT, start - 1, end + CAUSE_BEFORE_S + HEAVY_WINDOW_S)):
+                       (HEAVY_PCT, HEAVY_PCT, start - CAUSE_BEFORE_S - 1, end + CAUSE_AFTER_S + HEAVY_WINDOW_S)):
             h.setdefault((r["name"] or "").lower(), []).append(
                 (r["ts"], r["cpu_pct"] if r["kind"] == "cpu" else r["gpu_pct"]))
         return h
@@ -214,9 +214,15 @@ class StartCauses:
                 out[key] = (pct, name)
         tags = [f"background_start:{n}" for _, n in sorted(out.values(), key=lambda x: (-x[0], x[1].lower()))]
         tags = tags[:MAX_START_TAGS]
-        if any(a - CAUSE_AFTER_S <= ts <= (b if b is not None else self.end) + CAUSE_AFTER_S for a, b in self.scans):
+        if any(a - CAUSE_AFTER_S <= ts <= b + CAUSE_AFTER_S for a, b in self.scans):
             tags.append("background_scan:defender")
         return tags
+
+
+def scans_between(con, t0, t1):
+    """defender_scan incidents overlapping [t0, t1]; one without an end lasts at most SCAN_MAX_S."""
+    return _rows(con, "SELECT ts, end_ts FROM incidents WHERE kind='defender_scan' AND ts<=? AND "
+                      "(end_ts>=? OR (end_ts IS NULL AND ts>=?)) ORDER BY ts", (t1, t0, t0 - SCAN_MAX_S))
 
 
 def session_proc_events(con, start, end, game_exe, culprits=None):
@@ -245,8 +251,7 @@ def session_proc_events(con, start, end, game_exe, culprits=None):
             g["heavy_pct"] = an._r(pct)
     scans = [{"start_time": an.fmt_ts(r["ts"]), "end_time": an.fmt_ts(r["end_ts"]) or None,
               "duration_s": round(r["end_ts"] - r["ts"]) if r["end_ts"] else None}
-             for r in _rows(con, "SELECT ts, end_ts FROM incidents WHERE kind='defender_scan' AND ts<=? AND "
-                                 "(end_ts IS NULL OR end_ts>=?) ORDER BY ts", (end, start))]
+             for r in scans_between(con, start, end)]
     return {"starts": starts, "culprits": list(groups.values()), "defender_scans": scans}
 
 

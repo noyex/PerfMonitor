@@ -37,6 +37,8 @@ INSERT_SAMPLE = f"INSERT OR REPLACE INTO samples ({','.join(SAMPLE_COLS)}) VALUE
 FREEZE_MS = 2000      # shell/DWM unresponsive this long = freeze incident
 TEMP_LIMITS = {"cpu_temp": 95, "gpu_hotspot": 105, "gpu_mem_temp": 100}
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
+BSOD_LOCK = threading.Lock()
+BOTTLENECK_EVERY_S = 300   # summary.bottleneck refresh while a game runs (and once at its end)
 
 SRC_DIR = Path(__file__).resolve().parent
 RELOAD_FLAG = config.DATA_DIR / "reload.request"   # touched by `pm collector reload`
@@ -277,7 +279,8 @@ class Collector:
                 i = pr.info
                 if i["pid"] == 0:
                     continue  # "System Idle Process": idle time, not load
-                snap[i["pid"]] = (i["create_time"], i["name"], i["ppid"])
+                if i["create_time"] is not None:   # psutil gives None when it cannot read it
+                    snap[i["pid"]] = (i["create_time"], i["name"], i["ppid"])
                 ct = i["cpu_times"]
                 cpu_s = ct.user + ct.system
                 try:
@@ -409,16 +412,19 @@ class Collector:
                   (s["ts"], s["session"], s["ft_ms"], s["median_ms"]))
         self.etw.on_stutter(s["ts"], s["session"])
 
-    def save_summary(self, g):
+    def save_summary(self, g, final=False):
         summ = g["capture"].summary() if g["capture"] else {"error": "PresentMon niedostępny"}
-        try:
-            with self.lock:
-                b = bottleneck.compute(self.con, g["session"], g["start"], time.time())
-            if b:
-                summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
-                summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
-        except Exception:
-            log.exception("bottleneck for session %s", g["session"])
+        now = time.time()
+        if final or now - g.get("last_bottleneck", 0) >= BOTTLENECK_EVERY_S:
+            g["last_bottleneck"] = now
+            try:
+                with self.lock:   # ~30 ms for a 3 h session
+                    b = bottleneck.compute(self.con, g["session"], g["start"], now)
+                if b:
+                    summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
+                    summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
+            except Exception:
+                log.exception("bottleneck for session %s", g["session"])
         self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)
 
     def end_game(self, pid, reason):
@@ -435,7 +441,7 @@ class Collector:
                 reason = "crash"
             # WER writes 1000/1002 (and the report) seconds after the process dies and we poll the log every 30 s
             self.pending_crash_checks.append((g["session"], g["exe"], end))
-        self.save_summary(g)
+        self.save_summary(g, final=True)
         self.save_mem_growth(g["session"], g["exe"], end)
         self.exec("UPDATE sessions SET end_ts=?, end_reason=? WHERE id=?", (end, reason, g["session"]))
         if reason == "crash":
@@ -538,7 +544,7 @@ class Collector:
                         iid = self.incident(c[0], c[1], c[2], {"event_id": ev["event_id"], "provider": ev["provider"],
                                                                "message": ev["message"][:1500]}, ts=ev["ts"])
                         if c[0] == "bsod" and os.path.exists(crashinfo.CDB):
-                            threading.Thread(target=self._bsod_cause, args=(iid,), daemon=True).start()
+                            threading.Thread(target=self._bsod_cause, args=(iid, ev["ts"]), daemon=True).start()
         with self.lock:
             db.set_meta(self.con, "events_since", newest)
             self.con.commit()
@@ -548,7 +554,7 @@ class Collector:
         info = procwatch.defender_scan_info(ev)
         if not info:
             return
-        sid = info["id"] or f"type{info['type_index']}"
+        sid = procwatch.defender_scan(ev)[1]
         if info["kind"] == "start":
             kind = {"1": "szybki", "2": "pełny", "3": "niestandardowy"}.get(str(info["params_index"]), "")
             self.incident("defender_scan", "info", f"Skan Windows Defender {kind}".strip(), {"scan_id": sid}, ts=ev["ts"])
@@ -556,9 +562,13 @@ class Collector:
             self.exec("UPDATE incidents SET end_ts=? WHERE kind='defender_scan' AND end_ts IS NULL AND details LIKE ?",
                       (ev["ts"], f'%"{sid}"%'))
 
-    def _bsod_cause(self, iid):
-        """Optional: `cdb !analyze -v` on the newest minidump (only when Debugging Tools are installed)."""
-        r = crashinfo.bsod_cause()
+    def _bsod_cause(self, iid, ts):
+        """Optional: `cdb !analyze -v` on the minidump of this BSOD (only when Debugging Tools are installed)."""
+        dump = crashinfo.minidump_near(ts)
+        if not dump:
+            return
+        with BSOD_LOCK:   # a backfill can find several BSODs at once
+            r = crashinfo.bsod_cause(dump)
         if r:
             with self.lock:
                 d = json.loads(self.con.execute("SELECT details FROM incidents WHERE id=?", (iid,)).fetchone()[0] or "{}")
@@ -573,11 +583,13 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "etw_captures"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             with self.lock:
-                if etwbox.retention(self.con, self.etw.s, now):
-                    self.con.commit()
+                etwbox.retention(self.con, self.etw.s, now)
+                # rows outlive their trace file (kept for the analysis) until the general retention
+                self.con.execute("DELETE FROM etw_captures WHERE ts < ? AND path IS NULL", (cutoff,))
+                self.con.commit()
             self.name_cache.clear()
 
     def _sysinfo(self):
@@ -587,7 +599,7 @@ class Collector:
         if prev:
             old = json.loads(prev[0])
             changed = {k: {"before": old.get(k), "after": v} for k, v in info.items()
-                       if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health")
+                       if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health", "disk_map")
                        and old.get(k) != v}
             if changed:
                 self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)

@@ -848,6 +848,7 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
     if group_by not in ("week", "day", "month", "driver", "game_version", "session", "present_mode"):
         raise ValueError("group_by must be week|day|month|driver|game_version|session|present_mode")
     split = None
+    before = before if before is not None else after
     if before is not None:
         b = resolve_point(con, before, exe)
         split = (b, resolve_point(con, after, exe) if after is not None else b)

@@ -351,6 +351,19 @@ def annotate_recurring(con, crashes, t0):
 
 
 # ---------- BSOD (optional, only if Debugging Tools are installed) ----------
+def minidump_near(ts, window_s=3600):
+    """Minidump written closest to a BSOD event at ts (the dump and BugCheck 1001 are both written at the next boot)."""
+    best = None
+    for p in glob.glob(os.path.join(MINIDUMP, "*.dmp")):
+        try:
+            d = abs(os.path.getmtime(p) - ts)
+        except OSError:
+            continue
+        if d <= window_s and (best is None or d < best[0]):
+            best = (d, p)
+    return best[1] if best else None
+
+
 def bsod_cause(dump=None, timeout=180):
     """'Probably caused by' from `cdb !analyze -v` on the newest minidump; None when cdb or a dump is missing."""
     if not os.path.exists(CDB):
