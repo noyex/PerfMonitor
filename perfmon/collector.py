@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, procwatch, shadercache, sysinfo
+from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, memleak, procwatch, shadercache, sysinfo
 from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -418,6 +418,7 @@ class Collector:
             # WER writes 1000/1002 (and the report) seconds after the process dies and we poll the log every 30 s
             self.pending_crash_checks.append((g["session"], g["exe"], end))
         self.save_summary(g)
+        self.save_mem_growth(g["session"], g["exe"], end)
         self.exec("UPDATE sessions SET end_ts=?, end_reason=? WHERE id=?", (end, reason, g["session"]))
         if reason == "crash":
             self.save_crash(g["session"], g["exe"], end)
@@ -433,6 +434,19 @@ class Collector:
             summ.update(extra)
             self.con.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ, ensure_ascii=False), sid))
             self.con.commit()
+
+    def save_mem_growth(self, sid, exe, end):
+        try:
+            with self.lock:
+                start = self.con.execute("SELECT start_ts FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+                m = memleak.assess(self.con, sid, start, end)
+            if not m:
+                return
+            self.merge_summary(sid, {"mem_growth_mb_h": m["mem_growth_mb_h"], "mem_growth_r2": m["mem_growth_r2"]})
+            if m["leak"]:
+                self.incident("game_mem_leak", "warning", memleak.title(exe, m), dict(m, session=sid), ts=end)
+        except Exception:
+            log.exception("memory growth for session %s", sid)
 
     def save_crash(self, sid, exe, end):
         try:

@@ -207,7 +207,7 @@ def sessions(con, limit=20):
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     ends = _eff_ends(con, rows)
-    ext = diagreport.session_extras(con, ids)
+    ext = diagreport.session_extras(con, rows)
     return [{**_flatten_session(r, st.get(r["id"], 0), ends), **ext.get(r["id"], {})} for r in rows]
 
 
@@ -793,7 +793,7 @@ def _session_metrics(con, exe=None, since=None):
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     out = []
     ends = _eff_ends(con, rows)
-    ext = diagreport.session_extras(con, ids)
+    ext = diagreport.session_extras(con, rows)
     for r in rows:
         f = _flatten_session(r, ends=ends)
         end = ends[r["id"]] or time.time()

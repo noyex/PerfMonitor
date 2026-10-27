@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import config, crashinfo, diskinfo, present, procwatch
+from . import config, crashinfo, diskinfo, memleak, present, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -148,12 +148,17 @@ def extend(con, rep, row, start, end):
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
     rep["present"] = present.session_present(con, row, summ)
     rep["shader"] = shader_summary(con, row)
+    rep["mem_growth"] = memleak.assess(con, row["id"], start, end)
 
 
-def session_extras(con, ids):
-    """{session id: {...}} extra per-session columns for session lists and comparisons."""
-    pres = present.labels(con, ids)
-    return {sid: {"present": pres.get(sid)} for sid in ids}
+def session_extras(con, rows):
+    """{session id: {...}} extra per-session columns for session lists and comparisons (rows: sessions rows)."""
+    pres = present.labels(con, [r["id"] for r in rows])
+    out = {}
+    for r in rows:
+        summ = an._json(r.get("summary")) or {}
+        out[r["id"]] = {"present": pres.get(r["id"]), "mem_growth": summ.get("mem_growth_mb_h")}
+    return out
 
 
 # ---------- findings ----------
@@ -183,6 +188,7 @@ def findings(rep, row):
             f"Cache shaderów urósł o {sh.get('cache_growth_mb')} MB w trakcie sesji. Gra kompiluje shadery w locie: "
             "użyj prekompilacji w menu gry, nie czyść cache (Adrenalin -> Reset Shader Cache, Oczyszczanie dysku -> "
             "DirectX Shader Cache); jeśli dzieje się to w każdej sesji, cache jest kasowany.")
+    f += memleak.finding(row["exe"], rep.get("mem_growth"))
     f += diskinfo.findings(rep)
     f += present.findings(rep)
     f += procwatch.findings(rep)

@@ -131,7 +131,7 @@ def cmd_sessions(con, a):
         r["start"], r["end"] = an.fmt_ts(r["start_ts"]), an.fmt_ts(r["end_ts"])
         r["min"] = round((r["duration_s"] or 0) / 60, 1)
     table(rows, ["id", "exe", "start", "min", "end_reason", "fps_avg", "fps_1low", "fps_01low", "stutters",
-                 "present", "gpu_driver", "game_version"])
+                 "present", "mem_growth", "gpu_driver", "game_version"])
 
 
 def cmd_session(con, a):
@@ -172,6 +172,10 @@ def cmd_session(con, a):
     kv(r["hardware"], "Sprzęt (szczyty/średnie)")
     gp = r.get("game_proc")
     if gp:
+        mg = r.get("mem_growth") or {}
+        if mg:
+            out(f"Pamięć gry: {mg['private_start_mb']} -> {mg['private_end_mb']} MB, trend {mg['mem_growth_mb_h']} MB/h "
+                f"(R² {mg['mem_growth_r2']}){' - możliwy wyciek' if mg['leak'] else ''}")
         out(f"VRAM gry: dedicated max {cell(gp['vram_dedicated_max_mb'])} MB, shared max {cell(gp['vram_shared_max_mb'])} MB; "
             f"najbardziej obciążony wątek p95 {cell(gp['thread_max_p95'])}%, pamięć prywatna max {cell(gp['private_max_mb'])} MB")
     d = r.get("disk") or {}
