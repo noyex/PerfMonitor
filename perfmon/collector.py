@@ -16,7 +16,7 @@ import psutil
 
 from . import config, db, gamectx, sysinfo
 from .events import LOGS, EventReader, classify
-from .netmon import NetMonitor
+from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
 from .watchdog import Watchdog, foreground, user_idle_s
@@ -145,6 +145,10 @@ class Collector:
                 "UPDATE sessions SET end_reason='unknown', end_ts=MAX(start_ts, "
                 "COALESCE((SELECT MAX(ts) FROM frames WHERE session=sessions.id), 0), "
                 "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL")
+            # Ongoing network incidents left open the same way end where network data stopped
+            self.con.execute(
+                f"UPDATE incidents SET end_ts=MAX(ts, COALESCE((SELECT MAX(ts) FROM net_samples), ts)) "
+                f"WHERE end_ts IS NULL AND kind IN ({','.join('?' * len(NET_INCIDENTS))})", NET_INCIDENTS)
             self.con.commit()
         log.info("collector start, admin=%s", is_admin())
 

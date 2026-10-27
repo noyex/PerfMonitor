@@ -255,6 +255,7 @@ def _loss(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 
+INCIDENT_KINDS = ("net_down", "net_link_down", "packet_loss", "latency_spike", "game_lag", "wifi_weak")
 WHERE_PL = {"home": "Wi-Fi / router / domowe łącze", "isp": "operator", "internet": "internet za operatorem",
             "game": "serwer gry"}
 
@@ -276,6 +277,7 @@ class NetMonitor:
         self._game_ip = None
         self._game_probe = {"ip": None, "ok": 0, "tries": 0, "last_lookup": 0.0}
         self.gw = self.isp = None
+        self.connected = False
         self.adapter = self.link_type = None
         self.link_speed = None
         self.wifi_info = None
@@ -300,7 +302,7 @@ class NetMonitor:
     def stop(self):
         self.running = False
         if self.thread:
-            self.thread.join(timeout=5)
+            self.thread.join(timeout=15)   # a tick with the network down can take several 1 s timeouts
         now = time.time()
         for iid in self.open.values():
             self.close_incident(iid, now)
@@ -315,25 +317,27 @@ class NetMonitor:
         self.loss["game"].clear()
 
     def _loop(self):
-        nxt = time.time()
+        nxt = last = time.time()
         while self.running:
             now = time.time()
+            if now - last > 10:   # resumed from sleep / long stall: network is reconnecting, don't alarm
+                self.grace_until = now + 20
+                self.down_streak = 0
+            last = now
             try:
                 self.tick(now)
             except Exception:
                 log.exception("netmon tick")
             nxt += 1.0
             delay = nxt - time.time()
-            if delay < -5:   # resumed from sleep / long stall: network is reconnecting, don't alarm
+            if delay < 0:   # ticks with timeouts run long: re-anchor instead of spinning to catch up
                 nxt = time.time()
-                self.grace_until = nxt + 20
-                self.down_streak = 0
-                continue
             time.sleep(max(0.0, delay))
 
     # ---------- slow refreshes ----------
     def _refresh_route(self, now):
         gw, ifidx = best_route(self.inet_targets[0])
+        self.connected = ifidx is not None
         if gw != self.gw:
             log.info("gateway %s -> %s", self.gw, gw)
             self.isp = None
@@ -453,6 +457,8 @@ class NetMonitor:
             gp = self._game_probe
             gp["tries"] += 1
             gp["ok"] += res["game"][0] is not None
+            if not gp["ok"]:
+                del res["game"]   # many servers drop ICMP: no answer yet is not packet loss
         for k in ("gw", "isp", "inet", "game"):
             if k in res:
                 rtt, loss = res[k]
@@ -460,10 +466,11 @@ class NetMonitor:
                 if rtt is not None:
                     self.hist[k].append(rtt)
 
-        extra = {"gateway": self.gw, "isp_hop": self.isp, "adapter": self.adapter, "link_mbps": self.link_speed,
-                 "game_ip": self._game_ip}
-        if self.wifi_info:
-            extra.update({f"wifi_{k}": v for k, v in self.wifi_info.items() if k != "signal"})
+        extra = {"gateway": self.gw, "isp_hop": self.isp, "adapter": self.adapter, "game_ip": self._game_ip}
+        if self.wifi_info:   # rx/tx rate and RSSI change every few seconds: not part of the change-only state
+            extra.update({f"wifi_{k}": v for k, v in self.wifi_info.items() if k in ("ssid", "bssid", "channel", "phy")})
+        else:
+            extra["link_mbps"] = self.link_speed
         changed = {k: v for k, v in extra.items() if self.state_extra.get(k) != v}
         self.state_extra = extra
         if self.nic_errs:
@@ -476,7 +483,8 @@ class NetMonitor:
         row = dict(ts=now, session=self.game[2] if self.game else None,
                    gw_ms=g("gw", 0), gw_loss=g("gw", 1), isp_ms=g("isp", 0), isp_loss=g("isp", 1),
                    inet_ms=g("inet", 0), inet_loss=g("inet", 1), game_ms=g("game", 0), game_loss=g("game", 1),
-                   dns_ms=dns[0] if dns and dns[1] else None, link=self.link_type if self.gw else None,
+                   dns_ms=dns[0] if dns and dns[1] else None,
+                   link=(self.link_type or "other") if self.connected else None,
                    wifi_signal=self.wifi_info.get("signal") if self.wifi_info else None,
                    wifi_rssi=self.wifi_info.get("rssi") if self.wifi_info else None,
                    extra=json.dumps(changed, ensure_ascii=False) if changed else None)
@@ -487,7 +495,7 @@ class NetMonitor:
     # ---------- incidents ----------
     def _ongoing(self, kind, active, severity, title, ts, details_fn):
         iid = self.open.get(kind)
-        if active and iid is None:
+        if active and iid is None and self.running:
             self.open[kind] = self.open_incident(kind, severity, title, details_fn(), ts)
         elif not active and iid is not None:
             self.close_incident(iid, ts)
@@ -533,6 +541,8 @@ class NetMonitor:
         self._ongoing("net_link_down", link_down, "serious", "Brak połączenia z siecią (Wi-Fi / kabel rozłączony)",
                       ts, self._snapshot)
         if link_down:
+            if self.open.get("wifi_weak"):
+                self._ongoing("wifi_weak", False, "warning", "", ts, dict)
             return
 
         inet_lost = r["inet_loss"] == 1
@@ -585,5 +595,7 @@ class NetMonitor:
 
         sig = r["wifi_signal"]
         weak = self.open.get("wifi_weak") is not None
-        if sig is not None and (not weak and sig < 40 or weak and sig >= 50):
-            self._ongoing("wifi_weak", not weak, "warning", f"Słaby sygnał Wi-Fi ({sig}%)", ts, self._snapshot)
+        if weak and (sig is None or sig >= 50):
+            self._ongoing("wifi_weak", False, "warning", "", ts, dict)
+        elif not weak and sig is not None and sig < 40:
+            self._ongoing("wifi_weak", True, "warning", f"Słaby sygnał Wi-Fi ({sig}%)", ts, self._snapshot)
