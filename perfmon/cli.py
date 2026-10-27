@@ -314,8 +314,8 @@ def cmd_procs(con, a):
     out(f"## Procesy ({a.kind}) {an.fmt_ts(t0)} -> {an.fmt_ts(t1)}")
     col = {"cpu": "cpu_pct", "mem": "mem_mb", "io": "io_mbs", "gpu": "gpu_pct"}[a.kind]
     table(an._rows(con, f"SELECT name, ROUND(AVG({col}),2) AS avg, ROUND(MAX({col}),1) AS max, COUNT(*) AS appearances "
-                        f"FROM procs WHERE kind=? AND ts BETWEEN ? AND ? AND name NOT IN ('System Idle Process','Idle') GROUP BY name ORDER BY SUM({col}) DESC LIMIT 25",
-                   (a.kind, t0, t1)))
+                        f"FROM procs WHERE kind=? AND ts BETWEEN ? AND ? AND name NOT IN ('System Idle Process','Idle') AND ({col}<=? OR kind!='gpu') GROUP BY name ORDER BY SUM({col}) DESC LIMIT 25",
+                   (a.kind, t0, t1, config.GPU_PCT_MAX)))
 
 
 def cmd_sysinfo(con, a):

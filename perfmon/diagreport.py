@@ -29,8 +29,8 @@ class StutterExt:
         sid = row["id"]
         self.gp = an._rows(con, "SELECT ts, vram_shared_mb, shader_bytes FROM game_proc WHERE session=? ORDER BY ts", (sid,))
         self.gp_ts = [g["ts"] for g in self.gp]
-        self.gpu = an._rows(con, "SELECT ts, name, gpu_pct FROM procs WHERE kind='gpu' AND ts BETWEEN ? AND ? ORDER BY ts",
-                            (start - 6, end + 6))
+        self.gpu = an._rows(con, "SELECT ts, name, gpu_pct FROM procs WHERE kind='gpu' AND gpu_pct<=? "
+                            "AND ts BETWEEN ? AND ? ORDER BY ts", (config.GPU_PCT_MAX, start - 6, end + 6))
         self.gpu_ts = [p["ts"] for p in self.gpu]
         vt = con.execute("SELECT MAX(gpu_vram_total_mb) FROM samples WHERE ts BETWEEN ? AND ?", (start, end)).fetchone()[0]
         self.shared_limit = vram_shared_limit(vt)
@@ -84,7 +84,7 @@ class StutterExt:
 # ---------- report sections ----------
 def game_proc_summary(con, sid):
     g = an._one(con, "SELECT COUNT(*) AS n, MAX(vram_dedicated_mb) AS ded_max, MAX(vram_shared_mb) AS shared_max, "
-                     "AVG(gpu_pct) AS gpu_avg, MAX(private_mb) AS private_max, MAX(rss_mb) AS rss_max, "
+                     "AVG(CASE WHEN gpu_pct<=100 THEN gpu_pct END) AS gpu_avg, MAX(private_mb) AS private_max, MAX(rss_mb) AS rss_max, "
                      "AVG(io_read_mbs) AS io_avg, MAX(io_read_mbs) AS io_max, MAX(threads) AS threads_max, "
                      "MAX(handles) AS handles_max FROM game_proc WHERE session=?", (sid,))
     if not g or not g["n"]:
@@ -128,8 +128,8 @@ def gpu_background(con, start, end, exe):
     if not n_ticks:
         return []
     rows = an._rows(con, "SELECT name, SUM(gpu_pct) AS s, MAX(gpu_pct) AS mx, COUNT(*) AS n, AVG(vram_mb) AS vram "
-                         "FROM procs WHERE kind='gpu' AND ts BETWEEN ? AND ? GROUP BY name ORDER BY s DESC LIMIT 12",
-                    (start, end))
+                         "FROM procs WHERE kind='gpu' AND gpu_pct<=? AND ts BETWEEN ? AND ? "
+                         "GROUP BY name ORDER BY s DESC LIMIT 12", (config.GPU_PCT_MAX, start, end))
     skip = an.NOT_BACKGROUND | {(exe or "").lower()}
     # avg over the whole session (a process missing from the top 5 at a tick counts as 0 there)
     return [{"name": r["name"], "avg_pct": an._r(r["s"] / n_ticks), "max_pct": an._r(r["mx"]),

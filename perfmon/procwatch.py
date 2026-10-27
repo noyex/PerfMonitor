@@ -9,6 +9,7 @@ import re
 import sqlite3
 
 from . import analyze as an
+from . import config
 
 log = logging.getLogger("perfmon.procwatch")
 
@@ -192,8 +193,8 @@ class StartCauses:
     def _heavy(self, con, start, end):
         h = {}
         for r in _rows(con, "SELECT ts, name, kind, cpu_pct, gpu_pct FROM procs WHERE ((kind='cpu' AND cpu_pct>?) OR "
-                            "(kind='gpu' AND gpu_pct>?)) AND ts BETWEEN ? AND ? ORDER BY ts",
-                       (HEAVY_PCT, HEAVY_PCT, start - CAUSE_BEFORE_S - 1, end + CAUSE_AFTER_S + HEAVY_WINDOW_S)):
+                            "(kind='gpu' AND gpu_pct>? AND gpu_pct<=?)) AND ts BETWEEN ? AND ? ORDER BY ts",
+                       (HEAVY_PCT, HEAVY_PCT, config.GPU_PCT_MAX, start - CAUSE_BEFORE_S - 1, end + CAUSE_AFTER_S + HEAVY_WINDOW_S)):
             h.setdefault((r["name"] or "").lower(), []).append(
                 (r["ts"], r["cpu_pct"] if r["kind"] == "cpu" else r["gpu_pct"]))
         return h

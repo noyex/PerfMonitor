@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or ROOT / "data")   # env override: tests
 DB_PATH = DATA_DIR / "perf.db"
+GPU_PCT_MAX = 100.0   # GPU load of one process / engine above this is a PDH artifact (seen: 3e13 %), never real
 LOG_PATH = DATA_DIR / "collector.log"
 CONFIG_PATH = DATA_DIR / "config.json"
 

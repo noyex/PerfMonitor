@@ -10,6 +10,8 @@ import time
 import psutil
 import win32pdh
 
+from .config import GPU_PCT_MAX
+
 log = logging.getLogger("perfmon.gpuproc")
 
 ENGINE = r"\GPU Engine(*)\Utilization Percentage"
@@ -32,16 +34,21 @@ def aggregate(engines, dedicated, shared):
     """Per-PID {gpu, gpu_3d, ded_mb, shared_mb} from PDH arrays {instance: value}.
 
     Engine load is summed over every adapter; memory is taken from the adapter with the most dedicated
-    memory in use (the discrete card - the iGPU's 'shared' memory is ordinary RAM and would mislead)."""
+    memory in use (the discrete card - the iGPU's 'shared' memory is ordinary RAM and would mislead).
+
+    PDH occasionally returns absurd engine values (a fresh instance with a zero baseline or a reset counter divided by
+    a tiny interval: 3e13 %). An engine above 100 % is dropped as invalid; the per-process sum is capped at 100."""
     out = {}
     for inst, v in engines.items():
         p = parse_instance(inst)
         if not p or not p[2] or not _COUNTED.match(p[2]) or v is None:
             continue
+        if not 0 <= v <= GPU_PCT_MAX * 1.05:   # small overshoot is rounding, the rest is garbage (NaN fails the test too)
+            continue
         d = out.setdefault(p[0], {"gpu": 0.0, "gpu_3d": 0.0, "ded_mb": None, "shared_mb": None})
-        d["gpu"] += v
+        d["gpu"] = min(GPU_PCT_MAX, d["gpu"] + v)
         if p[2].upper() == "3D":
-            d["gpu_3d"] += v
+            d["gpu_3d"] = min(GPU_PCT_MAX, d["gpu_3d"] + v)
     per_luid = {}
     for inst, v in dedicated.items():
         p = parse_instance(inst)
