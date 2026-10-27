@@ -2,6 +2,7 @@
 import csv
 import io
 import logging
+import os
 import statistics
 import subprocess
 import threading
@@ -51,7 +52,8 @@ class FrameCapture:
         self.error = None
         self.lines = 0
         args = [exe_path, "--process_id", str(pid), "--output_stdout", "--no_console_stats",
-                "--session_name", f"PerfMon_{session_id}", "--stop_existing_session",
+                # the PID keeps a test collector (own DB, ids from 1) from stopping the production capture
+                "--session_name", f"PerfMon_{os.getpid()}_{session_id}", "--stop_existing_session",
                 "--terminate_on_proc_exit"]
         try:
             self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
