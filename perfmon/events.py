@@ -103,12 +103,18 @@ _APPNAME = re.compile(r"\bAppName=([^;\]]+)")
 _EXE = re.compile(r"([^\s:,\"'\[\]]+\.exe)\b", re.I)
 
 
-def exe_from_message(m: str) -> str:
-    """Faulting/hung exe from a WER 1000/1002 message, independent of the system language
-    ("Faulting application name: x.exe, ..." / "Nazwa aplikacji powodującej błąd: x.exe, ...")."""
+def exe_from_message(m: str, first_field=False) -> str:
+    """Faulting/hung exe from a WER 1000/1002 message, independent of the system language.
+
+    first_field: Application Error 1000 starts with "<label>: <exe>, ..." ("Faulting application name:" /
+    "Nazwa aplikacji powodującej błąd:") - take that whole field, so names with spaces survive."""
     s = _APPNAME.search(m or "")
     if s and s.group(1).strip():
         return s.group(1).strip()
+    if first_field and m:
+        f = m.split(",")[0].split(":")[-1].strip()
+        if f.lower().endswith(".exe"):
+            return f
     s = _EXE.search(m or "")
     return s.group(1) if s else "?"
 
@@ -127,7 +133,7 @@ def classify(ev: dict):
     if (p == "Display" and i == 4101) or p.lower() in ("amdkmdag", "amdkmdap", "nvlddmkm"):
         return "gpu_driver", "serious", f"Problem sterownika GPU: {p} {i}"
     if i == 1000 and p == "Application Error":
-        return "app_crash", "serious", f"Crash aplikacji: {exe_from_message(m)}"
+        return "app_crash", "serious", f"Crash aplikacji: {exe_from_message(m, first_field=True)}"
     if i == 1002 and p == "Application Hang":
         return "app_hang", "serious", f"Aplikacja przestała odpowiadać: {exe_from_message(m)}"
     if p == "Microsoft-Windows-Kernel-Processor-Power" and i == 37:
