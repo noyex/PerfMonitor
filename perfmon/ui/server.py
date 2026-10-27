@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import analyze, config, db
+from .. import analyze, config, db, ocanalyze
 
 STATIC = Path(__file__).parent / "static"
 
@@ -44,7 +44,30 @@ ROUTES = {
     "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d")),
     "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d")),
     "points": lambda con, q: analyze.session_points(con, q.get("exe") or None, _since(q, "180d")),
+    "oc": lambda con, q: ocanalyze.overview(con),
+    "oc_compare": lambda con, q: ocanalyze.compare_profiles(con, q.get("exe") or None, q.get("since") or "180d"),
+    "oc_vf": lambda con, q: ocanalyze.vf_curve(con, _pid(q), q.get("since") or "30d"),
+    "oc_cores": lambda con, q: ocanalyze.per_core(con, _pid(q), q.get("since") or "30d"),
+    "oc_stress": lambda con, q: ocanalyze.stress_runs(con, int(q.get("limit", 30))),
 }
+
+
+def _pid(q):
+    return int(q["profile"]) if q.get("profile") else None
+
+
+def save_profile(con, body):
+    """POST /api/oc_profile: create (no id) or update a profile; "activate": true = active from now."""
+    pid = body.get("id")
+    args = {k: body.get(k) for k in ("name", "cpu", "gpu", "notes", "status")}
+    if pid:
+        ocanalyze.update_profile(con, int(pid), **args)
+    else:
+        pid = ocanalyze.create_profile(con, args["name"], args["cpu"], args["gpu"], args["notes"],
+                                       args["status"] or "testing")
+    if body.get("activate"):
+        ocanalyze.activate(con, int(pid))
+    return {"id": pid}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,6 +81,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        """The only write endpoint (UV/OC profiles). JSON-only + same-origin check: a web page in the browser
+        cannot post here (non-simple content type needs a CORS preflight that this server never allows)."""
+        u = urlparse(self.path)
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        if u.path != "/api/oc_profile":
+            return self._send(404, b'{"error":"not found"}', "application/json")
+        if not self.headers.get("Content-Type", "").startswith("application/json") or (
+                origin and urlparse(origin).netloc != host):
+            return self._send(403, b'{"error":"forbidden"}', "application/json")
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("oczekiwano obiektu JSON")
+            con = db.connect()
+            try:
+                res = save_profile(con, body)
+            finally:
+                con.close()
+            return self._send(200, json.dumps(res).encode(), "application/json")
+        except ValueError as e:
+            return self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"),
+                              "application/json; charset=utf-8")
+        except Exception as e:
+            return self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json")
 
     def do_GET(self):
         u = urlparse(self.path)
