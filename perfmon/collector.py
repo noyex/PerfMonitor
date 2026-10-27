@@ -9,12 +9,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from pathlib import Path
 
 import psutil
 
-from . import config, db, gamectx, sysinfo
+from . import config, db, gamectx, marks, sysinfo
 from .events import EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -85,6 +86,8 @@ class Collector:
         self.last_reload_check = time.time()
         self.reload_deferred_logged = False
         self.import_check = None       # {"requested", "err"} while the new code is being import-checked
+        self.mark_queue = deque()      # hotkey presses (ts), filled by the hotkey thread
+        self.hotkey = marks.Hotkey(self.cfg.get("hotkey_mark"), self.mark_queue.append, self.cfg.get("hotkey_beep", True))
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -233,6 +236,19 @@ class Collector:
         cl = r.get("commit_limit_gb") or 0
         self._ongoing("commit_full", bool(cl and r["commit_gb"] / cl > 0.92), "serious",
                       "Pamięć zadeklarowana (commit) >92% limitu", r, ctx)
+
+    # ---------- user marks ----------
+    def process_marks(self):
+        reqs = []
+        while self.mark_queue:
+            reqs.append({"ts": self.mark_queue.popleft(), "text": None, "source": "hotkey"})
+        reqs += marks.take_requests()
+        for r in reqs:
+            session = next(iter(self.games.values()))["session"] if self.games else None
+            with self.lock:
+                det = marks.context(self.con, r["ts"], session=session)
+            det.update(text=r["text"], source=r["source"], top_procs=self.snapshot_procs())
+            self.incident("user_mark", "info", marks.title(r["text"]), det, ts=r["ts"])
 
     # ---------- processes ----------
     def sample_procs(self):
@@ -503,6 +519,7 @@ class Collector:
                     self.last_events = now
                     self.poll_events()
                     self.recheck_crashes(now)
+                self.process_marks()
                 self.housekeeping(now)
                 self.check_reload(now)
                 self.finish_reload()
@@ -521,6 +538,7 @@ class Collector:
         for iid in self.open_incidents.values():
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
         self.open_incidents.clear()
+        self.hotkey.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

@@ -12,6 +12,8 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
+from . import marks
+
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
 # --------------------------------------------------------------------------
@@ -339,6 +341,7 @@ def session_report(con, session_id):
                                "ORDER BY ts LIMIT 60", (start, end + 60))
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
+    rep["marks"] = marks.report(con, start, end + 5, exe)
     rep["findings"] = _session_findings(rep, row)
     return rep
 
@@ -520,6 +523,7 @@ def range_report(con, t0, t1):
     for e in ev:
         e["time"] = fmt_ts(e["ts"])
     rep["events"] = ev
+    rep["marks"] = marks.report(con, t0, t1)
     rep["top_procs"] = {
         "cpu": _rows(con, "SELECT name, ROUND(AVG(cpu_pct),2) AS avg_cpu_pct, ROUND(MAX(cpu_pct),1) AS max_cpu_pct, "
                           "COUNT(*) AS appearances FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? "

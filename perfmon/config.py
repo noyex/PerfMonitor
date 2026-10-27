@@ -17,6 +17,8 @@ DEFAULTS = {
     "event_poll_s": 30.0,
     "retention_days": 90,
     "ui_port": 8765,
+    "hotkey_mark": "ctrl+alt+l",   # global shortcut for `pm mark` while playing; "" = off
+    "hotkey_beep": True,           # short beep confirming the mark
     "lhm_dir": str(_WINGET / "LibreHardwareMonitor.LibreHardwareMonitor_Microsoft.Winget.Source_8wekyb3d8bbwe"),
     "presentmon_exe": str(_WINGET / "Intel.PresentMon.Console_Microsoft.Winget.Source_8wekyb3d8bbwe" / "presentmon.exe"),
     # Games detected by exe name (lowercase) – add your own in data/config.json

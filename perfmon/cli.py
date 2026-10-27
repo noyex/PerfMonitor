@@ -162,7 +162,29 @@ def cmd_session(con, a):
     if r["events"]:
         out("### Zdarzenia Windows w trakcie sesji")
         table(r["events"], ["time", "provider", "event_id", "level", "message"])
+    print_marks(r.get("marks"))
     findings(r["findings"])
+
+
+def print_marks(ms):
+    if not ms:
+        return
+    out("### Znaczniki użytkownika (kontekst +-30 s)")
+    table([{"time": m["time"], "text": m["text"], "fps_min": m["context"]["fps_min"], "ft_max": m["context"]["ft_max"],
+            "stutters": m["context"]["stutters"], "dwm_ms_max": m["context"]["dwm_ms_max"],
+            "disk_lat_max": m["context"]["disk_lat_max"],
+            "bg_procs": ", ".join(f"{p['name']} {p['cpu_max']}%" for p in m["context"]["top_bg_procs"]),
+            "events": ", ".join(m["context"]["events"])} for m in ms], maxw=200)
+
+
+def cmd_mark(con, a):
+    """Mark 'something was wrong just now' - the collector stores it with the system state."""
+    from perfmon import marks
+    ts = marks.request(" ".join(a.text) if a.text else None)
+    s = an.latest(con)
+    out(f"Zapisano znacznik na {time.strftime('%H:%M:%S', time.localtime(ts))}"
+        + ("" if s["collector_alive"] else " (UWAGA: kolektor nie działa, znacznik zostanie dodany po jego starcie)"))
+    out(f"Podgląd: pm at {time.strftime('%H:%M:%S', time.localtime(ts))} --window 30")
 
 
 def cmd_incidents(con, a):
@@ -201,6 +223,7 @@ def cmd_range(con, a):
     table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
     out("### Zdarzenia (level<=2)")
     table(r["events"], ["time", "provider", "event_id", "message"])
+    print_marks(r.get("marks"))
     out("### Top procesy CPU")
     table(r["top_procs"]["cpu"])
     out("### Top procesy I/O")
@@ -222,6 +245,10 @@ def cmd_at(con, a):
                          "fg_exe", "fg_hung"])
     out("### Incydenty")
     table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
+    for i in r["incidents"]:
+        if i["kind"] == "user_mark" and isinstance(i["details"], dict):
+            out(f"- Znacznik {i['time']}: {i['details'].get('text') or '(bez opisu)'} - stan: "
+                f"{cell(i['details'].get('last_sample'))}")
     out("### Zdarzenia")
     table(r["events"], ["time", "provider", "event_id", "level", "message"], maxw=250)
     out("### Procesy (cpu/io/mem)")
@@ -399,6 +426,7 @@ def build():
         s.set_defaults(fn=fn)
         return s
     add("status", cmd_status)
+    add("mark", cmd_mark, help="mark a lag/problem right now").add_argument("text", nargs="*")
     add("health", cmd_health).add_argument("--days", type=float, default=14)
     add("sessions", cmd_sessions).add_argument("--limit", type=int, default=20)
     add("session", cmd_session).add_argument("id", type=int)
