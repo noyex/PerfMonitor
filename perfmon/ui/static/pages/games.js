@@ -51,7 +51,7 @@ Pages.games = (() => {
         tbody.append(
           h("tr", { onclick: () => (location.hash = `#/games?id=${s.id}`) },
             h("td", { class: "muted" }, fmtTime(s.start_ts)),
-            h("td", {}, gameName(s.exe),
+            h("td", {}, gameTitle(s),
               s.running ? h("span", { class: "live" }, "trwa") : null,
               end ? h("span", { class: `sev ${end[0]}` }, end[1]) : null,
               BOTTLENECK[s.bottleneck] && s.bottleneck !== "mixed" ? h("span", { class: "chip" }, BOTTLENECK[s.bottleneck]) : null),
@@ -86,7 +86,7 @@ Pages.games = (() => {
       return;
     }
     const s = d.session;
-    const game = gameName(s.exe);
+    const game = gameTitle(s);
     const now = Date.now() / 1000;
     const t0 = s.start_ts;
 
