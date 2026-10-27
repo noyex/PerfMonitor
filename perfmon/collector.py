@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, procwatch, sysinfo
+from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, procwatch, shadercache, sysinfo
 from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
@@ -73,6 +73,9 @@ class Collector:
         self.game_sampler = gpuproc.GameProcSampler()
         self.last_gpu_proc = 0.0
         self.procwatch = procwatch.ProcWatch(self.cfg)
+        self.shader = shadercache.ShaderWatch(self.cfg.get("shader_cache_dirs") or shadercache.DEFAULT_DIRS,
+                                              self.cfg.get("shader_scan_interval_s", 10))
+        self.shader_pid = None         # game whose shader caches ShaderWatch measures
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -315,6 +318,8 @@ class Collector:
         for pid, g in self.games.items():
             r = self.game_sampler.sample(pid, g["session"], gpu.get(pid), now)
             if r:
+                if pid == self.shader_pid:
+                    r["shader_bytes"] = self.shader.latest()[1]
                 game_rows.append(r)
         out = []
         for pid, d in gpuproc.top_background(gpu, set(self.games)):
@@ -380,7 +385,9 @@ class Collector:
         cap = None
         if os.path.exists(self.cfg["presentmon_exe"]):
             cap = FrameCapture(self.cfg["presentmon_exe"], name, pid, sid, self.on_frame_second, self.on_stutter)
-        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "last_summary": time.time()}
+        self.games[pid] = {"session": sid, "capture": cap, "exe": name, "path": exe, "last_summary": time.time()}
+        self.shader.set_game(exe)   # the newest game: usually the only one
+        self.shader_pid = pid
         log.info("game start %s pid=%s session=%s", name, pid, sid)
 
     def on_frame_second(self, r):
@@ -399,6 +406,9 @@ class Collector:
     def end_game(self, pid, reason):
         g = self.games.pop(pid)
         self.game_sampler.forget(pid)
+        if pid == self.shader_pid:
+            self.shader_pid = next(iter(self.games), None)
+            self.shader.set_game(self.games[self.shader_pid]["path"] if self.shader_pid else None)
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
@@ -636,6 +646,7 @@ class Collector:
             self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
         self.open_incidents.clear()
         self.hotkey.stop()
+        self.shader.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

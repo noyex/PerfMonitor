@@ -20,6 +20,11 @@ DEFAULTS = {
     "hotkey_mark": "ctrl+alt+l",   # global shortcut for `pm mark` while playing; "" = off
     "hotkey_beep": True,           # short beep confirming the mark
     "gpu_proc_interval_s": 5.0,    # GPU load / VRAM per process and the game process sampler
+    # Shader caches measured during a game (growth at a stutter = shader compilation); "{steam}" =
+    # steamapps\shadercache\<appid> of the game. Same list as shadercache.DEFAULT_DIRS (importing it here is a cycle).
+    "shader_cache_dirs": [r"%LOCALAPPDATA%\AMD\DxCache", r"%LOCALAPPDATA%\AMD\DxcCache", r"%LOCALAPPDATA%\AMD\VkCache",
+                          r"%LOCALAPPDATA%\AMD\OglCache", r"%LOCALAPPDATA%\AMD\DX9Cache", "{steam}"],
+    "shader_scan_interval_s": 10,
     # Process start/stop log: these are ignored outside game sessions (inside only conhost/dllhost/WmiPrvSE)
     "proc_events_ignore": ["conhost.exe", "cmd.exe", "powershell.exe", "svchost.exe", "RuntimeBroker.exe",
                            "backgroundTaskHost.exe", "dllhost.exe", "WmiPrvSE.exe", "taskhostw.exe"],

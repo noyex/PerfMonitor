@@ -10,6 +10,7 @@ from . import config, crashinfo, diskinfo, present, procwatch
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
 BG_GPU_PCT = 15               # background process GPU load counted as a stutter cause
+SHADER_GROWTH_BYTES = 256 * 1024   # shader cache growth around a stutter = it compiled shaders
 
 
 def _i(v):
@@ -49,6 +50,14 @@ class StutterExt:
         return any(b["vram_shared_mb"] - a["vram_shared_mb"] > VRAM_SHARED_JUMP_MB
                    for i, a in enumerate(grow) for b in grow[i + 1:] if b["ts"] - a["ts"] <= 10)
 
+    def shader_compile(self, ts):
+        """Shader cache grew > SHADER_GROWTH_BYTES between the last sample before and the last one after the stutter
+        (window -10 s / +5 s: caches are rescanned every 10 s, game_proc rows come every 5 s)."""
+        near = [g for g in self._win(self.gp_ts, self.gp, ts - 10, ts + 5) if g["shader_bytes"] is not None]
+        before = [g["shader_bytes"] for g in near if g["ts"] <= ts]
+        after = [g["shader_bytes"] for g in near if g["ts"] > ts]
+        return bool(before and after) and after[-1] - before[-1] > SHADER_GROWTH_BYTES
+
     def background_gpu(self, ts):
         bg = {}
         for p in self._win(self.gpu_ts, self.gpu, ts - 5, ts + 5):
@@ -67,6 +76,8 @@ class StutterExt:
             causes.append("vram_shared")
         causes += [f"background_gpu:{n}" for n in self.background_gpu(ts)]
         causes += self.starts.causes(ts)
+        if self.shader_compile(ts):   # also keeps the shader_or_unknown fallback off
+            causes.append("shader_compile")
         return causes
 
 
@@ -85,6 +96,30 @@ def game_proc_summary(con, sid):
             "rss_max_mb": _i(g["rss_max"]), "io_read_avg_mbs": an._r(g["io_avg"], 2),
             "io_read_max_mbs": an._r(g["io_max"], 1), "thread_max_p95": an._r(an._pct(th, 0.95)),
             "threads_max": g["threads_max"], "handles_max": g["handles_max"]}
+
+
+def first_session_after_change(con, row):
+    """'driver' / 'game_update' when the previous session of this game ran another GPU driver / game build
+    (both invalidate the shader caches), else 'none'; None for the first session of the game."""
+    prev = an._one(con, "SELECT context FROM sessions WHERE lower(exe)=lower(?) AND start_ts<? "
+                        "ORDER BY start_ts DESC LIMIT 1", (row["exe"], row["start_ts"]))
+    if not prev:
+        return None
+    a, b = an._ctx(prev), an._ctx(row)
+    if an._driver(a) and an._driver(b) and an._driver(a) != an._driver(b):
+        return "driver"
+    build = lambda c: ((c.get("steam") or {}).get("buildid"), c.get("game_version"))
+    if any(x and y and x != y for x, y in zip(build(a), build(b))):
+        return "game_update"
+    return "none"
+
+
+def shader_summary(con, row):
+    r = con.execute("SELECT MIN(shader_bytes), MAX(shader_bytes) FROM game_proc WHERE session=? "
+                    "AND shader_bytes IS NOT NULL", (row["id"],)).fetchone()
+    return {"first_session_after_change": first_session_after_change(con, row),
+            "cache_mb": an._r(r[1] / 2**20) if r and r[1] is not None else None,
+            "cache_growth_mb": an._r((r[1] - r[0]) / 2**20, 2) if r and r[1] is not None else None}
 
 
 def gpu_background(con, start, end, exe):
@@ -112,6 +147,7 @@ def extend(con, rep, row, start, end):
     rep["proc_events"] = procwatch.session_proc_events(con, start, end, row["exe"], config.load().get("background_culprits"))
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
     rep["present"] = present.session_present(con, row, summ)
+    rep["shader"] = shader_summary(con, row)
 
 
 def session_extras(con, ids):
@@ -134,6 +170,19 @@ def findings(rep, row):
         add("warning", f"{cc['pagefile']} stutterów przy intensywnym czytaniu z pliku wymiany",
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
+    sh = rep.get("shader") or {}
+    change = {"driver": "sterownika GPU", "game_update": "aktualizacji gry"}.get(sh.get("first_session_after_change"))
+    n_sh = cc.get("shader_compile", 0)
+    if change and n_sh + cc.get("shader_or_unknown", 0) >= 3:
+        add("info", f"Pierwsza sesja po zmianie {change}",
+            f"Zmiana unieważnia cache shaderów, więc stuttery ({n_sh} przy rosnącym cache, "
+            f"{cc.get('shader_or_unknown', 0)} bez innej przyczyny) to prawdopodobnie kompilacja shaderów. "
+            "Powinny zniknąć w kolejnej sesji; jeśli zostaną - szukaj innej przyczyny.")
+    elif n_sh >= 3:
+        add("warning", f"{n_sh} stutterów przy kompilacji shaderów",
+            f"Cache shaderów urósł o {sh.get('cache_growth_mb')} MB w trakcie sesji. Gra kompiluje shadery w locie: "
+            "użyj prekompilacji w menu gry, nie czyść cache (Adrenalin -> Reset Shader Cache, Oczyszczanie dysku -> "
+            "DirectX Shader Cache); jeśli dzieje się to w każdej sesji, cache jest kasowany.")
     f += diskinfo.findings(rep)
     f += present.findings(rep)
     f += procwatch.findings(rep)

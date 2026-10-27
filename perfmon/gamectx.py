@@ -77,7 +77,8 @@ def steam_info(path):
     installdir = path[i + len("\\steamapps\\common\\"):].split("\\")[0].lower()
     for acf in glob.glob(os.path.join(steamapps, "appmanifest_*.acf")):
         try:
-            txt = open(acf, encoding="utf-8", errors="replace").read()
+            with open(acf, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
         except OSError:
             continue
         get = lambda k: (re.search(rf'"{k}"\s+"([^"]*)"', txt, re.I) or [None, None])[1]

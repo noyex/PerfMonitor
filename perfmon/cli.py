@@ -151,6 +151,10 @@ def cmd_session(con, a):
         kv(r["fps_timeline"], "FPS w czasie")
     if r.get("present"):
         out(f"Prezentacja: {present.describe(r['present'])}")
+    sh = r.get("shader") or {}
+    if sh.get("cache_mb") is not None or sh.get("first_session_after_change") not in (None, "none"):
+        out(f"Cache shaderów: {cell(sh.get('cache_mb'))} MB (+{cell(sh.get('cache_growth_mb'))} MB w sesji); "
+            f"pierwsza sesja po zmianie: {sh.get('first_session_after_change') or '-'}")
     st = r["stutters"]
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
         "przyczyny": st["cause_counts"]}, "Stuttery")
