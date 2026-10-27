@@ -429,8 +429,8 @@ class Collector:
         for logname in ("System", "Application"):
             for ev in self.events.read_since(logname, since):
                 newest = max(newest, ev["ts"])
-                cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message) "
-                                "VALUES (:ts,:log,:provider,:event_id,:level,:record_id,:message)", ev)
+                cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message, data) "
+                                "VALUES (:ts,:log,:provider,:event_id,:level,:record_id,:message,:data)", ev)
                 if cur.rowcount:
                     c = classify(ev)
                     if c:

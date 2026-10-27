@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS procs (              -- top processes every ~5 s
 CREATE TABLE IF NOT EXISTS events (             -- Windows event log (errors, warnings, selected info)
     ts REAL, log TEXT, provider TEXT, event_id INTEGER, level INTEGER, record_id INTEGER,
     message TEXT,
+    data TEXT,                                   -- raw EventData as JSON ({name: value} or [values]) for crash/disk/WHEA/Defender
     UNIQUE (log, record_id)
 );
 CREATE TABLE IF NOT EXISTS incidents (          -- detected problems (freeze, crash, driver reset...)
@@ -90,6 +91,7 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         # migrate DBs created before these columns existed
         add_columns(con, "sessions", {"context": "TEXT"})
         add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
+        add_columns(con, "events", {"data": "TEXT"})
     con.row_factory = sqlite3.Row
     return con
 

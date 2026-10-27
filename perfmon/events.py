@@ -1,4 +1,5 @@
 """Reading the Windows event log (System + Application) via EvtQuery."""
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -26,6 +27,28 @@ NOISE = {
     ("Microsoft-Windows-Security-SPP", 16384),
     ("Microsoft-Windows-Security-SPP", 16394),
 }
+
+# Events whose raw EventData is stored in events.data (crash/disk/WHEA/Defender details, language independent)
+DATA_PROVIDERS = {"stornvme", "storahci", "disk", "Ntfs", "Microsoft-Windows-Ntfs", "volmgr"}
+DATA_IDS = {("Application Error", 1000), ("Application Hang", 1002), ("Windows Error Reporting", 1001),
+            ("Microsoft-Windows-Kernel-Power", 41), ("Microsoft-Windows-WER-SystemErrorReporting", 1001),
+            ("BugCheck", 1001)}
+DEFENDER_IDS = {1000, 1001, 1002, 1116, 1117}
+
+
+def keep_data(provider, eid):
+    return ((provider, eid) in DATA_IDS or provider in DATA_PROVIDERS or provider.startswith("Microsoft-Windows-WHEA")
+            or (provider == "Microsoft-Windows-Windows Defender" and eid in DEFENDER_IDS))
+
+
+def raw_data(x):
+    """EventData as JSON: {name: value} when every field is named, else the values in order."""
+    ds = list(x.iter(NS + "Data"))
+    if not ds:
+        return None
+    if all(d.get("Name") for d in ds):
+        return json.dumps({d.get("Name"): d.text for d in ds}, ensure_ascii=False)
+    return json.dumps([d.text for d in ds], ensure_ascii=False)
 
 
 def _ts(s):
@@ -93,7 +116,8 @@ class EventReader:
                     elif not msg:
                         msg = " | ".join(d.text for d in x.iter(NS + "Data") if d.text)
                     out.append(dict(ts=ts, log=logname, provider=provider, event_id=eid, level=level,
-                                    record_id=rec, message=(msg or "").strip()[:4000]))
+                                    record_id=rec, message=(msg or "").strip()[:4000],
+                                    data=raw_data(x) if keep_data(provider, eid) else None))
                 except Exception as e:
                     log.debug("event parse: %s", e)
         return out
