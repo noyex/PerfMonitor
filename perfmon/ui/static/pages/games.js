@@ -71,6 +71,10 @@ Pages.games = (() => {
 
   const renderDetail = async (view, id) => {
     const d = await api("session", { id });
+    if (d.error) {
+      view.append(h("div", { class: "page-head" }, h("a", { class: "back", href: "#/games" }, "← Gry")), h("div", { class: "empty" }, d.error));
+      return;
+    }
     const s = d.session;
     const game = gameName(s.exe);
     const now = Date.now() / 1000;
@@ -128,14 +132,15 @@ Pages.games = (() => {
     } else {
       const worst = (st.worst || []).map((w) => ({ ts: w.ts, severity: "serious" }));
       const markers = () => worst;
+      const xRange = [t0, t1];
       const sr = await api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 });
       if (hasFrames) {
-        charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: false }, cols(f, ["fps"])));
-        charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, onSelect: zoom }, cols(f, ["ft_avg", "ft_p99"])));
+        charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: false, xRange }, cols(f, ["fps"])));
+        charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, onSelect: zoom, xRange }, cols(f, ["ft_avg", "ft_p99"])));
       } else {
         wrap.append(h("div", { class: "empty" }, "Brak danych o klatkach (PresentMon)"));
       }
-      if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, onSelect: zoom }, cols(sr, def.keys)));
+      if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, onSelect: zoom, xRange }, cols(sr, def.keys)));
     }
 
     // Stutters

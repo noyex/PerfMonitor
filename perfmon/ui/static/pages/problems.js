@@ -91,7 +91,7 @@ Pages.problems = (() => {
           h("div", { class: "row", onclick: () => around(ts, 300) },
             h("span", { class: "time" }, fmtTime(ts)),
             h("span", { class: "title" }, title),
-            h("span", { class: "aside" }, dur != null ? fmtDur(dur) : "do resetu")));
+            h("span", { class: "aside" }, dur != null ? fmtDur(dur) : g.items.some((i) => i.until_reset) ? "do resetu" : "–")));
       }
       box.append(list);
       if (!all && events.length > FREEZE_LIMIT) box.append(h("button", { class: "btn more", onclick: () => draw(true) }, `Pokaż wszystkie (${events.length})`));

@@ -21,7 +21,11 @@ Pages.compare = (() => {
   const deltaCell = (v, muted) => h("td", { class: `num${!muted && v ? (v > 0 ? " up" : " down") : ""}` }, pct(v));
 
   // "Sterownik GPU 26.9.1 -> 26.10.1" -> "26.10.1"
-  const markerValue = (m) => (m.label.split("->").pop() || "").trim();
+  // "exe: wersja A -> B (Steam build X -> Y)" -> "B"; "26.9.1 -> 26.10.1" -> "26.10.1"
+  const markerValue = (m) => {
+    const v = m.label.match(/wersja .*?->\s*([^\s(]+)/);
+    return v ? v[1] : (m.label.split("->").pop() || "").replace(/\)\s*$/, "").trim();
+  };
   const shortDate = (ts) => fmtDate(ts).slice(0, 5);
 
   const groupLabel = (g, by) => {
@@ -129,10 +133,7 @@ Pages.compare = (() => {
   };
 
   const render = async (view, params) => {
-    const sessions = await api("sessions", { limit: 5000 });
-    const counts = {};
-    for (const s of sessions) counts[s.exe] = (counts[s.exe] || 0) + 1;
-    const exes = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+    const exes = (await api("games")).map((g) => g.exe);
     if (!exes.length) {
       view.append(h("div", { class: "page-head" }, h("h1", {}, "Porównania")), h("div", { class: "empty" }, "Brak sesji do porównania"));
       return;
