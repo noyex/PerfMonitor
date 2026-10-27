@@ -339,6 +339,10 @@ def session_report(con, session_id):
                                "ORDER BY ts LIMIT 60", (start, end + 60))
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
+    # --- network during the session + does it line up with the stutters (network lag vs local stutter)
+    rep["net"] = net_summary(con, start, end)
+    rep["net"]["correlation"] = (net_correlation(con, _net_rows(con, start, end), [s["ts"] for s in st], start, end)
+                                 if rep["net"]["seconds"] else None)
     rep["findings"] = _session_findings(rep, row)
     return rep
 
@@ -439,6 +443,32 @@ def _session_findings(rep, row):
         if (hw.get("ui_ms_max") or 0) >= 2000 or (hw.get("dwm_ms_max") or 0) >= 2000:
             add("critical", "Zawieszenie pulpitu/DWM podczas sesji",
                 f"ui_ms max {hw.get('ui_ms_max')}, dwm_ms max {hw.get('dwm_ms_max')} - szczegóły w incydentach.")
+    net = rep.get("net") or {}
+    if net.get("seconds"):
+        ninc = Counter(i["kind"] for i in net.get("incidents") or [])
+        gl = (net.get("targets") or {}).get("game") or {}
+        if ninc.get("net_down") or ninc.get("net_link_down"):
+            add("serious", f"Utrata połączenia z internetem podczas gry ({ninc['net_down'] + ninc['net_link_down']}x)",
+                "Szczegóły i miejsce awarii (dom/operator/internet) w incydentach net_down / net_link_down.")
+        if ninc.get("game_lag"):
+            add("warning", f"Lag do serwera gry ({ninc['game_lag']}x)",
+                "Wzrost pingu lub utrata pakietów do serwera gry - to lag sieciowy, nie przycięcia PC. Pole `where` w "
+                "incydencie game_lag wskazuje winowajcę (dom/operator/internet/serwer gry).")
+        if ninc.get("packet_loss"):
+            add("warning", f"Utrata pakietów podczas gry ({ninc['packet_loss']}x)",
+                "; ".join(i["title"] for i in net["incidents"] if i["kind"] == "packet_loss") or "Sprawdź sekcję net.")
+        if (gl.get("loss_pct") or 0) >= 1:
+            add("warning", f"Utrata pakietów do serwera gry {gl['loss_pct']}%", "Rubber-banding / lag w grze online.")
+        cor = net.get("correlation") or {}
+        near_pct = cor.get("stutters_near_net_problem_pct") or 0
+        if (cor.get("stutters_near_net_problem") or 0) >= 2 and near_pct >= 30 and near_pct > 2 * (cor.get("chance_pct") or 0):
+            add("warning", f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów zbiega się z problemami sieci",
+                f"W oknie +-{cor['window_s']:g} s od skoku pingu / utraty pakietów ({cor['stutters_near_net_problem_pct']}% "
+                f"stutterów przy {cor['chance_pct']}% czasu z problemami sieci) - przycięcia mogą być lagiem sieciowym.")
+        elif cor.get("bad_seconds") and cor.get("stutters"):
+            add("info", "Stuttery w większości nie pokrywają się z problemami sieci",
+                f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów blisko skoku pingu / utraty pakietów - "
+                "pozostałe przycięcia są raczej lokalne (PC), nie sieciowe.")
     for inc in rep.get("incidents") or []:
         if inc["kind"] in ("gpu_driver", "whea", "bsod"):
             add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
@@ -537,6 +567,7 @@ def range_report(con, t0, t1):
                        "AND start_ts>=?)) ORDER BY start_ts", (t1, t1, t0, t0 - 86400))
     ends = _eff_ends(con, srows)
     rep["sessions"] = [_flatten_session(r, ends=ends) for r in srows if (ends[r["id"]] or t1) >= t0]
+    rep["net"] = net_summary(con, t0, t1)
     return rep
 
 
@@ -566,7 +597,18 @@ def moment(con, ts, window=30):
         e["time"] = fmt_ts(e["ts"])
     prev = _one(con, "SELECT ts FROM samples WHERE ts<? ORDER BY ts DESC LIMIT 1", (t0,))
     nxt = _one(con, "SELECT ts FROM samples WHERE ts>? ORDER BY ts LIMIT 1", (t1,))
-    return {"at": fmt_ts(ts), "window_s": window, "samples": rows, "procs": procs, "events": evs,
+    nrows = _net_rows(con, t0, t1)
+    for r in nrows:
+        r["time"] = fmt_ts(r["ts"])
+        r["t_rel"] = _r(r["ts"] - ts, 0)
+        r["extra"] = _json(r["extra"])
+        for k, v in r.items():
+            if isinstance(v, float) and k not in ("ts",):
+                r[k] = _r(v, 2)
+    near = min(nrows, key=lambda r: abs(r["ts"] - ts)) if nrows else None
+    net = {"nearest": near if near and abs(near["ts"] - ts) <= max(5.0, window) else None, "samples": nrows[-301:],
+           "summary": net_summary(con, t0, t1)}
+    return {"at": fmt_ts(ts), "window_s": window, "samples": rows, "procs": procs, "events": evs, "net": net,
             "incidents": incidents_between(con, t0, t1),
             "sample_gap_note": None if rows else "Brak próbek w tym oknie (kolektor nie działał - np. komputer był wyłączony).",
             "nearest_sample_before": fmt_ts(prev["ts"]) if prev else None,
@@ -574,10 +616,221 @@ def moment(con, ts, window=30):
 
 
 # --------------------------------------------------------------------------
+# network quality (net_samples, written by perfmon/netmon.py)
+# --------------------------------------------------------------------------
+
+NET_TARGETS = ("gw", "isp", "inet", "game")
+NET_TARGET_PL = {"gw": "router", "isp": "pierwszy węzeł operatora", "inet": "internet", "game": "serwer gry"}
+NET_KINDS = ["net_down", "net_link_down", "packet_loss", "latency_spike", "game_lag", "wifi_weak"]
+NET_COLS = ["gw_ms", "gw_loss", "isp_ms", "isp_loss", "inet_ms", "inet_loss", "game_ms", "game_loss", "dns_ms", "link",
+            "wifi_signal", "wifi_rssi"]
+NET_DOWNLOAD_KBS = 2000  # net_rx_kbs above this during a latency spike = a download is saturating the line
+_REASON = re.compile(r"(?<![A-Za-z])Reason=([^;\]\r\n]+)")
+_REASON_CODE = re.compile(r"ReasonCode=(\d+)")
+
+
+def _has_net(con):
+    return bool(_table_cols(con, "net_samples"))
+
+
+def _net_rows(con, t0, t1):
+    if not _has_net(con):
+        return []
+    return _rows(con, f"SELECT ts, session, {','.join(NET_COLS)}, extra FROM net_samples WHERE ts BETWEEN ? AND ? "
+                      "ORDER BY ts", (float(t0), float(t1)))
+
+
+def _ms_stats(vals):
+    return {"avg": _r(sum(vals) / len(vals), 1) if vals else None, "p50": _r(_pct(vals, 0.5), 1),
+            "p95": _r(_pct(vals, 0.95), 1), "p99": _r(_pct(vals, 0.99), 1), "max": _r(max(vals), 1) if vals else None}
+
+
+def _net_target(rows, k):
+    ms = [r[f"{k}_ms"] for r in rows if r[f"{k}_ms"] is not None]
+    losses = [r[f"{k}_loss"] for r in rows if r[f"{k}_loss"] is not None]
+    # jitter = mean absolute difference of rtts in consecutive seconds
+    diffs, prev = [], None
+    for r in rows:
+        v = r[f"{k}_ms"]
+        if v is not None and prev is not None and r["ts"] - prev[0] <= 2.5:
+            diffs.append(abs(v - prev[1]))
+        prev = (r["ts"], v) if v is not None else None
+    d = _ms_stats(ms)
+    d.update(jitter=_r(sum(diffs) / len(diffs), 2) if diffs else None, probes=len(losses),
+             loss_pct=_r(100 * sum(losses) / len(losses), 2) if losses else None,
+             loss_seconds=sum(1 for v in losses if v > 0))
+    return d
+
+
+def _net_wifi_disconnects(con, t0, t1):
+    out = []
+    for e in _rows(con, "SELECT ts, message FROM events WHERE provider LIKE '%WLAN-AutoConfig%' AND event_id=8003 "
+                        "AND ts BETWEEN ? AND ? ORDER BY ts", (t0, t1)):
+        msg = e["message"] or ""
+        m, c = _REASON.search(msg), _REASON_CODE.search(msg)
+        code = int(c.group(1)) if c else None
+        out.append({"ts": e["ts"], "time": fmt_ts(e["ts"]), "reason_code": code,
+                    "reason": m.group(1).strip() if m else None, "user_initiated": code == 3})
+    return out
+
+
+def net_summary(con, t0, t1):
+    """Network quality over a time range: per-target latency/jitter/loss, DNS, link, Wi-Fi, NIC errors, incidents,
+    and a short Polish verdict. Always returns the same shape (empty stats when there is no net data)."""
+    t0, t1 = float(t0), float(t1)
+    rows = _net_rows(con, t0, t1)
+    rep = {"from": fmt_ts(t0), "to": fmt_ts(t1), "seconds": len(rows), "targets": {}, "dns": None,
+           "disconnected_s": 0, "link_s": {}, "wifi": None, "nic_errors": {}, "incidents": [], "verdict": []}
+    rep["targets"] = {k: _net_target([], k) for k in NET_TARGETS}
+    if _has_net(con):
+        rep["incidents"] = incidents_between(con, t0, t1, kinds=NET_KINDS)
+    if not rows:
+        rep["verdict"] = ["Brak danych sieciowych w tym zakresie (monitor sieci nie działał lub starsza baza)."]
+        return rep
+    rep["targets"] = {k: _net_target(rows, k) for k in NET_TARGETS}
+    dns = [r["dns_ms"] for r in rows if r["dns_ms"] is not None]
+    extras = []
+    for r in rows:
+        x = _json(r["extra"]) if r["extra"] else None
+        extras.append(x if isinstance(x, dict) else {})
+    fails = sum(1 for x in extras if x.get("dns_failed"))
+    rep["dns"] = {"probes": len(dns) + fails, "avg": _r(sum(dns) / len(dns), 1) if dns else None,
+                  "p95": _r(_pct(dns, 0.95), 1), "failures": fails}
+    rep["disconnected_s"] = sum(1 for r in rows if r["link"] is None)
+    rep["link_s"] = dict(Counter(r["link"] for r in rows if r["link"]))
+    nic = Counter()
+    for x in extras:
+        if isinstance(x.get("nic_errors"), dict):
+            for k, v in x["nic_errors"].items():
+                nic[k] += v or 0
+    rep["nic_errors"] = {**nic, "total": sum(nic.values())} if nic else {}
+
+    sig = [r["wifi_signal"] for r in rows if r["wifi_signal"] is not None]
+    rssi = [r["wifi_rssi"] for r in rows if r["wifi_rssi"] is not None]
+    bssids = list(dict.fromkeys(x["wifi_bssid"] for x in extras if x.get("wifi_bssid")))
+    chans = list(dict.fromkeys(x["wifi_channel"] for x in extras if x.get("wifi_channel") is not None))
+    ssids = list(dict.fromkeys(x["wifi_ssid"] for x in extras if x.get("wifi_ssid")))
+    disc = _net_wifi_disconnects(con, t0, t1)
+    if sig or rssi or disc:
+        rep["wifi"] = {
+            "seconds": len(sig), "signal_min": min(sig) if sig else None,
+            "signal_avg": _r(sum(sig) / len(sig), 1) if sig else None,
+            "rssi_min": min(rssi) if rssi else None, "rssi_max": max(rssi) if rssi else None,
+            "ssids": ssids, "bssids": bssids, "channels": chans,
+            "disconnects": len(disc), "unexpected_disconnects": sum(1 for d in disc if not d["user_initiated"]),
+            "disconnect_events": disc}
+    rep["verdict"] = _net_verdict(con, rep, t0, t1)
+    return rep
+
+
+def _net_verdict(con, rep, t0, t1):
+    v = []
+    tg = rep["targets"]
+    n = rep["seconds"]
+    if rep["disconnected_s"]:
+        v.append(f"Brak łącza sieciowego przez {rep['disconnected_s']} s ({100 * rep['disconnected_s'] / n:.1f}% czasu)")
+    # loss: report at the closest-to-user hop that already shows it, that is where the problem starts
+    lossy = [(k, tg[k]["loss_pct"]) for k in NET_TARGETS if (tg[k]["loss_pct"] or 0) >= 1]
+    if lossy:
+        k, pct = lossy[0]
+        where = {"gw": "problem po stronie Wi-Fi/routera (sieci domowej)",
+                 "isp": "problem po stronie operatora (łącze/pierwszy węzeł)",
+                 "inet": "problem w internecie lub u operatora",
+                 "game": "problem na trasie do serwera gry"}[k]
+        v.append(f"Utrata pakietów {pct:.1f}% ({NET_TARGET_PL[k]}) - {where}")
+    for k in NET_TARGETS:
+        t = tg[k]
+        if t["probes"] < 20 or t["p50"] is None:
+            continue
+        if t["p99"] > max(3 * t["p50"], t["p50"] + 40):
+            v.append(f"Skoki pingu do: {NET_TARGET_PL[k]} (mediana {t['p50']} ms, p99 {t['p99']} ms, max {t['max']} ms)")
+        elif (t["jitter"] or 0) > max(5, 0.5 * t["p50"]):
+            v.append(f"Niestabilny ping do: {NET_TARGET_PL[k]} (jitter {t['jitter']} ms przy medianie {t['p50']} ms)")
+    gw = tg.get("gw") or {}
+    if (gw.get("p95") or 0) > 15 and rep["link_s"].get("wifi"):
+        v.append(f"Wysokie opóźnienie do routera przez Wi-Fi (p95 {gw['p95']} ms) - zakłócenia/zasięg, rozważ kabel")
+    dns = rep["dns"] or {}
+    if dns.get("failures"):
+        v.append(f"Błędy DNS: {dns['failures']} (serwer DNS operatora/routera)")
+    elif (dns.get("p95") or 0) > 150:
+        v.append(f"Wolny DNS (p95 {dns['p95']} ms) - rozważ 1.1.1.1 / 8.8.8.8")
+    w = rep["wifi"]
+    if w:
+        if w["signal_min"] is not None and w["signal_min"] < 40:
+            v.append(f"Słaby sygnał Wi-Fi (min {w['signal_min']}%, śr. {w['signal_avg']}%)")
+        if w["unexpected_disconnects"]:
+            v.append(f"{w['unexpected_disconnects']} nieoczekiwanych rozłączeń Wi-Fi")
+        if len(w["bssids"]) > 1:
+            v.append(f"Zmiana punktu dostępowego Wi-Fi ({len(w['bssids'])} BSSID) - roaming może dawać przerwy")
+    if rep["nic_errors"].get("total"):
+        v.append(f"Błędy karty sieciowej: {rep['nic_errors']['total']} (kabel/sterownik)")
+    spikes = [i for i in rep["incidents"] if i["kind"] in ("latency_spike", "packet_loss", "game_lag")]
+    if spikes and "net_rx_kbs" in _table_cols(con, "samples"):
+        heavy = 0
+        for i in spikes:
+            if i["kind"] != "latency_spike":
+                continue
+            a = _one(con, "SELECT AVG(net_rx_kbs) AS a FROM samples WHERE ts BETWEEN ? AND ?",
+                     (i["ts"], i["end_ts"] or i["ts"] + 30))
+            if a and (a["a"] or 0) >= NET_DOWNLOAD_KBS:
+                heavy += 1
+        if heavy:
+            v.append(f"Skoki pingu w trakcie pobierania ({heavy}) - łącze zapchane; ogranicz pobieranie lub włącz QoS/SQM")
+    if not v:
+        inet = tg.get("inet") or {}
+        v.append("Ping stabilny" + (f" (internet: mediana {inet['p50']} ms, p99 {inet['p99']} ms)" if inet.get("p50") is not None else ""))
+    return v
+
+
+def net_series(con, t0, t1, max_points=1500):
+    """Chart series like series(): ts + gw/isp/inet/game ms (max per bucket), inet_loss in % (max), wifi_signal (min)."""
+    t0, t1 = float(t0), float(t1)
+    cols = ["gw_ms", "isp_ms", "inet_ms", "game_ms", "inet_loss", "wifi_signal"]
+    if not _has_net(con):
+        return {"ts": [], "step_s": 1.0, **{c: [] for c in cols}}
+    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
+    rows = con.execute("SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, MAX(gw_ms) AS gw_ms, MAX(isp_ms) AS isp_ms, "
+                       "MAX(inet_ms) AS inet_ms, MAX(game_ms) AS game_ms, MAX(inet_loss) AS inet_loss, "
+                       "MIN(wifi_signal) AS wifi_signal FROM net_samples WHERE ts BETWEEN ? AND ? GROUP BY b ORDER BY b",
+                       (t0, step, t0, t1)).fetchall()
+    out = {"ts": [r["ts"] for r in rows], "step_s": step}
+    for c in cols:
+        if c == "inet_loss":
+            out[c] = [_r(100 * r[c], 1) if r[c] is not None else None for r in rows]
+        else:
+            out[c] = [_r(r[c], 2) for r in rows]
+    return out
+
+
+def _net_bad_seconds(rows):
+    """Timestamps of seconds with packet loss or a latency spike on any target (spike = well above that target's median)."""
+    med = {k: _pct([r[f"{k}_ms"] for r in rows if r[f"{k}_ms"] is not None], 0.5) for k in NET_TARGETS}
+    bad = []
+    for r in rows:
+        for k in NET_TARGETS:
+            ms, loss, m = r[f"{k}_ms"], r[f"{k}_loss"], med[k]
+            if (loss or 0) > 0 or (ms is not None and m is not None and ms > max(2 * m, m + 30)):
+                bad.append(r["ts"])
+                break
+    return bad
+
+
+def net_correlation(con, rows, stutter_ts, t0, t1, window=2.0):
+    """How many stutters fall within +-window s of a lossy / spiking network second (network lag vs local stutter)."""
+    bad = _net_bad_seconds(rows)
+    near = sum(1 for t in stutter_ts if bad and bisect.bisect_right(bad, t + window) - bisect.bisect_left(bad, t - window) > 0)
+    covered = len({int(b + d) for b in bad for d in range(-int(window), int(window) + 1)})
+    return {"bad_seconds": len(bad), "stutters": len(stutter_ts), "stutters_near_net_problem": near,
+            "stutters_near_net_problem_pct": _r(100 * near / len(stutter_ts)) if stutter_ts else None,
+            "chance_pct": _r(100 * min(covered, max(1, t1 - t0)) / max(1.0, t1 - t0)),
+            "window_s": window}
+
+
+# --------------------------------------------------------------------------
 # health / diagnosis
 # --------------------------------------------------------------------------
 
-_KV = re.compile(r"(\w+)=([^;\]]*)")
+_KV =re.compile(r"(\w+)=([^;\]]*)")
 
 
 def parse_kernel_power_41(message):
@@ -731,6 +984,22 @@ def diagnose(rep, con=None, t0=None):
                 f"Od {c['first']} do {c['last']}. " + (
                     "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
+    net_titles = {"net_down": "brak internetu", "net_link_down": "brak łącza (Wi-Fi/kabel rozłączony)",
+                  "packet_loss": "utrata pakietów", "latency_spike": "skok pingu", "game_lag": "lag do serwera gry",
+                  "wifi_weak": "słaby sygnał Wi-Fi"}
+    nets = {k: bk[k] for k in net_titles if bk.get(k)}
+    if nets:
+        where = Counter()
+        if con is not None and t0 is not None:
+            for i in incidents_between(con, t0, time.time(), kinds=list(nets)):
+                w = i["details"].get("where") if isinstance(i["details"], dict) else None
+                if w:
+                    where[w] += 1
+        loc = {"home": "dom (Wi-Fi/router)", "isp": "operator", "internet": "internet", "game": "serwer gry"}
+        add("serious" if nets.get("net_down") or nets.get("net_link_down") else "warning",
+            "Problemy sieciowe: " + ", ".join(f"{net_titles[k]} {v}x" for k, v in nets.items()),
+            ("Miejsce problemu: " + ", ".join(f"{loc.get(w, w)} {n}x" for w, n in where.most_common()) + ". " if where else "") +
+            "Szczegóły: `pm net --since " + str(rep["days"]) + "d`.")
     for k, name, desc in (
             ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
             ("gpu_driver", "problem sterownika GPU", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
