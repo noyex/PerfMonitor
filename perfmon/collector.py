@@ -15,8 +15,8 @@ from pathlib import Path
 
 import psutil
 
-from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, sysinfo
-from .events import EventReader, classify
+from . import config, crashinfo, db, diskinfo, gamectx, gpuproc, marks, procwatch, sysinfo
+from .events import LOGS, EventReader, classify
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
 from .watchdog import Watchdog, foreground, user_idle_s
@@ -72,6 +72,7 @@ class Collector:
         self.gpu_procs = gpuproc.GpuProcs()
         self.game_sampler = gpuproc.GameProcSampler()
         self.last_gpu_proc = 0.0
+        self.procwatch = procwatch.ProcWatch(self.cfg)
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -260,11 +261,13 @@ class Collector:
         now = time.time()
         rows, cur = [], {}
         ncpu = psutil.cpu_count()
-        for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info"]):
+        snap = {}   # pid -> (create_time, name, ppid) for the process start/stop log
+        for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info", "ppid", "create_time"]):
             try:
                 i = pr.info
                 if i["pid"] == 0:
                     continue  # "System Idle Process": idle time, not load
+                snap[i["pid"]] = (i["create_time"], i["name"], i["ppid"])
                 ct = i["cpu_times"]
                 cpu_s = ct.user + ct.system
                 try:
@@ -289,6 +292,8 @@ class Collector:
                 if kind == "io" and io < 0.5:
                     continue
                 out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2), None, None))
+        session = next(iter(self.games.values()))["session"] if self.games else None
+        pe = self.procwatch.update(now, snap, session)
         game_rows = []
         if now - self.last_gpu_proc >= self.cfg.get("gpu_proc_interval_s", 5) - 0.5:
             self.last_gpu_proc = now
@@ -296,6 +301,9 @@ class Collector:
         with self.lock:
             self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs, gpu_pct, vram_mb) "
                                  "VALUES (?,?,?,?,?,?,?,?,?)", out)
+            if pe:
+                self.con.executemany("INSERT INTO proc_events(ts, pid, name, ppid, parent_name, action, session, path) "
+                                     "VALUES (:ts,:pid,:name,:ppid,:parent_name,:action,:session,:path)", pe)
             for g in game_rows:
                 self.con.execute(f"INSERT OR REPLACE INTO game_proc ({','.join(g)}) VALUES ({','.join('?' * len(g))})",
                                  list(g.values()))
@@ -452,11 +460,13 @@ class Collector:
             last = db.get_meta(self.con, "events_since")
         since = float(last) if last else time.time() - 14 * 86400
         newest = since
-        for logname in ("System", "Application"):
+        for logname in LOGS:
             for ev in self.events.read_since(logname, since):
                 newest = max(newest, ev["ts"])
                 cur = self.exec("INSERT OR IGNORE INTO events(ts, log, provider, event_id, level, record_id, message, data) "
                                 "VALUES (:ts,:log,:provider,:event_id,:level,:record_id,:message,:data)", ev)
+                if cur.rowcount and logname == procwatch.DEFENDER_LOG_NAME:
+                    self.defender_event(ev)
                 if cur.rowcount:
                     c = classify(ev)
                     if c:
@@ -467,6 +477,19 @@ class Collector:
         with self.lock:
             db.set_meta(self.con, "events_since", newest)
             self.con.commit()
+
+    def defender_event(self, ev):
+        """Defender scan start (1000) opens a defender_scan incident, its 1001/1002 (same Scan ID) closes it."""
+        info = procwatch.defender_scan_info(ev)
+        if not info:
+            return
+        sid = info["id"] or f"type{info['type_index']}"
+        if info["kind"] == "start":
+            kind = {"1": "szybki", "2": "pełny", "3": "niestandardowy"}.get(str(info["params_index"]), "")
+            self.incident("defender_scan", "info", f"Skan Windows Defender {kind}".strip(), {"scan_id": sid}, ts=ev["ts"])
+        else:
+            self.exec("UPDATE incidents SET end_ts=? WHERE kind='defender_scan' AND end_ts IS NULL AND details LIKE ?",
+                      (ev["ts"], f'%"{sid}"%'))
 
     def _bsod_cause(self, iid):
         """Optional: `cdb !analyze -v` on the newest minidump (only when Debugging Tools are installed)."""
@@ -485,7 +508,7 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             self.name_cache.clear()
 

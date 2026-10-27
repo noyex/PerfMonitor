@@ -71,12 +71,20 @@ CREATE TABLE IF NOT EXISTS game_proc (          -- the game process itself every
     shader_bytes INTEGER,                        -- size of the driver/Steam shader caches (growth = compiling)
     PRIMARY KEY (session, ts)
 );
+CREATE TABLE IF NOT EXISTS proc_events (        -- processes started/stopped (diff of the ~5 s process list, perfmon/procwatch.py)
+    ts REAL, pid INTEGER, name TEXT,
+    ppid INTEGER, parent_name TEXT,
+    action TEXT,                                 -- start | stop
+    session INTEGER,                             -- game session id if running
+    path TEXT                                    -- exe path, only for starts during a game session
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
+CREATE INDEX IF NOT EXISTS ix_proc_events_ts ON proc_events(ts);
 """
 
 

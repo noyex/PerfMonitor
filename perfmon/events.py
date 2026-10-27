@@ -12,6 +12,9 @@ from . import diskinfo
 log = logging.getLogger("perfmon.events")
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
+DEFENDER_LOG = "Microsoft-Windows-Windows Defender/Operational"
+LOGS = ("System", "Application", DEFENDER_LOG)
+
 # Informational events we also want (level 4)
 INFO_KEEP = {
     ("System", 1074),   # who initiated shutdown/restart
@@ -22,6 +25,9 @@ INFO_KEEP = {
     ("System", 7045),   # new service installed
     ("Application", 10001),  # Winsrv: application blocked shutdown
     ("Application", 1001),   # WER: error report (crash details)
+    (DEFENDER_LOG, 1000), (DEFENDER_LOG, 1001), (DEFENDER_LOG, 1002),  # scan started / finished / stopped
+    (DEFENDER_LOG, 1116), (DEFENDER_LOG, 1117),  # malware detected / action taken
+    (DEFENDER_LOG, 5001), (DEFENDER_LOG, 5007),  # real-time protection disabled / configuration changed
 }
 NOISE = {
     ("Microsoft-Windows-DistributedCOM", 10016),
@@ -172,6 +178,8 @@ def classify(ev: dict):
         return "app_crash", "serious", f"Crash aplikacji: {exe_from_message(m, first_field=True)}"
     if i == 1002 and p == "Application Hang":
         return "app_hang", "serious", f"Aplikacja przestała odpowiadać: {exe_from_message(m)}"
+    if p == "Microsoft-Windows-Windows Defender" and i in (1116, 1117):
+        return "malware", "serious", f"Windows Defender wykrył zagrożenie ({i})"
     if p == "Microsoft-Windows-Kernel-Processor-Power" and i == 37:
         return "throttle", "warning", "Firmware ograniczył taktowanie CPU (throttling)"
     if p == "stornvme" and i == 129:

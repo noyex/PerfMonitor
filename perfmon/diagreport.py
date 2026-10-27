@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import crashinfo, diskinfo
+from . import config, crashinfo, diskinfo, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -33,6 +33,8 @@ class StutterExt:
         self.gpu_ts = [p["ts"] for p in self.gpu]
         vt = con.execute("SELECT MAX(gpu_vram_total_mb) FROM samples WHERE ts BETWEEN ? AND ?", (start, end)).fetchone()[0]
         self.shared_limit = vram_shared_limit(vt)
+        self.culprits = config.load().get("background_culprits")
+        self.starts = procwatch.StartCauses(con, start, end, row["exe"], self.culprits)
         self.resets = [r[0] for r in con.execute("SELECT ts FROM incidents WHERE kind IN ('nvme_reset','disk_retry') "
                                                  "AND ts BETWEEN ? AND ? ORDER BY ts", (start - 15, end + 15))]
 
@@ -64,6 +66,7 @@ class StutterExt:
         if self.vram_shared(ts):
             causes.append("vram_shared")
         causes += [f"background_gpu:{n}" for n in self.background_gpu(ts)]
+        causes += self.starts.causes(ts)
         return causes
 
 
@@ -106,6 +109,7 @@ def extend(con, rep, row, start, end):
                                          if row["end_reason"] == "crash" else None)
     rep["game_proc"] = game_proc_summary(con, row["id"])
     rep["disk"] = diskinfo.session_disk(con, start, end, row["path"], row["id"])
+    rep["proc_events"] = procwatch.session_proc_events(con, start, end, row["exe"], config.load().get("background_culprits"))
     rep["gpu_background"] = gpu_background(con, start, end, row["exe"])
 
 
@@ -124,6 +128,7 @@ def findings(rep, row):
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
     f += diskinfo.findings(rep)
+    f += procwatch.findings(rep)
     bgc = {k.split(":", 1)[1]: v for k, v in cc.items() if k.startswith("background_gpu:")}
     heavy = [b for b in rep.get("gpu_background") or [] if (b["avg_pct"] or 0) >= 10 or (b["max_pct"] or 0) >= 30]
     if bgc or heavy:
@@ -152,3 +157,13 @@ def health_findings(con, rep):
                   "detail": "Przybyło błędów nieskorygowanych lub zużycie nośnika przekroczyło 90% - kopia zapasowa, "
                             "sprawdź pm sysinfo (tabela zdrowia dysków)."})
     return f
+
+
+def diag_markers(con, t0, t1):
+    """Chart markers: user marks and Defender scans (timeline_markers(diag=True))."""
+    out = []
+    for i in an.incidents_between(con, t0, t1, kinds=["user_mark", "defender_scan"]):
+        d = i["details"] if isinstance(i["details"], dict) else {}
+        out.append({"ts": i["ts"], "end_ts": i["end_ts"], "kind": "mark" if i["kind"] == "user_mark" else "scan",
+                    "label": (d.get("text") or "Znacznik") if i["kind"] == "user_mark" else i["title"], "session": None})
+    return out

@@ -864,8 +864,10 @@ def compare(con, exe=None, group_by="week", since=None):
     return rows
 
 
-def timeline_markers(con, exe=None, since=None):
-    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions."""
+def timeline_markers(con, exe=None, since=None, diag=False):
+    """Changes (driver / game update / OS / BIOS / config) detected between consecutive sessions.
+
+    diag: also user marks and Defender scans (chart markers; not numbered points for before/after comparisons)."""
     t0 = parse_time(since) if since is not None else 0
     ss = _session_metrics(con, None, None)   # full history so the first in-range change is detected
     markers = []
@@ -911,6 +913,8 @@ def timeline_markers(con, exe=None, since=None):
                 markers.append({"ts": bts, "kind": "game_update", "label": f"{e}: Steam build {ba} -> {bb}", "session": bs["id"]})
     for i in incidents_between(con, t0, time.time(), kinds="config_change"):
         markers.append({"ts": i["ts"], "kind": "config", "label": i["title"], "session": None})
+    if diag:
+        markers += diagreport.diag_markers(con, t0, time.time())
     markers.sort(key=lambda m: m["ts"])
     for m in markers:
         m["time"] = fmt_ts(m["ts"])

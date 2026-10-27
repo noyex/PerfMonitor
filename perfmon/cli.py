@@ -174,6 +174,13 @@ def cmd_session(con, a):
             f"{', ' + d['game_disk_bus'] if d.get('game_disk_bus') else ''}; odczyt gry śr. "
             f"{cell((d.get('game_read') or {}).get('avg_mbs'))} / max {cell((d.get('game_read') or {}).get('max_mbs'))} MB/s)")
         table(d["per_disk"])
+    pe = r.get("proc_events") or {}
+    if pe.get("culprits") or pe.get("defender_scans"):
+        out("### Procesy w tle startujące w trakcie sesji")
+        table(pe.get("culprits") or [], ["name", "starts", "first_time", "parent_name", "heavy_pct"])
+        for s in pe.get("defender_scans") or []:
+            out(f"- Skan Windows Defender {s['start_time']} -> {s['end_time'] or 'trwa'}"
+                + (f" ({s['duration_s']} s)" if s.get("duration_s") else ""))
     if r.get("gpu_background"):
         out("### Procesy w tle na GPU")
         table(r["gpu_background"])
@@ -279,6 +286,13 @@ def cmd_at(con, a):
 
 def cmd_procs(con, a):
     t0, t1 = an.parse_time(a.frm), an.parse_time(a.to)
+    if a.events:
+        from perfmon import procwatch
+        rows = procwatch.events_list(con, t0, t1, 1000)
+        if a.json:
+            return dump(rows)
+        out(f"## Starty/zakończenia procesów {an.fmt_ts(t0)} -> {an.fmt_ts(t1)}")
+        return table(rows, ["time", "action", "name", "pid", "parent_name", "session"])
     if a.json:
         rows = an._rows(con, "SELECT * FROM procs WHERE kind=? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 2000", (a.kind, t0, t1))
         return dump(rows)
@@ -497,6 +511,7 @@ def build():
     s.add_argument("frm", metavar="FROM")
     s.add_argument("to", metavar="TO", nargs="?", default="now")
     s.add_argument("--kind", default="cpu", choices=["cpu", "mem", "io", "gpu"])
+    s.add_argument("--events", action="store_true", help="process starts/stops instead of top processes")
     add("sysinfo", cmd_sysinfo).add_argument("--diff", action="store_true")
     add("schema", cmd_schema)
     add("sql", cmd_sql).add_argument("query")
