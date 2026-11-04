@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS etw_captures (       -- ETW black box dumps (perfmon/
     status TEXT,                                 -- captured | analyzed | failed
     summary TEXT                                 -- JSON: top DPC/ISR drivers, disk I/O per process, timings
 );
+CREATE TABLE IF NOT EXISTS net_samples (        -- network quality every 1 s (perfmon/netmon.py)
+    ts REAL PRIMARY KEY,
+    session INTEGER,                             -- game session id if running
+    gw_ms REAL, gw_loss REAL,                    -- ping to the router (default gateway); loss = 0..1 this second
+    isp_ms REAL, isp_loss REAL,                  -- ping to the first operator router behind it
+    inet_ms REAL, inet_loss REAL,                -- ping to internet targets (1.1.1.1, 8.8.8.8 averaged)
+    game_ms REAL, game_loss REAL,                -- ping to the game server (when detected and it answers ICMP)
+    dns_ms REAL,                                 -- uncached DNS lookup time, every 30 s (NULL = not probed / failed)
+    link TEXT,                                   -- wifi | ethernet | NULL = no route (disconnected)
+    wifi_signal INTEGER, wifi_rssi INTEGER,      -- Wi-Fi signal quality % / dBm
+    extra TEXT                                   -- JSON, only what changed: gateway, isp_hop, adapter, wifi_*,
+                                                 -- game_ip, nic_errors, dns_failed
+);                                               -- *_ms NULL = lost or not probed; *_loss NULL = not probed
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS hw_detail (          -- UV/OC telemetry: every 1 s during game/stress sessions, every 10 s otherwise
     ts REAL PRIMARY KEY, session INTEGER,
@@ -125,6 +138,7 @@ CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
 CREATE INDEX IF NOT EXISTS ix_proc_events_ts ON proc_events(ts);
 CREATE INDEX IF NOT EXISTS ix_hw_detail_session ON hw_detail(session);
+CREATE INDEX IF NOT EXISTS ix_net_session ON net_samples(session);
 """
 
 

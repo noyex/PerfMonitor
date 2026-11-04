@@ -212,6 +212,8 @@ def cmd_session(con, a):
     if r.get("gpu_background"):
         out("### Procesy w tle na GPU")
         table(r["gpu_background"])
+    if r.get("net", {}).get("seconds"):
+        print_net(r["net"], "Sieć w trakcie sesji")
     if r["incidents"]:
         out("### Incydenty w trakcie sesji")
         table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
@@ -241,6 +243,55 @@ def cmd_mark(con, a):
     out(f"Zapisano znacznik na {time.strftime('%H:%M:%S', time.localtime(ts))}"
         + ("" if s["collector_alive"] else " (UWAGA: kolektor nie działa, znacznik zostanie dodany po jego starcie)"))
     out(f"Podgląd: pm at {time.strftime('%H:%M:%S', time.localtime(ts))} --window 30")
+
+
+def print_net(n, title="Sieć"):
+    """Compact network summary (shared by pm net / session / range)."""
+    out(f"### {title}")
+    if not n or not n.get("seconds"):
+        return out("_(brak danych sieciowych)_")
+    rows = []
+    for k, label in (("gw", "router"), ("isp", "operator"), ("inet", "internet"), ("game", "serwer gry")):
+        t = (n.get("targets") or {}).get(k) or {}
+        if t.get("probes"):
+            rows.append({"cel": label, "avg": t["avg"], "p50": t["p50"], "p95": t["p95"], "p99": t["p99"], "max": t["max"],
+                         "jitter": t["jitter"], "loss_%": t["loss_pct"], "próbki": t["probes"]})
+    table(rows)
+    d = n.get("dns") or {}
+    extra = {"DNS avg/p95 ms": f"{d['avg']}/{d['p95']}" if d.get("avg") is not None else None,
+             "błędy DNS": d.get("failures") or None, "brak łącza [s]": n.get("disconnected_s") or None,
+             "łącze [s]": n.get("link_s"), "błędy karty": n.get("nic_errors")}
+    kv(extra)
+    w = n.get("wifi")
+    if w:
+        kv({"sygnał min/śr %": f"{w['signal_min']}/{w['signal_avg']}", "RSSI dBm": f"{w['rssi_min']}..{w['rssi_max']}",
+            "SSID": w["ssids"], "BSSID": w["bssids"], "kanały": w["channels"],
+            "rozłączenia (nieoczekiwane)": f"{w['disconnects']} ({w['unexpected_disconnects']})" if w["disconnects"] else None},
+           "Wi-Fi")
+        if w["disconnect_events"]:
+            table([{"time": e["time"], "reason_code": e["reason_code"], "reason": e["reason"],
+                    "user": e["user_initiated"]} for e in w["disconnect_events"][:15]])
+    cor = n.get("correlation")
+    if cor and cor.get("stutters"):
+        out(f"- Stuttery blisko problemu sieci (+-{cor['window_s']:g} s): {cor['stutters_near_net_problem']}/{cor['stutters']} "
+            f"({cor['stutters_near_net_problem_pct']}%; losowo spodziewane ~{cor['chance_pct']}%)")
+    if n.get("incidents"):
+        out("#### Incydenty sieci")
+        table([{"time": i["time"], "kind": i["kind"], "where": (i["details"] or {}).get("where") if isinstance(i["details"], dict) else None,
+                "dur_s": round(i["end_ts"] - i["ts"]) if i["end_ts"] else None, "title": i["title"]} for i in n["incidents"]])
+    out("#### Werdykt")
+    for v in n.get("verdict") or []:
+        out(f"- {v}")
+
+
+def cmd_net(con, a):
+    t0 = an.parse_time(a.frm) if a.frm else an.parse_time(a.since)
+    t1 = an.parse_time(a.to)
+    n = an.net_summary(con, t0, t1)
+    if a.json:
+        return dump(n)
+    out(f"## Sieć {n['from']} -> {n['to']} ({n['seconds']} próbek)")
+    print_net(n, "Jakość połączenia")
 
 
 def cmd_incidents(con, a):
@@ -286,6 +337,8 @@ def cmd_range(con, a):
     table(r["top_procs"]["io"])
     out("### Sesje gier w zakresie")
     table(r["sessions"], ["id", "exe", "fps_avg", "fps_1low", "end_reason"])
+    if r.get("net", {}).get("seconds"):
+        print_net(r["net"])
 
 
 def cmd_at(con, a):
@@ -299,6 +352,15 @@ def cmd_at(con, a):
     table(r["samples"], ["time", "cpu_total", "cpu_core_max", "cpu_temp", "gpu_load", "gpu_temp", "gpu_hotspot",
                          "gpu_vram_mb", "ram_pct", "hard_faults_s", "disk_lat_ms", "dpc_pct", "ui_ms", "dwm_ms",
                          "fg_exe", "fg_hung"])
+    nt = r["net"]
+    if nt["samples"]:
+        out("### Sieć (ms; loss w %; link/Wi-Fi)")
+        table([{"time": x["time"], "gw": x["gw_ms"], "isp": x["isp_ms"], "inet": x["inet_ms"], "game": x["game_ms"],
+                "loss_inet": None if x["inet_loss"] is None else round(100 * x["inet_loss"]),
+                "loss_gw": None if x["gw_loss"] is None else round(100 * x["gw_loss"]),
+                "link": x["link"] or "BRAK", "wifi_%": x["wifi_signal"], "dns": x["dns_ms"]}
+               for x in nt["samples"] if abs(x["t_rel"]) <= 15 or x["inet_loss"] or x["gw_loss"] or x["link"] is None])
+        out("Werdykt: " + "; ".join(nt["summary"]["verdict"]))
     out("### Incydenty")
     table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
     for i in r["incidents"]:
@@ -759,6 +821,10 @@ def build():
     s = add("range", cmd_range)
     s.add_argument("frm", metavar="FROM")
     s.add_argument("to", metavar="TO", nargs="?", default="now")
+    s = add("net", cmd_net, help="network quality summary (ping, loss, Wi-Fi, incidents)")
+    s.add_argument("frm", metavar="FROM", nargs="?", help="range start (default: --since)")
+    s.add_argument("to", metavar="TO", nargs="?", default="now")
+    s.add_argument("--since", default="24h")
     s = add("at", cmd_at)
     s.add_argument("time")
     s.add_argument("--window", type=float, default=30)

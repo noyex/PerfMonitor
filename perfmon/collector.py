@@ -18,6 +18,7 @@ import psutil
 from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, ocanalyze, ocmon,
                presentmon, procwatch, shadercache, sysinfo)
 from .events import LOGS, EventReader, classify
+from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
 from .presentmon import FrameCapture
 from .sensors import HardwareSensors, PdhCounters
 from .watchdog import Watchdog, foreground, user_idle_s
@@ -91,6 +92,7 @@ class Collector:
         self.etw = etwbox.EtwBox(self.cfg, self.save_etw_capture)
         self.etw_pending = []          # (due ts, capture id) waiting for analysis
         self.etw_proc = None           # running analysis process
+        self.net = NetMonitor(self.cfg, self.on_net_second, self._net_incident, self._close_incident)
         self.name_cache = {}
         self.proc_prev = {}
         self.last_proc = 0.0
@@ -135,6 +137,17 @@ class Collector:
                          json.dumps(details, ensure_ascii=False) if details is not None else None))
         return cur.lastrowid
 
+    def _net_incident(self, kind, severity, title, details, ts):
+        return self.incident(kind, severity, title, details, ts=ts)
+
+    def _close_incident(self, iid, ts):
+        self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (ts, iid))
+
+    def on_net_second(self, r):
+        cols = list(r)
+        self.exec(f"INSERT OR REPLACE INTO net_samples ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                  [r[c] for c in cols])
+
     def pname(self, pid):
         if pid is None:
             return None
@@ -170,6 +183,10 @@ class Collector:
                 "COALESCE((SELECT MAX(ts) FROM samples WHERE game_session=sessions.id), 0)) WHERE end_ts IS NULL"
                 # `pm stress` sessions survive a collector reload, not a reboot
                 + ("" if new_boot else " AND COALESCE(kind, 'game') NOT IN ('manual', 'idle_soak')"))
+            # Ongoing network incidents left open the same way end where network data stopped
+            self.con.execute(
+                f"UPDATE incidents SET end_ts=MAX(ts, COALESCE((SELECT MAX(ts) FROM net_samples), ts)) "
+                f"WHERE end_ts IS NULL AND kind IN ({','.join('?' * len(NET_INCIDENTS))})", NET_INCIDENTS)
             self.con.commit()
         presentmon.cleanup_stale_sessions()   # ETW sessions leaked by earlier collectors block new captures
         self.vacuum_setup()
@@ -528,6 +545,7 @@ class Collector:
         if not stress:
             self.shader.set_game(exe)   # the newest game: usually the only one
             self.shader_pid = pid
+            self.net.set_game(pid, name, sid)
         log.info("game start %s pid=%s session=%s", name, pid, sid)
 
     def on_frame_second(self, r):
@@ -562,6 +580,11 @@ class Collector:
         if pid == self.shader_pid:
             self.shader_pid = next(iter(self.games), None)
             self.shader.set_game(self.games[self.shader_pid]["path"] if self.shader_pid else None)
+        if not self.games:
+            self.net.set_game(None, None, None)
+        elif self.net.game and self.net.game[0] == pid:
+            other, og = next(iter(self.games.items()))
+            self.net.set_game(other, og["exe"], og["session"])
         if g["capture"]:
             g["capture"].stop()
         end = time.time()
@@ -715,7 +738,7 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             with self.lock:
                 etwbox.retention(self.con, self.etw.s, now)
@@ -900,6 +923,7 @@ class Collector:
     # ---------- main loop ----------
     def run(self):
         self.on_start()
+        self.net.start()
         interval = self.cfg["sample_interval_s"]
         nxt = time.time()
         while self.running:
@@ -941,6 +965,7 @@ class Collector:
         self.hotkey.stop()
         self.shader.stop()
         self.etw.stop()
+        self.net.stop()
         self.wd.stop()
         self.hw.close()
         with self.lock:

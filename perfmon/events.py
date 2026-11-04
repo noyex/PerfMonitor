@@ -14,7 +14,8 @@ log = logging.getLogger("perfmon.events")
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
 DEFENDER_LOG = "Microsoft-Windows-Windows Defender/Operational"
-LOGS = ("System", "Application", DEFENDER_LOG)
+WLAN_LOG = "Microsoft-Windows-WLAN-AutoConfig/Operational"
+LOGS = ("System", "Application", DEFENDER_LOG, WLAN_LOG)
 
 # Informational events we also want (level 4)
 INFO_KEEP = {
@@ -29,6 +30,8 @@ INFO_KEEP = {
     (DEFENDER_LOG, 1000), (DEFENDER_LOG, 1001), (DEFENDER_LOG, 1002),  # scan started / finished / stopped
     (DEFENDER_LOG, 1116), (DEFENDER_LOG, 1117),  # malware detected / action taken
     (DEFENDER_LOG, 5001), (DEFENDER_LOG, 5007),  # real-time protection disabled / configuration changed
+    (WLAN_LOG, 8001), (WLAN_LOG, 8002), (WLAN_LOG, 8003),  # Wi-Fi connected / failed to connect / disconnected
+    (WLAN_LOG, 8000),   # connect started
 }
 NOISE = {
     ("Microsoft-Windows-DistributedCOM", 10016),

@@ -32,6 +32,7 @@ ROUTES = {
     "series": lambda con, q: analyze.series(con, _f(q, "from"), _f(q, "to", time.time()),
                                             [c for c in q.get("cols", "").split(",") if c],
                                             int(q.get("points", 1500))),
+    "net_series": lambda con, q: analyze.net_series(con, _f(q, "from"), _f(q, "to", time.time()), int(q.get("points", 1500))),
     "frames": lambda con, q: analyze.frame_series(con, _f(q, "from"), _f(q, "to", time.time()),
                                                   int(q["session"]) if q.get("session") else None,
                                                   int(q.get("points", 1500))),
