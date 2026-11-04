@@ -43,6 +43,27 @@ Pages.oc = (() => {
         : null);
   };
 
+  // ---------- next step (advice only: nothing here changes BIOS / Adrenalin) ----------
+  const nextBlock = (r) => {
+    const box = h("section", { class: "tile oc-next" }, h("div", { class: "label" }, "Następny krok"));
+    if (r.blocked) {
+      const why = r.blockers.map((b) => b.what).join(", ");
+      box.append(h("p", { class: "oc-next-text" }, `${r.until ? `Strojenie poczeka do ${r.until.slice(0, 10)}` : "Strojenie jeszcze poczeka"}: ${why}.`));
+      return box;
+    }
+    const s = r.step;
+    const copy = () => navigator.clipboard.writeText(s.command).then(() => toast("Skopiowano"), () => toast(s.command));
+    box.append(
+      h("div", { class: "oc-next-title" }, s.title),
+      h("p", { class: "oc-note" }, s.where),
+      h("div", { class: "oc-cmdrow" }, h("code", { class: "oc-cmd" }, s.command), h("button", { class: "btn", onclick: copy }, "Kopiuj")),
+      s.note ? h("p", { class: "oc-note" }, s.note) : null,
+      r.test ? h("div", { class: "oc-checks" }, h("p", { class: "oc-note" }, r.test.what),
+        r.test.criteria.map((c) => h("span", { class: `sev${c.ok ? " good" : ""}` }, c.check))) : null,
+      r.rollback_if_bad ? h("p", { class: "oc-note" }, r.rollback_if_bad) : null);
+    return box;
+  };
+
   // ---------- profile comparison ----------
   const compareTable = (cmp, activeId) => {
     if (!cmp.rows.length) return h("div", { class: "empty" }, "Brak sesji tej gry z danymi UV/OC.");
@@ -247,6 +268,8 @@ Pages.oc = (() => {
         h("span", {}, `Ustawienia GPU zmieniły się ${fmtTime(ov.gpu_change.ts)}`, h("span", { class: "sub" }, ` · ${(ov.gpu_change.changes || []).slice(0, 3).join(", ")}`)),
         h("button", { class: "btn", onclick: () => editor(copyOf(active), st, reload) }, "Oznacz nowym profilem")));
     }
+    const next = await api("oc_next").catch(() => null);
+    if (next) view.append(nextBlock(next));
     if (st && !st.error) view.append(stabilityBlock(st));
     else if (!active) view.append(h("p", { class: "oc-note" }, "Żaden profil nie jest aktywny – wybierz go z listy „Aktywuj profil…”."));
 

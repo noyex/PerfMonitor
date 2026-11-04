@@ -48,3 +48,11 @@ tr.cur td:first-child { font-weight: 500; }
 .oc-actions { display: flex; gap: 8px; }
 
 @media (max-width: 1000px) { .oc-cores { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+
+.oc-next { margin-bottom: 16px; }
+.oc-next-title { font-size: 18px; font-weight: 600; margin-top: 6px; letter-spacing: -0.01em; }
+.oc-next-text { margin: 6px 0 0; font-size: 14px; }
+.oc-cmdrow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.oc-cmd { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.oc-checks { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 10px; }
+.oc-checks .oc-note { flex-basis: 100%; margin: 0 0 2px; }
