@@ -158,11 +158,11 @@ tbody tr:hover { background: var(--surface-2); }
 
 @media (max-width: 1000px) {
   .charts.two { grid-template-columns: 1fr; }
-  .shell { padding: 16px 16px 0; }
-  .shell::after { height: 8px; margin: 0 -16px; }
+  .shell { padding: 16px; }
+  .shell::after { display: none; }
   .brand { top: 16px; left: 16px; }
   main { padding-top: 48px; }
-  .dock { bottom: 8px; grid-template-columns: minmax(0, 1fr); }
+  .dock { position: static; grid-template-columns: minmax(0, 1fr); }
   .dock nav { overflow-x: auto; }
   .temps { padding: 0 8px 6px; flex-wrap: wrap; }
 }

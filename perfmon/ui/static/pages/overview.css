@@ -38,7 +38,8 @@
 
 @media (max-width: 1000px) {
   .ov { display: flex; flex-direction: column; gap: 16px; }
-  .ov-top { padding-top: 0; }
+  .ov-top { padding-top: 28px; }
   .ov h1 { margin-top: 20px; }
+  .ov-fps { align-self: stretch; padding-bottom: 0; }
   .ov-total { margin-top: 0; }
 }

@@ -167,6 +167,7 @@ void main(){
       sync();
     },
     pause: (on) => {
+      if (on === paused) return;
       paused = on;
       sync();
     },
