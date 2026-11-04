@@ -19,7 +19,8 @@ def baseline_ts(gameplay_ts, stutter_ts):
 
 
 def rank(stutter_tags, base_tags):
-    """[{tag, n, stutter_pct, base_pct, lift, verdict: confirmed|ambient|noise}], strongest first.
+    """[{tag, n, stutter_pct, base_pct, lift, verdict: confirmed|weak|ambient|noise}], strongest first.
+    weak = more common around stutters, but too few of them to be sure.
     Both arguments: one list of tags per stutter / per baseline second."""
     ns, nb = len(stutter_tags), len(base_tags)
     if not ns or not nb:
@@ -30,11 +31,11 @@ def rank(stutter_tags, base_tags):
     for tag, n in hits.items():
         sp, bp = 100 * n / ns, 100 * base[tag] / nb
         lift = sp / bp if bp else None
-        if n >= MIN_STUTTERS and sp >= MIN_SHARE_PCT and (lift is None or lift >= MIN_LIFT):
-            verdict = "confirmed"
+        if lift is None or lift >= MIN_LIFT:
+            verdict = "confirmed" if n >= MIN_STUTTERS and sp >= MIN_SHARE_PCT else "weak"
         else:
             verdict = "ambient" if bp >= AMBIENT_PCT else "noise"
         out.append({"tag": tag, "n": n, "stutter_pct": round(sp, 1), "base_pct": round(bp, 1),
                     "lift": round(lift, 1) if lift is not None else None, "verdict": verdict})
-    order = {"confirmed": 0, "ambient": 1, "noise": 2}
+    order = {"confirmed": 0, "weak": 1, "ambient": 2, "noise": 3}
     return sorted(out, key=lambda r: (order[r["verdict"]], -r["n"]))

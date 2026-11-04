@@ -121,7 +121,8 @@ def refresh_all(con, merge_summary):
     """Recompute stored bottlenecks and gameplay stats of finished sessions with the current rules."""
     rows = con.execute(f"SELECT id, start_ts, end_ts FROM sessions WHERE end_ts IS NOT NULL AND {an.GAMES_ONLY}").fetchall()
     for sid, start, end in rows:
-        extra = {"gameplay": gameplay.stats(con, sid, start, end)}
+        gp = gameplay.stats(con, sid, start, end)
+        extra = {"gameplay": gp} if gp else {}
         b = compute(con, sid, start, end)
         if b:
             extra["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}

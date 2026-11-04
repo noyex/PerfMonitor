@@ -586,7 +586,7 @@ class Collector:
                 if b:
                     summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
                     summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
-                    summ["gameplay"] = gameplay.stats(self.con, g["session"], g["start"], now)
+                    summ["gameplay"] = gameplay.stats(self.con, g["session"], g["start"], now) or {}
             except Exception:
                 log.exception("bottleneck for session %s", g["session"])
         self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)
@@ -830,7 +830,7 @@ class Collector:
             for _ in range(10000):
                 if not con.execute("PRAGMA freelist_count").fetchone()[0]:
                     break
-                con.execute("PRAGMA incremental_vacuum(500)")
+                con.execute("PRAGMA incremental_vacuum(500)").fetchall()   # each fetched row frees one page
                 time.sleep(0.05)
             db.set_meta(con, "last_vacuum", time.time())
             con.commit()

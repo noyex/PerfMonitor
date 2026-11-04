@@ -209,7 +209,7 @@ def interpret(code, module, exe, history=None):
         return {"verdict": f"Podejrzenie niestabilnego CPU/RAM: {len(history)} crashy w {len(modules)} różnych modułach",
                 "confidence": "medium",
                 "next_steps": ["Wyłącz na test EXPO / Curve Optimizer / PBO i zagraj tak samo długo",
-                               "Sprawdź błędy WHEA (pm incidents --kind whea) i stabilność w pm oc",
+                               "Sprawdź błędy WHEA (pm incidents --kind whea_corrected, --kind whea_fatal) i stabilność w pm oc",
                                "Test RAM: MemTest86 / TestMem5, test CPU: OCCT / y-cruncher"]}
     if m in GPU_MODULES:
         return {"verdict": f"Crash w sterowniku/API grafiki ({module}): sterownik GPU lub nakładka; sprawdź też undervolt GPU",

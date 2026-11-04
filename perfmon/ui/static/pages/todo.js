@@ -45,7 +45,7 @@ Pages.todo = (() => {
   // ---------- changes ----------
   const fact = (k, v) => (v ? h("div", { class: "td-fact" }, h("span", {}, k), h("span", {}, v)) : null);
 
-  const item = (i, n, testRunning) => h("details", { class: "td-item" },
+  const item = (i, n, testRunning, exe) => h("details", { class: "td-item" },
     h("summary", {},
       h("span", { class: "td-n" }, fmt(n)),
       h("span", { class: "td-main" },
@@ -54,7 +54,7 @@ Pages.todo = (() => {
       i.test ? verdict(i.test.verdict) : h("span", { class: "td-kind" }, KIND[i.kind] || "")),
     h("div", { class: "td-body" },
       fact("Jak", i.how), fact("Efekt", i.expected), fact("Ryzyko", i.risk), fact("Cofnięcie", i.undo),
-      testRunning ? null : h("button", { class: "btn", onclick: act({ action: "start", name: i.title, key: i.key }) }, "Zmieniłem to, zacznij test")));
+      testRunning ? null : h("button", { class: "btn", onclick: act({ action: "start", name: i.title, key: i.key, exe }) }, "Zmieniłem to, zacznij test")));
 
   const simple = (title, rows) => (rows.length
     ? h("section", { class: "td-sec" }, h("h2", {}, title),
@@ -70,7 +70,7 @@ Pages.todo = (() => {
       a.game ? h("span", { class: "sub" }, `${gameName(a.game)}${b.kind ? ` · ogranicza ${b.kind.toUpperCase().replace("_", " ")} przez ${fmt(b.share_pct)}% grania` : ""}`) : null));
     if (t.open) el.append(openTest(t.open));
     if (a.items.length) {
-      el.append(h("div", { class: "td-list" }, a.items.map((i, n) => item(i, n + 1, !!t.open))));
+      el.append(h("div", { class: "td-list" }, a.items.map((i, n) => item(i, n + 1, !!t.open, a.test_exe))));
     } else {
       el.append(h("div", { class: "empty" }, a.game ? "Nic nie wymaga zmiany." : "Za mało rozegranych sesji, żeby coś doradzić."));
     }

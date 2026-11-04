@@ -8,10 +8,11 @@ from collections import Counter
 MIN_GAMEPLAY_S = 120     # below this a session says nothing about FPS (launcher restarts, 40 s sessions)
 WARMUP_S = 30            # first seconds: shader warm-up, intro, loading
 IDLE_S = 30              # no input this long = cutscene, AFK, match wait
-MIN_GPU_LOAD = 60
+MIN_GPU_SHARE = 0.6      # of the session's median GPU load: relative, a CPU-limited game runs at low GPU load all along
 MIN_POWER_SHARE = 0.5    # of the session's p90 GPU power
 MAX_CPU_TOTAL = 85       # every core busy = loading or shader compilation
 MAX_FPS_X_MEDIAN = 3
+GAP_S = 3                # a hitch can dip the load of its own second: short gaps inside gameplay stay gameplay
 
 
 def _p90(vals):
@@ -29,6 +30,8 @@ def select(frames, samples, start=None):
     fps = sorted(f["fps"] for f in frames)
     median = fps[len(fps) // 2]
     p90 = _p90([s["gpu_power_w"] for s in samples if s["gpu_power_w"]])
+    loads = sorted(s["gpu_load"] for s in samples if s["gpu_load"] is not None)
+    min_load = MIN_GPU_SHARE * loads[len(loads) // 2] if loads else 0
     # the game may hand over to a child process, so "the game" = what was in the foreground most of the time
     top = Counter(s["fg_exe"] for s in samples if s["fg_exe"]).most_common(1)
     game_fg = top[0][0] if top else None
@@ -40,12 +43,20 @@ def select(frames, samples, start=None):
             continue
         if (s["user_idle_s"] or 0) > IDLE_S or (s["cpu_total"] or 0) > MAX_CPU_TOTAL:
             continue
-        if (s["gpu_load"] or 0) < MIN_GPU_LOAD or (game_fg and s["fg_exe"] != game_fg):
+        if (s["gpu_load"] or 0) < min_load or (game_fg and s["fg_exe"] != game_fg):
             continue
         if p90 and (s["gpu_power_w"] or 0) < MIN_POWER_SHARE * p90:
             continue
         out.append(f)
-    return out
+    return _fill_gaps(frames, out)
+
+
+def _fill_gaps(frames, kept):
+    ts = [int(f["ts"]) for f in kept]
+    gaps = [(a, b) for a, b in zip(ts, ts[1:]) if 1 < b - a <= GAP_S + 1]
+    fill = {t for a, b in gaps for t in range(a + 1, b)}
+    keep = set(ts) | fill
+    return [f for f in frames if int(f["ts"]) in keep]
 
 
 def session_rows(con, sid, start, end):
@@ -60,8 +71,11 @@ def session_rows(con, sid, start, end):
 
 
 def stats(con, sid, start, end):
-    """summary.gameplay: gameplay-only FPS / 1% low / stutters and whether the session is usable for comparisons."""
+    """summary.gameplay: gameplay-only FPS / 1% low / stutters and whether the session is usable for comparisons.
+    None without frames (no PresentMon, pruned by retention): nothing to judge, not a bad session."""
     frames, samples = session_rows(con, sid, start, end)
+    if not frames:
+        return None
     keep = select(frames, samples, start)
     secs = len(keep)
     out = {"seconds": secs, "usable": secs >= MIN_GAMEPLAY_S, "share_pct": round(100 * secs / max(1.0, end - start), 1)}

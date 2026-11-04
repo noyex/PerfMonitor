@@ -5,10 +5,10 @@ read go to `unknown` (with how to check), claims the data refutes go to `not_wor
 we never promise a percentage gain, only a before/after test can prove one."""
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from . import analyze as an
-from . import experiments, present
+from . import config, experiments, present
 
 MAIN_GAME_DAYS = 14
 RECENT_SESSIONS = 6
@@ -28,6 +28,7 @@ OWN_PROCS = {"python.exe", "pythonw.exe", "powershell.exe", "presentmon.exe", "d
              "audiodg.exe", "lsass.exe", "services.exe", "winlogon.exe", "wmiprvse.exe", "msmpeng.exe", "sihost.exe",
              "taskhostw.exe", "ctfmon.exe", "searchhost.exe", "runtimebroker.exe", "fontdrvhost.exe", "gamingservices.exe",
              "amdrsserv.exe", "explorer.exe", "conhost.exe", "wudfhost.exe", "dllhost.exe", "smss.exe"}
+_REPORTS = {}
 GIGABYTE_RE = re.compile(r"easytune|aorus|^gcc|gigabyte", re.I)
 
 
@@ -41,7 +42,7 @@ def _main_game(con):
     """(key, [session rows newest first]) of the game with the most gameplay seconds in the last 14 days."""
     t0 = time.time() - MAIN_GAME_DAYS * 86400
     secs, rows = defaultdict(float), []
-    for r in an._rows(con, f"SELECT id, exe, start_ts, summary FROM sessions WHERE start_ts>=? AND {an.GAMES_ONLY} "
+    for r in an._rows(con, f"SELECT id, exe, start_ts, end_ts, summary FROM sessions WHERE start_ts>=? AND {an.GAMES_ONLY} "
                            f"ORDER BY start_ts DESC", (t0,)):
         gp = (an._json(r["summary"]) or {}).get("gameplay") or {}
         secs[_game_key(r["exe"])] += gp.get("seconds") or 0
@@ -74,18 +75,32 @@ def _bg_cpu(con, sessions, game_exes):
     return (sum(totals) / n if totals else None), top
 
 
+def _report(con, s):
+    """Finished sessions never change: the page must not rebuild six full reports on every click."""
+    key = (str(config.DB_PATH), s["id"], s["end_ts"], s["summary"])
+    if key not in _REPORTS:
+        if len(_REPORTS) > 2 * RECENT_SESSIONS:
+            _REPORTS.clear()
+        _REPORTS[key] = an.session_report(con, s["id"])
+    return _REPORTS[key]
+
+
 def gather(con):
     row = con.execute("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
     info = an._json(row[0]) if row else None
     key, sessions = _main_game(con)
     reports = []
     for s in reversed(sessions):
-        rep = an.session_report(con, s["id"])
+        rep = _report(con, s)
         if "error" not in rep:
             reports.append(rep)
     exes = {s["exe"] for s in sessions}
     cpu, top = _bg_cpu(con, sessions, exes) if sessions else (None, [])
+    played = Counter()
+    for s in sessions:
+        played[s["exe"]] += s["gp"].get("seconds") or 0
     return {"now": time.time(), "info": info or {}, "has_info": bool(info), "game": sessions[0]["exe"] if sessions else None,
+            "test_exe": played.most_common(1)[0][0] if played else None,
             "reports": reports, "health": an.health_overview(con, MAIN_GAME_DAYS), "bg_cpu": cpu, "bg_cpu_top": top}
 
 
@@ -217,10 +232,25 @@ def _cause_item(tag, hits, n_sessions):
                 "Uruchom LatencyMon podczas gry, zaktualizuj lub usuń sterownik z najwyższym czasem DPC (często LAN/Wi-Fi, audio, USB)."),
         "thermal": ("Obniż temperatury", "mniej stutterów od throttlingu, jeśli to on je powoduje", "brak",
                     "Oczyść radiator i filtry, popraw przepływ powietrza, ustaw bardziej agresywną krzywą wentylatorów (BIOS lub aplikacja)."),
+        "vram": ("Obniż jakość tekstur", "mniej stutterów, jeśli to VRAM je powoduje", "niższa jakość tekstur",
+                 "Gra > Grafika > Jakość tekstur: o stopień niżej; zamknij inne aplikacje używające GPU."),
+        "pagefile": ("Zamknij aplikacje przed grą", "mniej stutterów od pliku stronicowania, jeśli to on je powoduje", "brak",
+                     "Zamknij przeglądarkę i launchery; plik stronicowania trzymaj na dysku NVMe."),
+        "disk_reset": ("Sprawdź kontroler dysku NVMe", "koniec zacięć przy resetach dysku", "brak",
+                       "Zaktualizuj firmware (Samsung Magician), sprawdź osadzenie M.2 i wyłącz Link State Power Management."),
+        "background_scan": ("Przesuń skany Defendera poza granie", "mniej stutterów, jeśli to skany je powodują", "brak",
+                            "Dodaj folder gry do wykluczeń: Zabezpieczenia Windows > Ochrona przed wirusami > Wykluczenia."),
+        "shader_compile": ("Skompiluj shadery przed grą", "mniej stutterów w kolejnych sesjach", "dłuższy start gry",
+                           "Uruchom wstępną kompilację shaderów w menu gry; nie czyść cache shaderów w Adrenalinie."),
         "cpu_thread": ("Odciąż główny wątek CPU", "mniej stutterów, jeśli główny wątek je powoduje", "niższa jakość",
                        "Gra > Grafika: obniż ustawienia zależne od CPU (zasięg widzenia, liczba postaci, cienie, śledzenie promieni); "
                        "zamknij procesy w tle."),
     }
+    if name == "background":
+        exe = tag.split(":", 1)[1]
+        return _item(tag, f"Zamknij {exe} na czas gry", f"{base}; {exe} zabiera CPU w chwili stutterów.",
+                     "mniej stutterów, jeśli to ten proces je powoduje", "brak", "uruchom proces ponownie",
+                     f"Zakończ {exe} przed grą (Menedżer zadań) albo wyłącz jego autostart.", "smoothness", score=score)
     if name in texts:
         title, exp, risk, how = texts[name]
         return _item(tag, title, base + ".", exp, risk, "przywróć poprzednie ustawienia", how, "smoothness", score=score)
@@ -404,7 +434,7 @@ def build(d):
     for p, i in enumerate(items, 1):
         i["priority"] = p
         del i["_tier"], i["_score"]
-    return {"generated": an.fmt_ts(d.get("now") or time.time()), "game": d.get("game"),
+    return {"generated": an.fmt_ts(d.get("now") or time.time()), "game": d.get("game"), "test_exe": d.get("test_exe"),
             "bottleneck": {k: bn[k] for k in ("kind", "share_pct", "minutes")}, "sessions": n,
             "items": items, "not_worth": not_worth, "unknown": unknown}
 

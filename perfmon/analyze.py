@@ -387,7 +387,7 @@ def session_report(con, session_id):
                 bg_counts[c.split(":", 1)[1]] += 1
     ranked = _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext)
     if ranked is not None:   # keep only what stutters have more often than normal gameplay
-        confirmed = {r["tag"] for r in ranked if r["verdict"] == "confirmed"}
+        confirmed = {r["tag"] for r in ranked if r["verdict"] in ("confirmed", "weak")}
         cause_counts = Counter()
         for s in st:
             s["causes"] = [c for c in s["causes"] if c in confirmed] or ["shader_or_unknown"]
@@ -445,6 +445,8 @@ def _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext):
         return None
     secs = {int(f["ts"]) for f in keep}
     played = [s for s in st if int(s["ts"]) in secs]
+    if not played:
+        return None
     base = stuttercause.baseline_ts([f["ts"] for f in keep], [s["ts"] for s in st])
     base_tags = [_causes_for_stutter({"ts": t}, s_ts, samples, p_ts, procs, exe, ext) for t in base]
     return stuttercause.rank([s["causes"] for s in played], base_tags)
@@ -575,7 +577,7 @@ def _session_findings(rep, row):
             add("warning", f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów zbiega się z problemami sieci",
                 f"W oknie +-{cor['window_s']:g} s od skoku pingu / utraty pakietów ({cor['stutters_near_net_problem_pct']}% "
                 f"stutterów przy {cor['chance_pct']}% czasu z problemami sieci) - przycięcia mogą być lagiem sieciowym.")
-        elif cor.get("bad_seconds") and cor.get("stutters"):
+        elif cor.get("bad_seconds") and cor.get("stutters") and near_pct < 30:
             add("info", "Stuttery w większości nie pokrywają się z problemami sieci",
                 f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów blisko skoku pingu / utraty pakietów - "
                 "pozostałe przycięcia są raczej lokalne (PC), nie sieciowe.")
