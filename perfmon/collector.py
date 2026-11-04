@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gpuproc, marks, memleak, ocanalyze, ocmon,
+from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memleak, ocanalyze, ocmon,
                presentmon, procwatch, shadercache, sysinfo)
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
@@ -49,6 +49,7 @@ OC_ALERT_S = 5        # UV/OC alerts fire only after the condition held this lon
 STRETCH_MAX = 0.97    # effective / reference clock of a fully loaded core below this = clock stretching
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
 BSOD_LOCK = threading.Lock()
+ANALYSIS_VERSION = "2"
 BOTTLENECK_EVERY_S = 300   # summary.bottleneck refresh while a game runs (and once at its end)
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -190,7 +191,23 @@ class Collector:
             self.con.commit()
         presentmon.cleanup_stale_sessions()   # ETW sessions leaked by earlier collectors block new captures
         self.vacuum_setup()
+        self.upgrade_analysis()
         log.info("collector start, admin=%s", is_admin())
+
+    def upgrade_analysis(self):
+        """Stored results follow the current analysis rules: recomputed once after an upgrade."""
+        with self.lock:
+            if db.get_meta(self.con, "analysis_version", "0") == ANALYSIS_VERSION:
+                return
+        try:
+            n = bottleneck.refresh_all(self.con, self.merge_summary)
+            with self.lock:
+                etwbox.fix_old_headlines(self.con)
+                db.set_meta(self.con, "analysis_version", ANALYSIS_VERSION)
+                self.con.commit()
+            log.info("analysis upgraded to %s (%s sessions)", ANALYSIS_VERSION, n)
+        except Exception:
+            log.exception("analysis upgrade")
 
     # ---------- per-second sample ----------
     def sample(self):
@@ -569,6 +586,7 @@ class Collector:
                 if b:
                     summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
                     summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
+                    summ["gameplay"] = gameplay.stats(self.con, g["session"], g["start"], now)
             except Exception:
                 log.exception("bottleneck for session %s", g["session"])
         self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)

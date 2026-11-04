@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, marks
+from . import bottleneck, crashinfo, diagreport, gameplay, marks, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -299,7 +299,7 @@ def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=
         return max(v) if v else None
 
     if win:
-        if (mx("disk_lat_ms") or 0) > 30 or (mx("hard_faults_s") or 0) > 200:
+        if (mx("disk_lat_ms") or 0) > 30:   # hard faults alone are normal streaming (45% of seconds in a CoD session)
             causes.append("disk")
         vr = [s["gpu_vram_mb"] / s["gpu_vram_total_mb"] for s in win if s["gpu_vram_mb"] and s["gpu_vram_total_mb"]]
         if vr and max(vr) > 0.95:
@@ -370,7 +370,8 @@ def session_report(con, session_id):
     st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
     samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, pagefile_pct, "
                          "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
-                         "fg_exe FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (start - 3, end + 3))
+                         "fg_exe, gpu_power_w, user_idle_s, cpu_total FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts",
+                    (start - 3, end + 3))
     procs = _rows(con, "SELECT ts, name, cpu_pct FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? ORDER BY ts",
                   (start - 6, end + 6))
     s_ts, p_ts = [s["ts"] for s in samples], [p["ts"] for p in procs]
@@ -384,11 +385,21 @@ def session_report(con, session_id):
             cause_counts[c] += 1
             if c.startswith("background:"):
                 bg_counts[c.split(":", 1)[1]] += 1
+    ranked = _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext)
+    if ranked is not None:   # keep only what stutters have more often than normal gameplay
+        confirmed = {r["tag"] for r in ranked if r["verdict"] == "confirmed"}
+        cause_counts = Counter()
+        for s in st:
+            s["causes"] = [c for c in s["causes"] if c in confirmed] or ["shader_or_unknown"]
+            cause_counts.update(s["causes"])
+        bg_counts = Counter({k: v for k, v in bg_counts.items() if f"background:{k}" in confirmed})
     worst = sorted(st, key=lambda s: -s["ft_ms"])[:15]
     rep["stutters"] = {
         "count": len(st), "per_min": _r(len(st) / (dur / 60), 2),
         "worst_ft_ms": _r(max((s["ft_ms"] for s in st), default=None)),
         "cause_counts": dict(cause_counts.most_common()),
+        "cause_ranking": ranked,
+        "ambient": [r for r in ranked or [] if r["verdict"] == "ambient" and r["tag"] != "shader_or_unknown"],
         "background_procs": dict(bg_counts.most_common(5)),
         "worst": [{"ts": w["ts"], "time": fmt_ts(w["ts"]), "ft_ms": _r(w["ft_ms"]), "median_ms": _r(w["median_ms"]),
                    "causes": w["causes"]} for w in worst],
@@ -425,6 +436,18 @@ def session_report(con, session_id):
     diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
     return rep
+
+
+def _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext):
+    """stuttercause.rank over gameplay seconds, or None when the session has too little gameplay to judge."""
+    keep = gameplay.select(frames, samples, start)
+    if len(keep) < gameplay.MIN_GAMEPLAY_S:
+        return None
+    secs = {int(f["ts"]) for f in keep}
+    played = [s for s in st if int(s["ts"]) in secs]
+    base = stuttercause.baseline_ts([f["ts"] for f in keep], [s["ts"] for s in st])
+    base_tags = [_causes_for_stutter({"ts": t}, s_ts, samples, p_ts, procs, exe, ext) for t in base]
+    return stuttercause.rank([s["causes"] for s in played], base_tags)
 
 
 def _session_findings(rep, row):
@@ -507,6 +530,14 @@ def _session_findings(rep, row):
             add("info", "Większość stutterów bez przyczyny systemowej",
                 "Zwykle kompilacja shaderów lub streaming zasobów w grze. Pomaga: wstępna kompilacja shaderów, "
                 "aktualne sterowniki Adrenalin, gra na szybkim SSD, ReBAR/SAM włączony.")
+        amb = st.get("ambient") or []
+        if st.get("cause_ranking") is None:
+            add("info", "Za mało rozgrywki, by ocenić przyczyny stutterów",
+                "Sesja to głównie menu, ładowanie lub kompilacja shaderów. Podane przyczyny są niepotwierdzone.")
+        if amb:
+            add("info", "Stałe warunki, których nie da się ocenić w tej sesji",
+                ", ".join(f"{r['tag']} ({r['base_pct']:.0f}% zwykłych sekund)" for r in amb[:3]) +
+                ": występują także bez stutterów. Sprawdź je testem przed/po (pm test start).")
 
     if hw:
         tc, th = hw.get("cpu_temp_max"), hw.get("gpu_hotspot_max")
@@ -1167,13 +1198,22 @@ def _session_metrics(con, exe=None, since=None):
         if low1 is None and x and x["p99"]:
             low1 = 1000 / x["p99"]
         ctx = _ctx(r)
+        gp = (_json(r["summary"]) or {}).get("gameplay")
+        stutters = st.get(r["id"], 0)
+        if gp and gp.get("seconds"):   # menus and loading screens do not count
+            fps, low1, stutters, minutes = gp["fps_avg"], gp["fps_1low"], gp["stutters"], gp["seconds"] / 60
+        bn = (_json(r["summary"]) or {}).get("bottleneck") or {}
         out.append({
             "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": f["end_ts"], "minutes": _r(minutes),
             "fps_avg": _r(fps), "fps_1low": _r(low1), "fps_01low": f.get("fps_01low"),
-            "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
+            "stutters": stutters, "stutters_per_min": _r(stutters / minutes, 2) if minutes > 0.5 else None,
+            "usable": gp.get("usable", True) if gp else True,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            "_g": (x["g"] or 0) if x else 0, "_c": (x["c"] or 0) if x else 0, "_l": (x["l"] or 0) if x else 0,
+            # PresentMon writes no GPUBusy on this PC: `bound` stays empty, the shares come from summary.bottleneck
+            "_g": (x["g"] or 0 if x else 0) or (bn.get("gpu_bound_pct") or 0) * minutes,
+            "_c": (x["c"] or 0 if x else 0) or (bn.get("cpu_bound_pct") or 0) * minutes,
+            "_l": (x["l"] or 0 if x else 0) or (bn.get("limit_pct") or 0) * minutes,
             "_n": x["n"] if x else 0,
             "_secs": x["secs"] if x else 0, **ext.get(r["id"], {}),
         })
@@ -1215,7 +1255,7 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
         b = resolve_point(con, before, exe)
         split = (b, resolve_point(con, after, exe) if after is not None else b)
     groups = {}
-    metrics = _session_metrics(con, exe, None if split else since)
+    metrics = [s for s in _session_metrics(con, exe, None if split else since) if s["usable"]]
     diagreport.fill_bottleneck(con, metrics)
     for s in metrics:
         if split:

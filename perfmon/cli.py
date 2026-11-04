@@ -176,6 +176,11 @@ def cmd_session(con, a):
     st = r["stutters"]
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
         "przyczyny": st["cause_counts"]}, "Stuttery")
+    if st.get("cause_ranking"):
+        out("Przyczyny względem zwykłej rozgrywki (potwierdzona = przy stutterach częściej niż normalnie):")
+        table([{"przyczyna": r["tag"], "przy stutterach %": r["stutter_pct"], "zwykle %": r["base_pct"],
+                "ocena": {"confirmed": "potwierdzona", "ambient": "stała, bez związku", "noise": "szum"}[r["verdict"]]}
+               for r in st["cause_ranking"] if r["tag"] != "shader_or_unknown"][:8])
     if st["worst"]:
         table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])
                 + (f" (pm etw show {w['etw_capture']})" if w.get("etw_capture") else "")} for w in st["worst"]])
