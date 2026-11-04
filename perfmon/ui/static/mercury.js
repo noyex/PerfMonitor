@@ -4,6 +4,7 @@
 const Mercury = (() => {
   const FRAME_MS = 1000 / 30;
   const SCALE = 0.75;         // render size vs CSS pixels, the liquid is soft anyway
+  const MAX_RATE = 40;        // stutters per minute; a burst in a few seconds of play would alias the noise into grain
   const MIN_AMP = 0.12;       // a perfectly flat surface shows the plateau of the pillow as a grey disc
   const WRAP_S = 3600;        // keeps the noise inputs small in float32 when the window stays open for days
   const FRAGMENT = `
@@ -62,6 +63,7 @@ void main(){
   let amp = 0, ampTo = 0, freq = 22, settled = false;
 
   const compile = () => {
+    uni = null;
     const shader = (type, src) => {
       const o = gl.createShader(type);
       gl.shaderSource(o, src);
@@ -124,6 +126,12 @@ void main(){
     draw();
   };
 
+  // The CSS drop stands in whenever there is no working context, also after a GPU reset that never recovers.
+  const reveal = () => {
+    cv.hidden = !shown || !uni;
+    fallback.hidden = !shown || !!uni;
+  };
+
   const start = () => {
     if (gl) return;
     gl = cv.getContext("webgl", { alpha: false, antialias: false, depth: false, stencil: false, powerPreference: "low-power" });
@@ -133,9 +141,11 @@ void main(){
     cv.addEventListener("webglcontextlost", (e) => {   // a GPU driver reset, the very thing this app records
       e.preventDefault();
       uni = null;
+      reveal();
     });
     cv.addEventListener("webglcontextrestored", () => {
       compile();
+      reveal();
       size();
       sync();
     });
@@ -149,19 +159,20 @@ void main(){
     show: () => {
       shown = true;
       start();
-      cv.hidden = !gl;
-      fallback.hidden = !!gl;
+      reveal();
       if (gl) size();
       sync();
     },
     hide: () => {
       shown = false;
-      cv.hidden = fallback.hidden = true;
+      reveal();
     },
     // A calmer session means calmer metal.
     surface: (perMin) => {
-      ampTo = Math.max(MIN_AMP, Math.min(1, perMin / 26));
-      freq = 14 + perMin * 1.1;
+      const rate = Math.min(perMin, MAX_RATE);
+      if (settled && Math.abs(14 + rate * 1.1 - freq) < 1) return;   // a live session drifts: no redraw per poll
+      ampTo = Math.max(MIN_AMP, Math.min(1, rate / 26));
+      freq = 14 + rate * 1.1;
       if (!settled) amp = ampTo;   // the first session opens at rest, later ones ease into their surface
       settled = true;
       sync();

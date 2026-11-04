@@ -21,4 +21,4 @@
 .kv + .list { margin-top: 12px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 24px; font-size: 13px; }
 .kv .k { color: var(--muted); }
-.kv .v { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.kv .v { color: var(--ink-2); }

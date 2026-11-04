@@ -38,7 +38,7 @@ Pages.overview = (() => {
       el.textContent = "–";
       return;
     }
-    if (calm.matches || !from) {
+    if (calm.matches || !from || to === from || liveId) {   // nothing moves during a game
       el.textContent = fmt(to);
       return;
     }
@@ -166,7 +166,7 @@ Pages.overview = (() => {
       const live = cur && cur.running ? cur.id : null;
       if (live && live !== liveId) picked = null;   // a game that just started takes the screen
       liveId = live;
-      Mercury.pause(!!live);   // the drop costs ~1.5% GPU and ~15% of a core animated, ~0 as a still frame
+      Mercury.pause(o.game_running);   // the drop costs ~1.5% GPU and ~15% of a core animated, ~0 as a still frame
       sessions = [cur, ...o.recent].filter(Boolean).slice(0, SESSIONS);
       totals = o.totals;
       loaded = true;
