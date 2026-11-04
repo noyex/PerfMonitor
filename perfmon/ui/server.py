@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import analyze, config, db, diagreport, ocanalyze
+from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist
 
 STATIC = Path(__file__).parent / "static"
 
@@ -44,6 +44,7 @@ ROUTES = {
     "range": lambda con, q: analyze.range_report(con, _f(q, "from"), _f(q, "to", time.time())),
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts"), int(q.get("window", 30))),
     "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
+    "advise": lambda con, q: advisor.advise(con),
     "health": lambda con, q: analyze.health_overview(con, int(q.get("days", 14))),
     "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d"),
                                               q.get("before") or None, q.get("after") or None),
@@ -54,7 +55,9 @@ ROUTES = {
     "oc_compare": lambda con, q: ocanalyze.compare_profiles(con, q.get("exe") or None, q.get("since") or "180d"),
     "oc_vf": lambda con, q: ocanalyze.vf_curve(con, _pid(q), q.get("since") or "30d"),
     "oc_cores": lambda con, q: ocanalyze.per_core(con, _pid(q), q.get("since") or "30d"),
+    "tests": lambda con, q: experiments.overview(con),
     "oc_stress": lambda con, q: ocanalyze.stress_runs(con, int(q.get("limit", 30))),
+    "oc_next": lambda con, q: ocassist.next_step(con),
 }
 
 
@@ -80,6 +83,21 @@ def save_profile(con, body):
     return {"id": pid}
 
 
+def test_action(con, body):
+    """POST /api/test: {"action": "start", "name", "key"?, "exe"?} | {"action": "stop"} | {"action": "cancel"}."""
+    act = body.get("action")
+    if act == "start":
+        return {"id": experiments.start(con, body.get("name"), body.get("exe") or None, body.get("key") or None)}
+    if act == "stop":
+        return experiments.stop(con)
+    if act == "cancel":
+        return {"cancelled": experiments.cancel(con)}
+    raise ValueError("nieznana akcja")
+
+
+POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action}   # the only write endpoints
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -93,14 +111,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        """The only write endpoint (UV/OC profiles). JSON-only + same-origin check: a web page in the browser
+        """The write endpoints (POSTS: UV/OC profiles, tests). JSON-only + same-origin check: a web page in the browser
         cannot post here (non-simple content type needs a CORS preflight that this server never allows)."""
         u = urlparse(self.path)
         origin = self.headers.get("Origin")
         host = self.headers.get("Host", "")
         if not _local_host(host):
             return self._send(403, b'{"error":"forbidden"}', "application/json")
-        if u.path != "/api/oc_profile":
+        handler = POSTS.get(u.path)
+        if not handler:
             return self._send(404, b'{"error":"not found"}', "application/json")
         if not self.headers.get("Content-Type", "").startswith("application/json") or (
                 origin and urlparse(origin).netloc != host):
@@ -111,7 +130,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("oczekiwano obiektu JSON")
             con = db.connect()
             try:
-                res = save_profile(con, body)
+                res = handler(con, body)
             finally:
                 con.close()
             return self._send(200, json.dumps(res).encode(), "application/json")

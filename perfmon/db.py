@@ -131,6 +131,12 @@ CREATE TABLE IF NOT EXISTS oc_session_stats (   -- per-session UV/OC aggregates 
 CREATE TABLE IF NOT EXISTS gpu_od_snapshots (   -- AMD ADL Overdrive8 current settings, stored when they change
     ts REAL, settings TEXT                       -- JSON {"named": {...}, "raw": [...]}
 );
+CREATE TABLE IF NOT EXISTS experiments (        -- pm test: one setting changed, before/after verdict
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key TEXT, exe TEXT, start_ts REAL, end_ts REAL,
+    status TEXT,                                 -- open | done | cancelled
+    result TEXT,                                 -- JSON verdict stored at stop
+    notes TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);

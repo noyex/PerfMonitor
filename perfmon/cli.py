@@ -15,7 +15,9 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
 
 from perfmon import analyze as an  # noqa: E402
 from perfmon import bottleneck, config, db, present  # noqa: E402
+from perfmon import experiments as exps  # noqa: E402
 from perfmon import ocanalyze as oc  # noqa: E402
+from perfmon import ocassist  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -108,6 +110,32 @@ def cmd_status(con, a):
         out(f"### Trwa sesja gry: #{o['id']} {o['exe']} ({o['running_s'] // 60} min)")
     if not s["admin"]:
         out("_Uwaga: kolektor bez uprawnień admina - część czujników/PresentMon może być niedostępna._")
+
+
+def cmd_advise(con, a):
+    from perfmon import advisor
+    r = advisor.advise(con)
+    if a.json:
+        return dump(r)
+    b = r["bottleneck"]
+    out(f"## Co zmienić - {r['game'] or 'brak danych o grze'} ({r['generated']})")
+    if b["kind"]:
+        out(f"Wąskie gardło: {b['kind']} przez {b['share_pct']}% z {b['minutes']} min grania ({r['sessions']} ostatnich sesji).")
+    for i in r["items"]:
+        out(f"### {i['priority']}. {i['title']} [{i['kind']}]")
+        for k, label in (("why", "Dlaczego"), ("expected", "Oczekiwany efekt"), ("risk", "Ryzyko"), ("undo", "Cofnięcie"),
+                         ("how", "Jak")):
+            out(f"- {label}: {i[k]}")
+    if not r["items"]:
+        out("Brak rekomendacji - dane nie wskazują nic do zmiany.")
+    if r["not_worth"]:
+        out("### Nie warto")
+        for n in r["not_worth"]:
+            out(f"- {n['title']}: {n['why']}")
+    if r["unknown"]:
+        out("### Nieznane (sprawdź ręcznie)")
+        for u in r["unknown"]:
+            out(f"- {u['title']}: {u['check']}")
 
 
 def cmd_health(con, a):
@@ -672,6 +700,34 @@ def _delta(v):
     return None if v is None else f"{v:+g}%"
 
 
+def _oc_next(r):
+    cur = r["current"]
+    out("## Następny krok UV/OC" + (f" - aktywny profil: {cur['profile']} ({cur['settings']})" if cur else ""))
+    if r["blocked"]:
+        out("**Strojenie poczeka.**" + (f" Odblokuje się {r['until']}." if r.get("until") else ""))
+        for b in r["blockers"]:
+            out(f"- {b['what']}: {b['detail']}" + (f" (do {b['until']})" if b.get("until") else ""))
+    for b in r.get("warnings") or []:
+        out(f"Uwaga: {b['what']}: {b['detail']} - zmiany ustawień poczekają do {b['until']}.")
+    s = r["step"]
+    if s:
+        out(f"### {s['title']}")
+        kv({"gdzie": s["where"], "wartość": s["value"], "komenda": s["command"], "po awarii": s.get("reject_command"),
+            "uwaga": s.get("note"), "co się nie zgadza": s.get("failed")})
+        for x in s.get("skipped") or []:
+            out(f"_{x}_")
+    t = r["test"]
+    if t:
+        out(f"### Test: {t['what']}")
+        for c in t["criteria"]:
+            out(f"- [{'x' if c['ok'] else ' '}] {c['check']}" + (f" ({c['value']})" if c.get("value") is not None else ""))
+    if r["next_if_ok"]:
+        out(f"Jeśli OK: {r['next_if_ok']}")
+    if r["rollback_if_bad"]:
+        out(f"Jeśli źle: {r['rollback_if_bad']}")
+    out("_PerfMonitor tylko doradza - niczego nie zmienia w BIOS ani Adrenalin i sam nie oznacza profilu jako stabilny._")
+
+
 def cmd_oc(con, a):
     act = a.action
     if act == "list":
@@ -749,6 +805,11 @@ def cmd_oc(con, a):
             table(r["resets"], ["time", "cpu_avg", "low_load"])
         if r["missing"]:
             out("Brakuje: " + "; ".join(r["missing"]))
+    elif act == "next":
+        r = ocassist.next_step(con)
+        if a.json:
+            return dump(r)
+        _oc_next(r)
     elif act == "vf":
         r = oc.vf_curve(con, a.profile, a.since)
         if a.json:
@@ -769,6 +830,43 @@ def cmd_oc(con, a):
             out(r["note"])
         if r["whea_uncore"]:
             kv({"WHEA poza rdzeniami": r["whea_uncore"]})
+
+
+def _print_test(r):
+    out(f"## Test #{r['id']}: {r['name']} ({r.get('exe')}, {r.get('status')})")
+    if r.get("metrics"):
+        table([{"metryka": m["label"], "przed": m["before"], "po": m["after"], "zmiana %": m["change_pct"],
+                "istotne": "tak" if m["significant"] else "nie"} for m in r["metrics"]],
+              ["metryka", "przed", "po", "zmiana %", "istotne"])
+    b, af = r.get("before") or {}, r.get("after") or {}
+    if b:
+        out(f"Przed: {b['sessions']} sesji, {b['minutes']} min gry. Po: {af['sessions']} sesji, {af['minutes']} min gry.")
+    out(f"**Werdykt: {r['verdict']}**" + (f" ({'; '.join(r['missing'])})" if r.get("missing") else ""))
+    for w in r.get("warnings") or []:
+        out(f"- Uwaga: {w}")
+
+
+def cmd_test(con, a):
+    act = a.action
+    if act == "start":
+        tid = exps.start(con, a.name, a.exe, a.key)
+        if a.json:
+            return dump({"id": tid})
+        out(f"Rozpoczęto test #{tid}: **{a.name}**. Zmień JEDNO ustawienie i graj dalej, potem `pm test show` / `pm test stop`.")
+    elif act in ("stop", "show"):
+        r = exps.stop(con, a.id) if act == "stop" else exps.show(con, a.id)
+        if a.json:
+            return dump(r)
+        _print_test(r if r.get("name") else dict(r, name="?"))
+    elif act == "cancel":
+        tid = exps.cancel(con, a.id)
+        out(json.dumps({"cancelled": tid}) if a.json else f"Anulowano test #{tid}.")
+    else:
+        rows = exps.list_all(con)
+        if a.json:
+            return dump(rows)
+        out("## Testy zmian")
+        table(rows, ["id", "time", "name", "exe", "status", "verdict"])
 
 
 def cmd_stress(con, a):
@@ -812,6 +910,7 @@ def build():
         return s
     add("status", cmd_status)
     add("mark", cmd_mark, help="mark a lag/problem right now").add_argument("text", nargs="*")
+    add("advise", cmd_advise, help="ranked concrete changes backed by your own data")
     add("health", cmd_health).add_argument("--days", type=float, default=14)
     add("sessions", cmd_sessions).add_argument("--limit", type=int, default=20)
     add("session", cmd_session).add_argument("id", type=int)
@@ -905,6 +1004,7 @@ def build():
     x.add_argument("--exe")
     x.add_argument("--since", default="180d")
     oc_action("stability").add_argument("--profile", type=int)
+    oc_action("next")
     for n in ("vf", "cores"):
         x = oc_action(n)
         x.add_argument("--profile", type=int)
@@ -922,6 +1022,23 @@ def build():
     st_action("idle", True).add_argument("name", nargs="?")
     st_action("stop", True)
     st_action("list").add_argument("--limit", type=int, default=30)
+
+    s = add("test", cmd_test, help="one-setting test with before/after verdict: start|stop|cancel|list|show")
+    tp = s.add_subparsers(dest="action", required=True)
+
+    def t_action(name, writes=False):
+        x = tp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+    x = t_action("start", True)
+    x.add_argument("name")
+    x.add_argument("--exe")
+    x.add_argument("--key")
+    for n in ("stop", "cancel"):
+        t_action(n, True).add_argument("id", nargs="?", type=int)
+    t_action("list")
+    t_action("show").add_argument("id", nargs="?", type=int)
     return p
 
 

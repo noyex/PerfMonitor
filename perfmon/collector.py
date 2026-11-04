@@ -863,7 +863,7 @@ class Collector:
             old = json.loads(prev[0])
             changed = {k: {"before": old.get(k), "after": v} for k, v in info.items()
                        if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health", "disk_map")
-                       and old.get(k) != v}
+                       and old.get(k) is not None and old.get(k) != v}   # null = was unreadable, not a change
             if changed:
                 self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)
             for kind, sev, title, det in diskinfo.health_changes(old, info):
