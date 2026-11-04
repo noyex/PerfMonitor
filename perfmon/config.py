@@ -17,6 +17,11 @@ DEFAULTS = {
     "proc_interval_s": 5.0,
     "event_poll_s": 30.0,
     "retention_days": 90,
+    "detail_retention_days": 30,        # hw_detail (UV/OC telemetry); per-session aggregates are kept forever
+    "detail_interval_s": 10.0,          # hw_detail outside game/stress sessions (1 s inside them)
+    "db_guard_gb": 2.0,                 # above this perf.db size: warning incident + detail retention cut to 14 days
+    "apic_ids_per_core": 2,             # WHEA APIC ID -> core (7700X with SMT: 2 threads per core)
+    "gpu_od_poll_s": 600,               # Adrenalin tuning readout via ADL; 0 = never touch ADL
     "ui_port": 8765,
     "hotkey_mark": "ctrl+alt+l",   # global shortcut for `pm mark` while playing; "" = off
     "hotkey_beep": True,           # short beep confirming the mark
@@ -70,6 +75,19 @@ DEFAULTS = {
         "wallpaper32.exe", "wallpaper64.exe", "wallpaperservice32.exe", "wallpaperui.exe", "webwallpaper32.exe",
         "steamerrorreporter.exe",
     ],
+    # Stress tests / benchmarks (lowercase exe) -> sessions with kind='stress'. "3d": capture frames with PresentMon
+    "stress_exes": {
+        "occt.exe": {"name": "OCCT"}, "y-cruncher.exe": {"name": "y-cruncher"},
+        "prime95.exe": {"name": "Prime95"}, "cinebench.exe": {"name": "Cinebench"},
+        "cinebenchr23.exe": {"name": "Cinebench R23"}, "3dmark.exe": {"name": "3DMark", "3d": True},
+        "3dmarksteelnomad.exe": {"name": "3DMark Steel Nomad", "3d": True},
+        "3dmarktimespy.exe": {"name": "3DMark Time Spy", "3d": True},
+        "furmark.exe": {"name": "FurMark", "3d": True}, "furmark_gui.exe": {"name": "FurMark", "3d": True},
+        "msi-kombustor-x64.exe": {"name": "Kombustor", "3d": True},
+    },
+    # Matched by path substring, before stress_exes: y-cruncher ships per-CPU binaries ("13-ZN4 ~ Kizuna.exe"),
+    # CoreCycler runs the Prime95 copy from its own folder
+    "stress_path_markers": {"\\corecycler": "CoreCycler", "\\y-cruncher": "y-cruncher"},
 }
 
 
@@ -81,6 +99,8 @@ def load() -> dict:
             for k, v in user.items():
                 if k in ("game_exes", "not_game_exes", "game_path_markers") and isinstance(v, list):
                     cfg[k] = list(dict.fromkeys(cfg[k] + [x.lower() for x in v]))
+                elif k in ("stress_exes", "stress_path_markers") and isinstance(v, dict):
+                    cfg[k] = {**cfg[k], **{x.lower(): y for x, y in v.items()}}
                 else:
                     cfg[k] = v
         except Exception:

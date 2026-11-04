@@ -15,6 +15,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
 
 from perfmon import analyze as an  # noqa: E402
 from perfmon import bottleneck, config, db, present  # noqa: E402
+from perfmon import ocanalyze as oc  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -81,11 +82,23 @@ def cmd_status(con, a):
     if a.json:
         return dump(s)
     smp = s["sample"] or {}
+    extra = {}
+    try:
+        pid = oc.active_profile_id(con)
+        if pid is not None:
+            extra["profil OC"] = (oc.profile(con, pid) or {}).get("name")
+    except sqlite3.Error:
+        pass
+    try:
+        files = [Path(str(config.DB_PATH) + sfx) for sfx in ("", "-wal", "-shm")]
+        extra["rozmiar bazy [MB]"] = round(sum(f.stat().st_size for f in files if f.exists()) / 1048576, 1)
+    except OSError:
+        pass
     out(f"## Status kolektora: {'DZIALA' if s['collector_alive'] else 'NIE DZIALA'}")
     kv({"ostatnia próbka": an.fmt_ts(smp.get("ts")), "wiek próbki [s]": s["sample_age_s"],
         "admin": s["admin"], "kolektor start": an.fmt_ts(s["collector_started"]),
         "kolektor stop": an.fmt_ts(s["collector_stopped"]), "liczniki": s["counts"] and {
-            **s["counts"], "first_sample": an.fmt_ts(s["counts"]["first_sample"])}})
+            **s["counts"], "first_sample": an.fmt_ts(s["counts"]["first_sample"])}, **extra})
     if smp:
         keys = ["cpu_total", "cpu_temp", "cpu_clock_mhz", "gpu_load", "gpu_temp", "gpu_hotspot", "gpu_vram_mb",
                 "ram_pct", "disk_lat_ms", "ui_ms", "dwm_ms", "fg_exe"]
@@ -553,6 +566,173 @@ def cmd_freeze_check(con, a):
         table(r["recent_events"], ["time", "provider", "event_id", "level", "message"])
 
 
+# ---------------- UV/OC ----------------
+def _onoff(v):
+    return {"on": True, "off": False}.get(v.lower(), v)
+
+
+def _settings(a):
+    """CLI flags -> (cpu, gpu) dicts for ocanalyze.validate; only keys the user passed."""
+    if a.co is not None and a.co_all is not None:
+        raise ValueError("Podaj albo --co, albo --co-all")
+    cpu, pbo, gpu = {}, {}, {}
+    if a.co is not None:
+        try:
+            cpu["co_per_core"] = [int(x) for x in a.co.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError("--co: liczby całkowite oddzielone przecinkami, np. -10,-15,-10,-5,-10,-10,-15,-10")
+    if a.co_all is not None:
+        cpu["co_per_core"] = [a.co_all] * 8
+    for flag, key in (("ppt", "ppt"), ("tdc", "tdc"), ("edc", "edc"), ("scalar", "scalar"), ("boost", "boost_override")):
+        if getattr(a, flag) is not None:
+            pbo[key] = getattr(a, flag)
+    if pbo:
+        cpu["pbo"] = pbo
+    if a.expo is not None:
+        cpu["expo"] = _onoff(a.expo)
+    if a.soc_v is not None:
+        cpu["soc_v"] = a.soc_v
+    for flag, key in (("gpu_uv", "voltage_offset_mv"), ("gpu_pl", "power_limit_pct"), ("gpu_clk", "max_clock_offset"),
+                      ("vram", "vram_mhz"), ("fan", "fan_curve")):
+        if getattr(a, flag) is not None:
+            gpu[key] = getattr(a, flag)
+    if a.vram_fast is not None:
+        gpu["vram_fast_timing"] = _onoff(a.vram_fast)
+    return cpu or None, gpu or None
+
+
+def _delta(v):
+    return None if v is None else f"{v:+g}%"
+
+
+def cmd_oc(con, a):
+    act = a.action
+    if act == "list":
+        ps = oc.profiles(con)
+        if a.json:
+            return dump(ps)
+        out("## Profile UV/OC")
+        table([{"id": p["id"], "name": p["name"], "status": p["status"], "active": "✓" if p["active"] else "",
+                "summary": oc.summarize_settings(p), "active_hours": p["active_hours"], "created": p["created"]}
+               for p in ps], maxw=160)
+    elif act == "show":
+        p = oc.profile(con, a.id)
+        if not p:
+            raise ValueError(f"Nie ma profilu #{a.id}")
+        p["periods"] = [{"from": an.fmt_ts(f), "to": an.fmt_ts(t)} for pid, f, t in oc.periods(con) if pid == p["id"]]
+        p["summary"] = oc.summarize_settings(p)
+        if a.json:
+            return dump(p)
+        out(f"## Profil #{p['id']} - {p['name']} ({p['status']})")
+        kv({"ustawienia": p["summary"], "utworzono": p["created"], "notatki": p["notes"],
+            "aktywny w": "; ".join(f"{x['from']} -> {x['to']}" for x in p["periods"]) or "nigdy"})
+        kv(p["cpu"], "CPU")
+        kv(p["gpu"], "GPU")
+    elif act in ("add", "edit"):
+        cpu, gpu = _settings(a)
+        since = an.parse_time(a.since) if act == "add" and a.since else None
+        if act == "add":
+            pid = oc.create_profile(con, a.name, cpu, gpu, a.notes, a.status or "testing")
+            if a.activate:
+                oc.activate(con, pid, ts=since)
+        else:
+            pid = a.id
+            oc.update_profile(con, pid, name=a.name, cpu=cpu, gpu=gpu, notes=a.notes, status=a.status)
+        p = oc.profile(con, pid)
+        if a.json:
+            return dump(p)
+        out(f"Profil #{pid} {'utworzony' if act == 'add' else 'zaktualizowany'}: **{p['name']}** ({p['status']})")
+        out(f"Ustawienia: {oc.summarize_settings(p)}")
+        if act == "add" and a.activate:
+            out(f"Aktywny od {an.fmt_ts(since or time.time())}.")
+    elif act == "activate":
+        ts = oc.activate(con, a.id, ts=an.parse_time(a.since) if a.since else None)
+        p = oc.profile(con, a.id)
+        if a.json:
+            return dump({"profile": p, "since": ts})
+        out(f"Aktywny profil: **{p['name']}** (#{p['id']}) od {an.fmt_ts(ts)}.")
+        out("Sesje rozpoczęte od tej chwili zostały ponownie przypisane do profilu." if a.since
+            else "Nowe sesje będą przypisywane do tego profilu.")
+    elif act == "compare":
+        r = oc.compare_profiles(con, a.exe, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Porównanie profili - {r['exe'] or 'brak gier'} (od {a.since})")
+        out(f"Punkt odniesienia: {r['baseline'] or '-'}")
+        rows = [{**x, "fps_avg_delta_pct": _delta(x.get("fps_avg_delta_pct")),
+                 "fps_per_w_delta_pct": _delta(x.get("fps_per_w_delta_pct"))} for x in r["rows"]]
+        table(rows, ["profile", "sessions", "minutes", "fps_avg", "fps_avg_delta_pct", "fps_1low", "fps_per_w",
+                     "fps_per_w_delta_pct", "power_w", "cpu_temp", "gpu_hotspot", "errors_per_h", "game_crashes"])
+        small = [x["profile"] for x in r["rows"] if x["small_sample"]]
+        if small:
+            out(f"_mała próba (<{oc.MIN_COMPARE_MIN} min): {', '.join(small)}_")
+    elif act == "stability":
+        r = oc.stability(con, a.profile)
+        if a.json:
+            return dump(r)
+        if "error" in r:
+            return out(r["error"])
+        p = r["profile"]
+        out(f"## Stabilność - {p['name']} (#{p['id']}, {p['status']}): {r['verdict']}")
+        kv({"ustawienia": r["settings"], "aktywny od": r["active_since"], "zebrane dane [h]": r["hours_collected"],
+            "błędy/h": r["errors_per_h"], "błędy": r["errors"], "resety przy niskim obciążeniu": r["low_load_resets"]})
+        table([{"check": c["check"], "ok": "✓" if c["ok"] else "✗", "value": c["value"]} for c in r["checks"]])
+        if r["resets"]:
+            out("### Resety")
+            table(r["resets"], ["time", "cpu_avg", "low_load"])
+        if r["missing"]:
+            out("Brakuje: " + "; ".join(r["missing"]))
+    elif act == "vf":
+        r = oc.vf_curve(con, a.profile, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Krzywa V/F (od {a.since}, {r['rows']} próbek)")
+        for key, title in (("gpu", "GPU: MHz -> V (obciążenie >= 90%)"), ("cpu_single", "CPU: jeden wątek"),
+                           ("cpu_all", "CPU: wszystkie rdzenie")):
+            out(f"### {title}")
+            table(r[key], ["mhz", "v", "n"])
+    elif act == "cores":
+        r = oc.per_core(con, a.profile, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Rdzenie CPU (od {a.since})")
+        table([{**c, "suspect": "✓" if c["suspect"] else ""} for c in r["cores"]],
+              ["core", "whea19", "whea18", "stretch_pct", "eff_loaded_avg", "eff_max", "loaded_min", "suspect"])
+        if r["note"]:
+            out(r["note"])
+        if r["whea_uncore"]:
+            kv({"WHEA poza rdzeniami": r["whea_uncore"]})
+
+
+def cmd_stress(con, a):
+    act = a.action
+    if act in ("start", "idle"):
+        name = a.name or "idle soak"
+        sid = oc.stress_start(con, name, "manual" if act == "start" else "idle_soak")
+        if a.json:
+            return dump({"session": sid, "name": name})
+        out(f"Rozpoczęto test #{sid}: **{name}**.")
+        out("Zostaw PC w spoczynku na 1-2 h, potem uruchom `pm stress stop`." if act == "idle"
+            else "Po zakończeniu testu uruchom `pm stress stop`.")
+    elif act == "stop":
+        ids = oc.stress_stop(con)
+        if a.json:
+            return dump({"ended": ids})
+        out(f"Zakończono: {', '.join(f'#{i}' for i in ids)}." if ids else "Brak trwających testów.")
+        if ids:
+            out("Wynik: pm stress list")
+    elif act == "list":
+        rows = oc.stress_runs(con, a.limit)
+        if a.json:
+            return dump(rows)
+        out("## Testy obciążeniowe i bezczynność")
+        for r in rows:
+            r["test"] = r["test"] or r["exe"]
+            r["errors"] = sum((r["errors"] or {}).values()) if r["errors"] is not None else None
+        table(rows, ["id", "time", "test", "kind", "minutes", "end_reason", "errors", "tctl_max", "gpu_hot_max",
+                     "cpu_w_avg", "gpu_w_avg", "stretch_max_pct"])
+
+
 def build():
     p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
@@ -609,7 +789,85 @@ def build():
     s.add_argument("--limit", type=int, default=30)
     add("dumps", cmd_dumps, help="WER minidumps of crashing apps (HKLM, via the collector)").add_argument(
         "action", choices=["status", "enable", "disable"])
+
+    s = add("oc", cmd_oc, help="UV/OC profiles: list|show|add|edit|activate|compare|stability|vf|cores")
+    ocp = s.add_subparsers(dest="action", required=True)
+
+    def oc_action(name, writes=False):
+        x = ocp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+
+    def settings_flags(x):
+        x.add_argument("--co", help="Curve Optimizer per core, e.g. -10,-15,-10,-5,-10,-10,-15,-10")
+        x.add_argument("--co-all", type=int, help="Curve Optimizer for all 8 cores")
+        for f in ("ppt", "tdc", "edc", "scalar"):
+            x.add_argument(f"--{f}", type=int)
+        x.add_argument("--boost", type=int, help="boost override [MHz]")
+        x.add_argument("--expo", help="on|off|text, e.g. '6000 CL30'")
+        x.add_argument("--soc-v", type=float, help="VSoC [V]")
+        x.add_argument("--gpu-uv", type=int, help="GPU voltage offset [mV]")
+        x.add_argument("--gpu-pl", type=int, help="GPU power limit [%%]")
+        x.add_argument("--gpu-clk", type=int, help="GPU max clock offset [MHz]")
+        x.add_argument("--vram", type=int, help="VRAM [MHz]")
+        x.add_argument("--vram-fast", help="on|off")
+        x.add_argument("--fan", help="fan curve description")
+        x.add_argument("--notes")
+        x.add_argument("--status", choices=oc.STATUSES)
+
+    oc_action("list")
+    oc_action("show").add_argument("id", type=int)
+    x = oc_action("add", True)
+    x.add_argument("name")
+    settings_flags(x)
+    x.add_argument("--activate", action="store_true")
+    x.add_argument("--since", help="back-date the activation (e.g. 90d, 2026-01-01)")
+    x = oc_action("edit", True)
+    x.add_argument("id", type=int)
+    x.add_argument("--name")
+    settings_flags(x)
+    x = oc_action("activate", True)
+    x.add_argument("id", type=int)
+    x.add_argument("--since", help="back-date the activation (re-tags sessions since then)")
+    x = oc_action("compare")
+    x.add_argument("--exe")
+    x.add_argument("--since", default="180d")
+    oc_action("stability").add_argument("--profile", type=int)
+    for n in ("vf", "cores"):
+        x = oc_action(n)
+        x.add_argument("--profile", type=int)
+        x.add_argument("--since", default="30d")
+
+    s = add("stress", cmd_stress, help="manual stress tests / idle soak: start|idle|stop|list")
+    stp = s.add_subparsers(dest="action", required=True)
+
+    def st_action(name, writes=False):
+        x = stp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+    st_action("start", True).add_argument("name")
+    st_action("idle", True).add_argument("name", nargs="?")
+    st_action("stop", True)
+    st_action("list").add_argument("--limit", type=int, default=30)
     return p
+
+
+NEG_VALUE_FLAGS = {"--co", "--co-all", "--gpu-uv", "--gpu-pl", "--gpu-clk", "--soc-v"}
+
+
+def _glue_negatives(argv):
+    """argparse takes '-10' / '-10,-15' after a flag for an option: rewrite to --flag=-10."""
+    res, i = [], 0
+    while i < len(argv):
+        if argv[i] in NEG_VALUE_FLAGS and i + 1 < len(argv) and argv[i + 1].startswith("-"):
+            res.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            res.append(argv[i])
+            i += 1
+    return res
 
 
 def main(argv=None):
@@ -618,14 +876,14 @@ def main(argv=None):
             st.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-    a = build().parse_args(argv)
+    a = build().parse_args(_glue_negatives(sys.argv[1:] if argv is None else list(argv)))
     if not hasattr(a, "json"):
         a.json = False
     import os
     if os.environ.get("PERFMON_DB"):  # testing: point at another database file
         config.DB_PATH = Path(os.environ["PERFMON_DB"])
     try:
-        con = db.connect(readonly=True)
+        con = db.connect(readonly=not getattr(a, "writes", False))
     except sqlite3.Error as e:
         sys.exit(f"Nie mogę otworzyć bazy {config.DB_PATH}: {e}")
     try:

@@ -248,7 +248,7 @@ def _flatten_session(r, stutters=None, ends=None):
         "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": end if r["end_ts"] is not None else None,
         "end_reason": r["end_reason"], "end_estimated": estimated,
         "duration_s": round((end or time.time()) - r["start_ts"]) if r["start_ts"] else None,
-        "running": running,
+        "running": running, "kind": r.get("kind") or "game", "profile_id": r.get("profile_id"),
     }
     for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error"):
         d[k] = summ.get(k)
@@ -261,8 +261,11 @@ def _flatten_session(r, stutters=None, ends=None):
     return d
 
 
+GAMES_ONLY = "COALESCE(kind, 'game')='game'"   # sessions that are not stress tests / idle soaks
+
+
 def sessions(con, limit=20):
-    rows = _rows(con, "SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (int(limit),))
+    rows = _rows(con, f"SELECT * FROM sessions WHERE {GAMES_ONLY} ORDER BY id DESC LIMIT ?", (int(limit),))
     if not rows:
         return []
     ids = [r["id"] for r in rows]
@@ -276,7 +279,7 @@ def sessions(con, limit=20):
 
 def game_list(con):
     """Games with at least one session, most played first (cheap list for pickers)."""
-    return _rows(con, "SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions "
+    return _rows(con, f"SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions WHERE {GAMES_ONLY} "
                       "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
 
 
@@ -510,7 +513,7 @@ def _session_findings(rep, row):
             add("critical", "Zawieszenie pulpitu/DWM podczas sesji",
                 f"ui_ms max {hw.get('ui_ms_max')}, dwm_ms max {hw.get('dwm_ms_max')} - szczegóły w incydentach.")
     for inc in rep.get("incidents") or []:
-        if inc["kind"] in ("gpu_driver", "whea", "bsod"):
+        if inc["kind"] in ("gpu_driver", "whea", "whea_fatal", "whea_corrected", "whea_pcie", "bsod"):
             add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
     f += diagreport.findings(rep, row)
     if not f:
@@ -702,6 +705,14 @@ def _unclean_shutdowns(con, t0):
             last = {k: (_r(v) if isinstance(v, float) else v) for k, v in last.items()}
             last["time"] = fmt_ts(last["ts"])
             info["last_sample_before"] = last
+            from .ocanalyze import reset_context   # local: ocanalyze imports this module
+            ctx = reset_context(con, r["ts"])
+            if ctx:
+                info["low_load"] = ctx["low_load"]
+                if ctx["low_load"]:
+                    info.setdefault("interpretation", []).append(
+                        f"Reset przy niskim obciążeniu (CPU śr. {ctx['cpu_avg']}% przed resetem) - typowy objaw za "
+                        "agresywnego Curve Optimizera na biegu jałowym (jeśli był włączony UV/OC)")
         out.append(info)
     # Kernel-Power 41 and EventLog 6008 usually both exist for the same crash; merge entries within 10 min
     merged = []
@@ -808,13 +819,17 @@ def diagnose(rep, con=None, t0=None):
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
     for k, name, desc in (
             ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
+            ("whea_fatal", "krytyczny błąd CPU (WHEA 18)", "Niestabilny CPU/SoC - cofnij ostatnią zmianę UV/OC (`pm oc stability`)."),
+            ("whea_corrected", "skorygowany błąd CPU (WHEA 19)", "Rdzeń na granicy stabilności - zwykle za mocny Curve Optimizer na tym rdzeniu (`pm oc stability`)."),
+            ("whea_pcie", "błąd PCIe (WHEA 17)", "Błędy łącza PCIe - sprawdź osadzenie karty, tryb PCIe w BIOS, riser."),
             ("gpu_driver", "problem sterownika GPU", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
             ("bsod", "blue screen", "Blue screeny - sprawdź kod w zdarzeniach BugCheck."),
             ("disk", "błąd dysku", "Błędy dysku - sprawdź SMART (CrystalDiskInfo) i kable/slot."),
             ("low_memory", "brak pamięci wirtualnej", "Kończyła się pamięć wirtualna - zwiększ plik wymiany/zamknij aplikacje."),
             ("throttle", "throttling CPU", "Throttling CPU - sprawdź chłodzenie i zasilanie VRM.")):
         if bk.get(k):
-            add("critical" if k in ("whea", "bsod") else "serious" if k in ("gpu_driver", "disk", "low_memory") else "warning",
+            add("critical" if k in ("whea", "whea_fatal", "bsod") else
+                "serious" if k in ("gpu_driver", "disk", "low_memory", "whea_corrected", "whea_pcie") else "warning",
                 f"{bk[k]}x {name}", desc)
     cfg = rep["config_changes"]
     if cfg and un:
@@ -840,7 +855,7 @@ def diagnose(rep, con=None, t0=None):
 def _session_metrics(con, exe=None, since=None):
     """One dict per finished-or-running session with fps/stutter/bound metrics (oldest first)."""
     t0 = parse_time(since) if since is not None else 0
-    sql, args = "SELECT * FROM sessions WHERE start_ts>=?", [t0]
+    sql, args = f"SELECT * FROM sessions WHERE start_ts>=? AND {GAMES_ONLY}", [t0]
     if exe:
         sql += " AND lower(exe)=lower(?)"
         args.append(exe)
