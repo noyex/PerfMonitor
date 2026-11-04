@@ -1,6 +1,7 @@
 import json
 import time
 import unittest
+from datetime import datetime, timedelta
 
 from perfmon import analyze as an
 from tests.test_bottleneck import add_session, new_db
@@ -15,8 +16,14 @@ def add_open_session(con, sid, start, exe="live.exe"):
                     (ts, sid, 140, 140.0, 7.1, 3.0, "GPU"))
 
 
+def add_finished(con, sid, start, seconds, frames=None, fps=120.0, reason="exit", bottleneck=None):
+    summ = {"frames": frames, "fps_avg": fps if frames else None, "bottleneck": bottleneck}
+    con.execute("INSERT INTO sessions(id, exe, start_ts, end_ts, end_reason, summary) VALUES (?,?,?,?,?,?)",
+                (sid, "game.exe", start, start + seconds, reason, json.dumps(summ)))
+
+
 class OverviewTest(unittest.TestCase):
-    def test_running_session_is_current_with_live_bottleneck_and_stutters(self):
+    def test_running_session_is_current_with_live_stats(self):
         con = new_db()
         now = time.time()
         add_session(con, 1, now - 86400, minutes=2)
@@ -30,10 +37,9 @@ class OverviewTest(unittest.TestCase):
         self.assertEqual(cur["id"], 2)
         self.assertTrue(cur["running"])
         self.assertEqual(cur["stutters"], 2)
-        self.assertAlmostEqual(cur["last_stutter_ts"], now - 30)
-        self.assertEqual(len(cur["stutter_ts"]), 2)
         self.assertEqual(cur["bottleneck"]["kind"], "gpu")
         self.assertEqual(cur["bottleneck"]["share"], 100.0)
+        self.assertEqual(cur["fps_live"], 140.0)
         self.assertEqual([r["id"] for r in o["recent"]], [1])
 
     def test_idle_shows_last_session_with_frames_and_skips_launchers(self):
@@ -67,6 +73,99 @@ class OverviewTest(unittest.TestCase):
         o = an.overview(new_db())
         self.assertIsNone(o["current"])
         self.assertEqual(o["recent"], [])
+        self.assertEqual(o["totals"], {"play_s": 0, "week_s": 0, "fps_avg": None, "crashes_14d": 0})
+        self.assertIsNone(o["temps"])
+
+    def test_finished_session_reads_the_flat_stored_bottleneck(self):
+        con = new_db()
+        now = time.time()
+        add_finished(con, 1, now - 7200, 600, frames=1000,
+                     bottleneck={"kind": "cpu", "why": "CPU-bound 50% czasu", "cpu_bound_pct": 50.0})
+        add_finished(con, 2, now - 3600, 600, frames=1000,
+                     bottleneck={"kind": "gpu", "why": "GPU-bound 89% czasu", "gpu_bound_pct": 89.0})
+        o = an.overview(con)
+        self.assertEqual((o["current"]["bottleneck"]["kind"], o["current"]["bottleneck"]["share"]), ("gpu", 89.0))
+        self.assertTrue(o["current"]["bottleneck"]["advice"])
+        self.assertEqual((o["recent"][0]["bottleneck"]["kind"], o["recent"][0]["bottleneck"]["share"]), ("cpu", 50.0))
+
+    def test_session_without_frames_has_no_bottleneck(self):
+        con = new_db()
+        now = time.time()
+        add_finished(con, 1, now - 7200, 100, reason="crash")
+        add_finished(con, 2, now - 3600, 600, frames=1000)
+        self.assertIsNone(an.overview(con)["recent"][0]["bottleneck"])
+
+    def test_running_session_longest_frame_comes_from_frames(self):
+        con = new_db()
+        now = time.time()
+        add_open_session(con, 1, now - 120)
+        con.execute("UPDATE frames SET ft_max=412.5 WHERE session=1 AND ts=(SELECT MAX(ts) FROM frames)")
+        con.execute("INSERT INTO samples(ts) VALUES (?)", (now - 1,))
+        self.assertEqual(an.overview(con)["current"]["ft_max"], 412.5)
+
+    def test_live_fps_covers_only_the_last_two_minutes(self):
+        con = new_db()
+        now = time.time()
+        add_open_session(con, 1, now - 3000)                                 # 140 fps, long ago
+        con.execute("INSERT INTO frames(ts, session, frames, fps) VALUES (?,1,60,60.0)", (now - 10,))
+        con.execute("INSERT INTO samples(ts) VALUES (?)", (now - 1,))
+        self.assertEqual(an.overview(con)["current"]["fps_live"], 60.0)
+
+    def test_totals_weigh_fps_by_time_over_sessions_with_frames(self):
+        con = new_db()
+        now = time.time()
+        add_finished(con, 1, now - 90 * 86400, 3000, frames=1000, fps=100.0)
+        add_finished(con, 2, now - 60 * 86400, 1000, frames=1000, fps=200.0)
+        add_finished(con, 3, now - 30 * 86400, 500, frames=0)                # PresentMon failed: time, no FPS
+        t = an.overview(con)["totals"]
+        self.assertEqual(t["fps_avg"], 125.0)
+        self.assertEqual(t["play_s"], 4500)
+
+    def test_broken_end_ts_uses_the_last_frame(self):
+        con = new_db()
+        now = time.time()
+        add_finished(con, 1, now - 30 * 86400, 0, frames=1000, fps=100.0)    # hard reset: end_ts == start_ts
+        con.execute("INSERT INTO frames(ts, session, fps) VALUES (?,1,100.0)", (now - 30 * 86400 + 900,))
+        t = an.overview(con)["totals"]
+        self.assertEqual(t["play_s"], 900)
+        self.assertEqual(t["fps_avg"], 100.0)
+
+    def test_week_starts_on_monday_midnight_local(self):
+        con = new_db()
+        now = time.time()
+        today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+        monday = (today - timedelta(days=today.weekday())).timestamp()
+        add_finished(con, 1, monday - 60, 600, frames=1000)
+        add_finished(con, 2, monday + 1, 300, frames=1000)
+        t = an.overview(con)["totals"]
+        self.assertEqual(t["week_s"], 300)
+        self.assertEqual(t["play_s"], 900)
+
+    def test_running_session_counts_and_stale_open_row_does_not(self):
+        con = new_db()
+        now = time.time()
+        add_open_session(con, 1, now - 30 * 86400)                           # never closed
+        add_open_session(con, 2, now - 120)
+        con.execute("INSERT INTO samples(ts) VALUES (?)", (now - 1,))
+        o = an.overview(con)
+        self.assertEqual(o["current"]["id"], 2)
+        self.assertAlmostEqual(o["totals"]["play_s"], 120, delta=2)
+
+    def test_crashes_are_app_crash_incidents_of_the_last_14_days(self):
+        con = new_db()
+        now = time.time()
+        con.executemany("INSERT INTO incidents(ts, kind, severity, title) VALUES (?,?,?,?)",
+                        [(now - 86400, "app_crash", "serious", "a"), (now - 13 * 86400, "app_crash", "serious", "b"),
+                         (now - 15 * 86400, "app_crash", "serious", "old"), (now - 3600, "app_hang", "serious", "hang")])
+        self.assertEqual(an.overview(con)["totals"]["crashes_14d"], 2)
+
+    def test_temps_are_live_only(self):
+        con = new_db()
+        now = time.time()
+        con.execute("INSERT INTO samples(ts, cpu_temp, gpu_temp) VALUES (?,?,?)", (now - 1, 61.04, 58.0))
+        self.assertEqual(an.overview(con)["temps"], {"cpu": 61.0, "gpu": 58.0})
+        con.execute("UPDATE samples SET ts=?", (now - 60,))
+        self.assertIsNone(an.overview(con)["temps"])
 
 
 if __name__ == "__main__":

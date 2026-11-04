@@ -148,7 +148,8 @@ _BOTTLENECK_SHARE = {"gpu": "gpu_bound_pct", "gpu_power": "gpu_bound_pct", "cpu"
                      "cpu_thread": "cpu_bound_pct", "limit": "limit_pct", "vram": "vram_shared_over_pct"}
 
 
-_OVERVIEW_LIVE_S = 130          # stutters sent for a running session (chart shows the last 2 minutes)
+_OVERVIEW_LIVE_S = 120          # a running session's FPS is the average of this window
+_CRASH_WINDOW_S = 14 * 86400    # "awarie" on the overview
 _BOTTLENECK_TTL_S = 30          # live bottleneck refresh; finished sessions are cached for good
 _bottleneck_cache = {}          # session id -> (computed at, result)
 
@@ -167,14 +168,56 @@ def _overview_bottleneck(con, cur, now):
     return b
 
 
+def _session_limit(con, s, now):
+    """{kind, share, advice} of a session; a stored summary keeps the metrics flat, bottleneck.compute nests them."""
+    if not s["running"] and not s.get("frames"):
+        return None
+    b = _overview_bottleneck(con, s, now)
+    if not b:
+        return None
+    return {"kind": b["kind"], "share": (b.get("metrics") or b).get(_BOTTLENECK_SHARE.get(b["kind"])),
+            "advice": b.get("advice") or bottleneck.ADVICE.get(b["kind"])}
+
+
+def _overview_totals(con, now, live_id):
+    """Play time overall and this calendar week (from Monday 00:00 local), time-weighted FPS, app crashes in 14 days.
+
+    Time counts every session, also those without frames (PresentMon can fail during a real game); an open row counts
+    only while it really runs, a stale one would grow forever. FPS = sum(fps_avg * time) / sum(time) over the sessions
+    with frames."""
+    rows = _rows(con, "SELECT id, start_ts, end_ts, summary FROM sessions")
+    ends = _eff_ends(con, rows)
+    today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    week0 = (today - timedelta(days=today.weekday())).timestamp()
+    play = week = fps_sum = fps_time = 0.0
+    for r in rows:
+        end = now if r["id"] == live_id else ends[r["id"]]
+        if end is None:
+            continue
+        dur = max(0.0, end - r["start_ts"])
+        play += dur
+        if r["start_ts"] >= week0:
+            week += dur
+        summ = _json(r["summary"]) or {}
+        if summ.get("frames") and summ.get("fps_avg") is not None:
+            fps_sum += summ["fps_avg"] * dur
+            fps_time += dur
+    crashes = _one(con, "SELECT COUNT(*) AS n FROM incidents WHERE kind='app_crash' AND ts>=?",
+                   (now - _CRASH_WINDOW_S,))["n"]
+    return {"play_s": round(play), "week_s": round(week), "fps_avg": _r(fps_sum / fps_time) if fps_time else None,
+            "crashes_14d": crashes}
+
+
 def overview(con, recent=5):
-    """Overview screen: the running game session, else the last one with frames, plus the latest sessions.
+    """Overview screen: the running game session, else the last one with frames, the latest sessions and the totals.
 
     A running session counts only while the collector is alive and the game renders (a frame in the last 30 s, or
     started under a minute ago), so a stale row after a crash or a launcher without frames doesn't take the card.
-    `current` adds stutter timestamps, the last stutter and the bottleneck ({kind, share, advice})."""
+    `current` and `recent` carry the bottleneck ({kind, share, advice}); a running `current` adds fps_live (average of
+    the last 2 minutes) and its ft_max from the frames, since the stored summary lags a minute behind.
+    `temps` are the live CPU/GPU temperatures, None while the collector is down."""
     now = time.time()
-    s = _one(con, "SELECT ts FROM samples ORDER BY ts DESC LIMIT 1")
+    s = _one(con, "SELECT ts, cpu_temp, gpu_temp FROM samples ORDER BY ts DESC LIMIT 1")
     alive = bool(s and now - s["ts"] < 5)
     rows = sessions(con, recent + 10)
     live = next((r for r in rows if r["running"]), None)
@@ -182,25 +225,21 @@ def overview(con, recent=5):
             con, "SELECT 1 AS x FROM frames WHERE session=? AND ts>?", (live["id"], now - 30)))):
         live = None
     cur = live or next((r for r in rows if not r["running"] and r.get("frames")), None)
-    if cur:
-        sid = cur["id"]
-        if cur["running"]:
-            st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? AND ts>? ORDER BY ts",
-                                               (sid, now - _OVERVIEW_LIVE_S))]
-            last = _one(con, "SELECT MAX(ts) AS ts FROM stutters WHERE session=?", (sid,))["ts"]
-        else:
-            st = [r["ts"] for r in con.execute("SELECT ts FROM stutters WHERE session=? ORDER BY ts", (sid,))]
-            last = st[-1] if st else None
-        cur["stutter_ts"], cur["last_stutter_ts"] = st, last
-        b = _overview_bottleneck(con, cur, now)
-        cur["bottleneck"] = {"kind": b["kind"], "share": (b.get("metrics") or {}).get(_BOTTLENECK_SHARE.get(b["kind"])),
-                             "advice": b.get("advice")} if b else None
+    if live:
+        f = _one(con, "SELECT AVG(CASE WHEN ts>? THEN fps END) AS fps, MAX(ft_max) AS ft_max FROM frames WHERE session=?",
+                 (now - _OVERVIEW_LIVE_S, live["id"]))
+        live["fps_live"], live["ft_max"] = _r(f["fps"]), _r(f["ft_max"])
+    # sessions without frames that ended normally are launchers / short starts, not games played
+    played = [r for r in rows if not r["running"] and r is not cur
+              and (r.get("frames") or r["end_reason"] != "exit")][:recent]
+    for r in ([cur] if cur else []) + played:
+        r["bottleneck"] = _session_limit(con, r, now)
     return {
         "now": now,
         "current": cur,
-        # sessions without frames that ended normally are launchers / short starts, not games played
-        "recent": [r for r in rows if not r["running"] and r is not cur
-                   and (r.get("frames") or r["end_reason"] != "exit")][:recent],
+        "recent": played,
+        "totals": _overview_totals(con, now, live["id"] if live else None),
+        "temps": {"cpu": _r(s["cpu_temp"]), "gpu": _r(s["gpu_temp"])} if alive else None,
     }
 
 
