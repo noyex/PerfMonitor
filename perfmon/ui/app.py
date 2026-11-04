@@ -2,6 +2,7 @@
 import socket
 import sys
 import webbrowser
+from pathlib import Path
 
 from .. import config
 from .server import serve
@@ -25,7 +26,7 @@ def main():
         import webview
         webview.create_window("PerfMonitor", url, width=1440, height=920, min_size=(1000, 700),
                               background_color="#000000")
-        webview.start()
+        webview.start(icon=str(Path(__file__).parent / "static" / "favicon.ico"))
     except Exception:
         webbrowser.open(url)
 

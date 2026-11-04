@@ -31,7 +31,7 @@ foreach ($dir in @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:APPD
     $lnk.TargetPath = $pyw
     $lnk.Arguments = '-m perfmon.ui.app'
     $lnk.WorkingDirectory = $root
-    $lnk.IconLocation = "$env:SystemRoot\System32\imageres.dll,144"
+    $lnk.IconLocation = "$root\perfmon\ui\static\favicon.ico"
     $lnk.Description = 'PerfMonitor - wydajność i problemy'
     $lnk.Save()
 }
