@@ -57,6 +57,12 @@ const h = (tag, attrs = {}, ...children) => {
   return e;
 };
 
+// Live temperatures in the dock; null while the collector is down.
+const setTemps = (t) => {
+  document.getElementById("temp-cpu").textContent = t && t.cpu != null ? `${fmt(t.cpu)}°` : "–";
+  document.getElementById("temp-gpu").textContent = t && t.gpu != null ? `${fmt(t.gpu)}°` : "–";
+};
+
 const toast = (msg) => {
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -193,7 +199,7 @@ const chart = (container, opt, data) => {
     stroke: css("--muted"),
     grid: { stroke: css("--grid"), width: 1 },
     ticks: { show: false },
-    font: `13px Geist, system-ui, sans-serif`,
+    font: `13px Nohemi, system-ui, sans-serif`,
   };
   const u = new uPlot(
     {
