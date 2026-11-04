@@ -169,18 +169,18 @@ def _overview_bottleneck(con, cur, now):
 
 
 def _session_limit(con, s, now):
-    """{kind, share, advice} of a session; a stored summary keeps the metrics flat, bottleneck.compute nests them."""
+    """{kind, share} of a session; a stored summary keeps the metrics flat, bottleneck.compute nests them."""
     if not s["running"] and not s.get("frames"):
         return None
     b = _overview_bottleneck(con, s, now)
     if not b:
         return None
-    return {"kind": b["kind"], "share": (b.get("metrics") or b).get(_BOTTLENECK_SHARE.get(b["kind"])),
-            "advice": b.get("advice") or bottleneck.ADVICE.get(b["kind"])}
+    return {"kind": b["kind"], "share": (b.get("metrics") or b).get(_BOTTLENECK_SHARE.get(b["kind"]))}
 
 
 def _overview_totals(con, now, live_id):
-    """Play time overall and this calendar week (from Monday 00:00 local), time-weighted FPS, app crashes in 14 days.
+    """Play time overall and this calendar week (Monday 00:00 local, a session over the edge counts its part in the
+    week), time-weighted FPS, app crashes in 14 days.
 
     Time counts every session, also those without frames (PresentMon can fail during a real game); an open row counts
     only while it really runs, a stale one would grow forever. FPS = sum(fps_avg * time) / sum(time) over the sessions
@@ -196,8 +196,7 @@ def _overview_totals(con, now, live_id):
             continue
         dur = max(0.0, end - r["start_ts"])
         play += dur
-        if r["start_ts"] >= week0:
-            week += dur
+        week += max(0.0, end - max(r["start_ts"], week0))
         summ = _json(r["summary"]) or {}
         if summ.get("frames") and summ.get("fps_avg") is not None:
             fps_sum += summ["fps_avg"] * dur
@@ -213,9 +212,10 @@ def overview(con, recent=5):
 
     A running session counts only while the collector is alive and the game renders (a frame in the last 30 s, or
     started under a minute ago), so a stale row after a crash or a launcher without frames doesn't take the card.
-    `current` and `recent` carry the bottleneck ({kind, share, advice}); a running `current` adds fps_live (average of
-    the last 2 minutes) and its ft_max from the frames, since the stored summary lags a minute behind.
-    `temps` are the live CPU/GPU temperatures, None while the collector is down."""
+    `current` and `recent` carry the bottleneck ({kind, share}); a running `current` adds fps_live (average of the
+    last 2 minutes) and its ft_max from the frames, since the stored summary lags a minute behind.
+    `temps` are the live CPU/GPU temperatures, None while the collector is down. `game_running` is any open session
+    with a live collector: wider than a running `current`, a game also runs without frames or on a loading screen."""
     now = time.time()
     s = _one(con, "SELECT ts, cpu_temp, gpu_temp FROM samples ORDER BY ts DESC LIMIT 1")
     alive = bool(s and now - s["ts"] < 5)
@@ -238,6 +238,7 @@ def overview(con, recent=5):
         "now": now,
         "current": cur,
         "recent": played,
+        "game_running": alive and any(r["running"] for r in rows),
         "totals": _overview_totals(con, now, live["id"] if live else None),
         "temps": {"cpu": _r(s["cpu_temp"]), "gpu": _r(s["gpu_temp"])} if alive else None,
     }

@@ -85,7 +85,6 @@ class OverviewTest(unittest.TestCase):
                      bottleneck={"kind": "gpu", "why": "GPU-bound 89% czasu", "gpu_bound_pct": 89.0})
         o = an.overview(con)
         self.assertEqual((o["current"]["bottleneck"]["kind"], o["current"]["bottleneck"]["share"]), ("gpu", 89.0))
-        self.assertTrue(o["current"]["bottleneck"]["advice"])
         self.assertEqual((o["recent"][0]["bottleneck"]["kind"], o["recent"][0]["bottleneck"]["share"]), ("cpu", 50.0))
 
     def test_session_without_frames_has_no_bottleneck(self):
@@ -135,11 +134,12 @@ class OverviewTest(unittest.TestCase):
         now = time.time()
         today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
         monday = (today - timedelta(days=today.weekday())).timestamp()
-        add_finished(con, 1, monday - 60, 600, frames=1000)
-        add_finished(con, 2, monday + 1, 300, frames=1000)
+        add_finished(con, 1, monday - 7200, 600, frames=1000)                # last week
+        add_finished(con, 2, monday - 60, 600, frames=1000)                  # over the edge: 540 s in this week
+        add_finished(con, 3, monday + 1, 300, frames=1000)
         t = an.overview(con)["totals"]
-        self.assertEqual(t["week_s"], 300)
-        self.assertEqual(t["play_s"], 900)
+        self.assertEqual(t["week_s"], 840)
+        self.assertEqual(t["play_s"], 1500)
 
     def test_running_session_counts_and_stale_open_row_does_not(self):
         con = new_db()
@@ -158,6 +158,16 @@ class OverviewTest(unittest.TestCase):
                         [(now - 86400, "app_crash", "serious", "a"), (now - 13 * 86400, "app_crash", "serious", "b"),
                          (now - 15 * 86400, "app_crash", "serious", "old"), (now - 3600, "app_hang", "serious", "hang")])
         self.assertEqual(an.overview(con)["totals"]["crashes_14d"], 2)
+
+    def test_game_running_covers_a_game_without_recent_frames(self):
+        con = new_db()
+        now = time.time()
+        add_open_session(con, 1, now - 3600)                                 # frames an hour old: not `current`
+        self.assertFalse(an.overview(con)["game_running"])                   # no collector
+        con.execute("INSERT INTO samples(ts) VALUES (?)", (now - 1,))
+        o = an.overview(con)
+        self.assertIsNone(o["current"])
+        self.assertTrue(o["game_running"])
 
     def test_temps_are_live_only(self):
         con = new_db()
