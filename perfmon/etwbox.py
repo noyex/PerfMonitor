@@ -34,6 +34,7 @@ ANALYZE_DELAY_S = 30       # let the disk settle after writing the .etl
 RETRY_S = 600              # after a failed wpr -start (no admin, another kernel logger, ...)
 BURST_WINDOW_S = 10
 DPC_TRIGGER_S = 2
+MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
 
 
 def settings(cfg):
@@ -350,6 +351,8 @@ def parse_csv(path, last_s=60):
                     init = init * 10_000_000 // perf_freq
                 diff = clock - init
                 min_diff = diff if min_diff is None or diff < min_diff else min_diff
+                if diff - min_diff > _units(MAX_DPC_US / 1e6, filetime_clock, perf_freq):
+                    continue   # start and end paired across a clock jump: seen as "56497207 ms"
                 (dpc if op in DPC_OPS else isr)[routine].add(diff)
                 events += 1
             elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
@@ -415,6 +418,15 @@ def headline(summary):
         parts.append(f"dysk: {disk['process']} {disk['max_ms']:.0f} ms")
         sev = "warning" if sev == "info" else sev
     return sev, "ETW: " + (", ".join(parts) if parts else "brak długich DPC/ISR")
+
+
+def fix_old_headlines(con):
+    """Incidents stored before impossible DPC/ISR durations were dropped."""
+    for iid, title in con.execute("SELECT id, title FROM incidents WHERE kind='etw_capture'").fetchall():
+        m = re.search(r"(DPC|ISR): \S+ ([\d.]+) ms max", title)
+        if m and float(m[2]) * 1000 >= MAX_DPC_US:
+            con.execute("UPDATE incidents SET severity='info', title=? WHERE id=?",
+                        (f"ETW: pominięty błędny pomiar {m[1]}", iid))
 
 
 def analyze(con, cid, keep_csv=False):

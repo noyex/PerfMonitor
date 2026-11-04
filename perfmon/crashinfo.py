@@ -239,7 +239,7 @@ def interpret(code, module, exe, history=None):
                 "next_steps": ["Zweryfikuj pliki gry (Steam/Battle.net: Sprawdź i napraw)",
                                "Wyczyść cache shaderów gry", "Jeśli crash pojawił się po aktualizacji - zgłoś/poczekaj na patch"]}
     if code in CPU_SUSPECT_CODES:
-        return {"verdict": f"{code_name(code)}: gra sama się przerwała. Bug gry, a jeśli to się powtarza w różnych "
+        return {"verdict": f"{code_name(code)}: program sam się przerwał. Błąd programu, a jeśli to się powtarza w różnych "
                            "modułach - niestabilny CPU/RAM", "confidence": "low",
                 "next_steps": ["Porównaj moduły kolejnych crashy (pm health)",
                                "Przy powtórkach: test bez EXPO/CO, sprawdź WHEA"]}
