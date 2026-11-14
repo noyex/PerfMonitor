@@ -28,6 +28,11 @@
 
   // data-tauri-drag-region: drags the window, and a double click toggles maximize.
   document.body.append(h("div", { class: "drag", "data-tauri-drag-region": "" }), h("div", { class: "winctl" }, min, max, close));
-  window.addEventListener("resize", sync);
+  // The state flips after the resize event that announced it, so read it once the resizing has settled.
+  let settle;
+  window.addEventListener("resize", () => {
+    clearTimeout(settle);
+    settle = setTimeout(sync, 100);
+  });
   sync();
 })();
