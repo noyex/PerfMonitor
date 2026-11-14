@@ -379,7 +379,7 @@ def _tune_step(con, p, ctx, prev_text):
                           "value": "pm oc stability", "command": "pm oc stability"},
                     test={"what": "Pełne kryteria stabilności (10 h gry, 3 dni, wszystkie testy)", "criteria": st["checks"]},
                     next_if_ok=f"Gdy wszystkie kryteria są spełnione, możesz sam oznaczyć profil jako stabilny: "
-                               f"pm oc edit {p['id']} --status stable (PerfMonitor tego nie zrobi).",
+                               f"pm oc edit {p['id']} --status stable (NX Frame tego nie zrobi).",
                     rollback_if_bad="Przy błędach wróć do poprzedniego, stabilnego profilu.", can_mark_stable=st["can_mark_stable"])
     what, crit = _future_gate(s["kind"])
     cmd = _command(s["new_cpu"], s["new_gpu"], s["new_notes"] if s.get("notes") else None)
