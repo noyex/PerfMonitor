@@ -87,13 +87,13 @@ def _short(v):
     return s if len(s) <= 40 else s[:39] + "…"
 
 
-def _judge(cur, base):
+def _judge(cur, base, min_n=MIN_BASELINE):
     """Per-metric verdicts of `cur` against the baseline metric dicts."""
     out = []
     for key, label, sign, rel, floor in METRICS:
         vals = [b[key] for b in base if b.get(key) is not None]
         v = cur.get(key)
-        if v is None or len(vals) < MIN_BASELINE:
+        if v is None or len(vals) < min_n:
             continue
         med = _median(vals)
         spread = 1.4826 * _median([abs(x - med) for x in vals])
@@ -146,8 +146,8 @@ def assess(con, session_id, rows=None):
     good = None
     for x, m in reversed(earlier):
         others = [o for y, o in earlier if y["id"] != x["id"]]
-        if len(others) >= MIN_BASELINE - 1 and not any(j["verdict"] == "regression" for j in _judge(m, others)
-                                                       if j["key"] in ("fps_avg", "fps_1low")):
+        if not any(j["verdict"] == "regression" for j in _judge(m, others, MIN_BASELINE - 1)
+                   if j["key"] in ("fps_avg", "fps_1low")):
             good = x
             break
     good = good or earlier[-1][0]

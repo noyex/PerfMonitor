@@ -607,7 +607,10 @@ def incidents_between(con, t0, t1, kinds=None, limit=500, group=False):
         kinds = [kinds] if isinstance(kinds, str) else list(kinds)
         sql += f" AND kind IN ({','.join('?' * len(kinds))})"
         args += kinds
-    rows = _rows(con, sql + " ORDER BY ts LIMIT ?", args + [100000 if group else limit])
+    if group:   # newest rows win the cap, grouped in time order
+        rows = _rows(con, sql + " ORDER BY ts DESC LIMIT 100000", args)[::-1]
+    else:
+        rows = _rows(con, sql + " ORDER BY ts LIMIT ?", args + [limit])
     for r in rows:
         r["details"] = _json(r["details"])
         r["time"] = fmt_ts(r["ts"])

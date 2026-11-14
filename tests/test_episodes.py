@@ -24,6 +24,16 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(end, 12)   # first second off, not when the gap ran out
         self.assertEqual(patch, {"count": 2, "worst": {"commit_pct": 97.5}})
 
+    def test_first_off_second_and_return_are_reported(self):
+        t = episodes.Tracker()
+        t.start("dwm_stall", {"ts": 0, "dwm_ms": 2500})
+        self.assertFalse(t.off("dwm_stall", 5))
+        self.assertTrue(t.just_off("dwm_stall", 5))   # collector writes a provisional end here
+        t.off("dwm_stall", 6)
+        self.assertFalse(t.just_off("dwm_stall", 6))
+        self.assertTrue(t.hit("dwm_stall", {"ts": 7, "dwm_ms": 2600}))   # back: provisional end cleared
+        self.assertFalse(t.hit("dwm_stall", {"ts": 8, "dwm_ms": 2600}))
+
     def test_kind_without_gap_closes_at_once(self):
         t = episodes.Tracker()
         t.start("unknown_kind", {"ts": 0})

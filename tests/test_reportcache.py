@@ -83,6 +83,15 @@ class ReportCacheTest(unittest.TestCase):
         self.build(self.con, 1)   # rebuilt under the other version: rebuilt again under the current one
         self.assertEqual(len(self.calls), 7)
 
+    def test_earlier_session_rewrite_invalidates(self):   # the regression verdict reads earlier sessions
+        self.con.isolation_level = None
+        self.con.execute("INSERT INTO sessions(id, exe, start_ts, end_ts, summary) VALUES (0, 'g.exe', 9e8, 9e8 + 60, '{}')")
+        self.build(self.con, 1)
+        self.build(self.con, 1)
+        self.con.execute("""UPDATE sessions SET summary='{"gameplay": {"seconds": 60}}' WHERE id=0""")
+        self.build(self.con, 1)
+        self.assertEqual(self.calls, [1, 1])
+
     def test_in_memory_db_uses_the_same_connection(self):
         con = new_db()
         con.execute("INSERT INTO sessions(id, exe, start_ts, end_ts) VALUES (1, 'g.exe', 1e9, 1e9 + 60)")

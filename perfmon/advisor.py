@@ -8,7 +8,7 @@ import time
 from collections import Counter, defaultdict
 
 from . import analyze as an
-from . import experiments, present
+from . import experiments, present, regression
 
 MAIN_GAME_DAYS = 14
 RECENT_SESSIONS = 6
@@ -31,7 +31,6 @@ WIFI_PROVIDERS = ("Netwtw%", "Netwbw%", "Netwsw%", "rtwlan%", "RtlWlan%", "mtkwl
 NET_HOME_KINDS = ("net_down", "net_link_down", "packet_loss", "latency_spike", "wifi_weak")
 
 TIER_STABILITY, TIER_NORMAL, TIER_LAST = 0, 1, 2
-GAME_ALIAS = re.compile(r"^(sp|mp|zm)\d*-", re.I)    # sp26-cod.exe and cod.exe are one game
 BG_GPU_IGNORE = {"dwm.exe", "system", "idle", "csrss.exe", "explorer.exe", "searchhost.exe"}
 # not autostart apps: our own tools, Windows components, the GPU driver service (judged by the background_gpu rule)
 OWN_PROCS = {"python.exe", "pythonw.exe", "powershell.exe", "presentmon.exe", "dwm.exe", "svchost.exe", "csrss.exe",
@@ -42,7 +41,7 @@ GIGABYTE_RE = re.compile(r"easytune|aorus|^gcc|gigabyte", re.I)
 
 
 def _game_key(exe):
-    return GAME_ALIAS.sub("", (exe or "").lower())
+    return regression.game_key(exe)   # sp26-cod.exe and cod.exe are one game
 
 
 # ---------------------------------------------------------------- data gathering
@@ -97,7 +96,7 @@ def _wifi(con, t0):
     home = Counter(i["kind"] for i in an.incidents_between(con, t0, time.time(), kinds=NET_HOME_KINDS, limit=100000,
                                                            group=True)
                    if i["kind"] == "net_link_down" or (isinstance(i["details"], dict) and i["details"].get("where") == "home"))
-    net_s = sum(links.values())
+    net_s = sum(n for link, n in links.items() if link)   # disconnected seconds (link NULL) are neither Wi-Fi nor cable
     return {"provider": ev[0], "event_id": ev[1], "n": ev[2], "adapter": (ev[3] or "").split("|")[-1].strip() or None,
             "net_s": net_s, "wifi_pct": round(100 * links["wifi"] / net_s) if net_s else None, "home": dict(home)}
 

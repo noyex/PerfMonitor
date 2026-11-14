@@ -288,9 +288,14 @@ class Collector:
             if kind in ("ui_freeze", "dwm_stall"):
                 self.etw.trigger(kind)
         elif active:
-            self.episodes.hit(kind, row)
-        elif iid is not None and self.episodes.off(kind, row["ts"]):
-            self._end_episode(kind, iid, row["ts"])
+            if self.episodes.hit(kind, row):   # back within the gap: the episode is ongoing again
+                self.exec("UPDATE incidents SET end_ts=NULL WHERE id=?", (iid,))
+        elif iid is not None:
+            if self.episodes.off(kind, row["ts"]):
+                self._end_episode(kind, iid, row["ts"])
+            elif self.episodes.just_off(kind, row["ts"]):
+                # provisional end while the gap runs: a reset now must not read as "frozen until the reset"
+                self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
 
     def _end_episode(self, kind, iid, now):
         """Close an ongoing incident; its details get the episode's count and worst value."""

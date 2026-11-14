@@ -24,19 +24,22 @@ from . import config
 
 REPORT_VERSION = "1"   # bump for changes the source hash cannot see (e.g. a new external input)
 MIN_AGE_S = 600
-_code_hash = None
 _lock = threading.Lock()
 
 
+def _source_hash():
+    h = hashlib.sha1(REPORT_VERSION.encode())
+    for p in sorted(Path(__file__).parent.glob("*.py")):
+        h.update(p.name.encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+_code_hash = _source_hash()   # at import, so files updated on disk later never pass as the running code
+
+
 def code_version():
-    """REPORT_VERSION + hash of the analysis sources and the user config (computed once per process)."""
-    global _code_hash
-    if _code_hash is None:
-        h = hashlib.sha1(REPORT_VERSION.encode())
-        for p in sorted(Path(__file__).parent.glob("*.py")):
-            h.update(p.name.encode())
-            h.update(p.read_bytes())
-        _code_hash = h.hexdigest()[:16]
+    """REPORT_VERSION + hash of the analysis sources (as loaded: hashed at import) and the user config."""
     try:
         cfg = config.CONFIG_PATH.read_bytes()
     except OSError:
@@ -58,6 +61,12 @@ def _key(con, row):
             s.update(repr(tuple(con.execute(q, a).fetchone())).encode())
         except sqlite3.Error:
             s.update(b"-")
+    # the regression verdict depends on earlier sessions (summary/context rewritten by upgrades) and config changes
+    for q, a in (("SELECT COUNT(*), MAX(id), TOTAL(length(summary)), TOTAL(length(context)), TOTAL(end_ts) FROM sessions "
+                  "WHERE start_ts < ?", (start,)),
+                 ("SELECT COUNT(*), MAX(id) FROM incidents WHERE kind IN ('config_change', 'gpu_settings_change') "
+                  "AND ts < ?", (start,))):
+        s.update(repr(tuple(con.execute(q, a).fetchone())).encode())
     first = con.execute("SELECT MIN(ts) FROM samples").fetchone()[0]
     s.update(b"pruned" if first is not None and first > start else b"full")
     return f"{code_version()}:{s.hexdigest()}"

@@ -43,6 +43,16 @@ class RegressionTest(unittest.TestCase):
         self.assertEqual(f["severity"], "warning")
         self.assertIn("1% low", f["title"])   # the biggest drop leads
 
+    def test_last_good_skips_a_bad_session_in_a_small_baseline(self):
+        con = new_db()
+        add(con, 1, 140)
+        add(con, 2, 141)
+        add(con, 3, 110, low=70, ctx=dict(CTX, adrenalin="26.10.2"))   # the driver update already hurt
+        add(con, 10, 112, low=71, ctx=dict(CTX, adrenalin="26.10.2"))
+        a = regression.assess(con, 10)
+        self.assertEqual(a["last_good"]["session"], 2)
+        self.assertEqual([c["key"] for c in a["changes"]], ["adrenalin"])
+
     def test_new_context_keys_diff_generically(self):
         con = new_db()
         for i in range(1, 5):

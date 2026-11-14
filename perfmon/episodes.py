@@ -59,15 +59,23 @@ class Tracker:
         self._worst(kind, row)
 
     def hit(self, kind, row):
-        """Condition on while the incident is open; a return after an off period is one more occurrence."""
+        """Condition on while the incident is open; a return after an off period is one more occurrence (True)."""
         st = self.s.get(kind)
         if st is None:
-            return self.start(kind, row)
-        if st["off_since"] is not None:
+            self.start(kind, row)
+            return False
+        back = st["off_since"] is not None
+        if back:
             st["count"] += 1
             st["off_since"] = None
         st["last"] = row["ts"]
         self._worst(kind, row)
+        return back
+
+    def just_off(self, kind, ts):
+        """True on the first off second of an episode (after off() recorded it)."""
+        st = self.s.get(kind)
+        return bool(st and st["off_since"] == ts)
 
     def off(self, kind, ts):
         """Condition off: True when the episode is over (off for its gap; kinds without a gap end at once)."""
