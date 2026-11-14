@@ -23,6 +23,8 @@ def main():
         input() if sys.stdin and sys.stdin.isatty() else __import__("time").sleep(10**9)
         return
     try:
+        # Own taskbar identity, otherwise Windows groups the window under pythonw.exe and its icon
+        __import__("ctypes").windll.shell32.SetCurrentProcessExplicitAppUserModelID("PerfMonitor.UI")
         import webview
         webview.create_window("PerfMonitor", url, width=1440, height=920, min_size=(1000, 700),
                               background_color="#000000")
