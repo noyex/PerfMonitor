@@ -1,5 +1,5 @@
-r"""Config snapshot: hardware, drivers, Windows settings important for games. Taken daily (full) and at every game
-session start (quick: everything but the disk health counters).
+r"""Config snapshot: hardware, drivers, Windows settings important for games. Taken daily (full, and at collector
+start) and at every game session start (quick: without disk health, drivers/KBs and display state).
 
 All readers are read-only. Unknown stays null (never a guess). Snapshot parts are providers (register()): each
 returns a dict merged into the snapshot; one failing provider only adds snapshot.errors[name].
@@ -121,7 +121,9 @@ def _gpus(ctx):
                     "refresh": g.get("CurrentRefreshRate"),
                     "res": f"{g.get('CurrentHorizontalResolution') or ''}x{g.get('CurrentVerticalResolution') or ''}",
                     "status": g.get("Status"), "igpu": bool(IGPU_RE.search(g.get("Name") or "")),
-                    "bar_mb": _bar_mb(g.get("PNPDeviceID")), "anti_lag": cls.get("KMD_DeLagEnabled"),
+                    # ASSOCIATORS takes 0.5-7 s and the BAR only changes with BIOS settings: daily snapshot only
+                    "bar_mb": None if ctx.get("quick") else _bar_mb(g.get("PNPDeviceID")),
+                    "anti_lag": cls.get("KMD_DeLagEnabled"),
                     "rebar_mode": cls.get("KMD_RebarControlMode")})
     return {"gpus": out}
 
@@ -192,7 +194,7 @@ def _windows(ctx):
 
 
 # ---------------------------------------------------------------- new sections
-@provider("display")
+@provider("display", quick=False)   # a starting game may switch modes: the desktop state is the setting
 def _display(ctx):
     return {"displays": displays() or None, "monitor_state": winsettings.monitor_state() or None,
             "directx": winsettings.directx()}
@@ -206,7 +208,7 @@ def _tuning(ctx):
             "defender": winsettings.defender(ctx.get("game_paths") or [])}
 
 
-@provider("drivers")
+@provider("drivers", quick=False)   # SetupAPI + QFE ~0.7 s; drivers change with reboots (daily runs at start)
 def _drivers(ctx):
     return {"drivers": winsettings.drivers(), "kbs": winsettings.kbs()}
 

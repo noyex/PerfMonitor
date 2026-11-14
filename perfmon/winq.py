@@ -19,6 +19,14 @@ def _locator():
     return _local.loc
 
 
+def release():
+    """Drop this thread's WMI objects and COM apartment (snapshot threads are short-lived)."""
+    if getattr(_local, "loc", None) is not None:
+        import pythoncom
+        _local.svc, _local.loc = None, None
+        pythoncom.CoUninitialize()
+
+
 def wmi(sql, ns=r"root\cimv2"):
     """[{property: value}] for a WQL query. Raises on a missing namespace / access denied."""
     loc = _locator()

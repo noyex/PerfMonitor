@@ -79,6 +79,18 @@ class SystemSnapshot(unittest.TestCase):
         self.assertIn("power", new)   # quick snapshot carries keys over from the stored one
 
 
+class QuickMerge(unittest.TestCase):
+    def test_desktop_mode_and_daily_sections_carry_over(self):
+        old = {"gpus": [{"name": GPU, "driver": "1", "refresh": 280, "res": "2560x1440", "bar_mb": 16384}], "drivers": {"usb": []},
+               "hags": 2, "error": "powershell era", "snapshot": {"quick": False}}
+        new = {"gpus": [{"name": GPU, "driver": "2", "refresh": 144, "res": "1920x1080", "bar_mb": None}], "hags": None,
+               "snapshot": {"quick": True}}
+        m = sessionctx.quick_merge(old, new)
+        self.assertEqual(m["gpus"], [{"name": GPU, "driver": "2", "refresh": 280, "res": "2560x1440", "bar_mb": 16384}])
+        self.assertEqual((m["hags"], m["drivers"], m["snapshot"]["quick"]), (2, {"usb": []}, True))
+        self.assertNotIn("error", m)
+
+
 class DuringGame(unittest.TestCase):
     def setUp(self):
         self.col = FakeCollector()

@@ -8,9 +8,25 @@ import logging
 import threading
 import time
 
-from . import confdiff, diskinfo, gamemods, gamesettings, sysinfo
+from . import confdiff, diskinfo, gamemods, gamesettings, sysinfo, winq
 
 log = logging.getLogger("perfmon.sessionctx")
+GPU_MODE_KEYS = ("refresh", "res")   # Win32_VideoController mode: the starting game may have switched it
+
+
+def quick_merge(old, new):
+    """Session-start snapshot on top of the stored one: daily-only sections (disk health, drivers, displays) and
+    values a provider could not read carry over (unread is not changed); GPU modes stay the desktop's."""
+    out = {k: v for k, v in old.items() if k not in ("error", "snapshot") and (k not in new or new[k] is None)}
+    out.update({k: v for k, v in new.items() if v is not None})
+    desk = {g.get("name"): g for g in old.get("gpus") or [] if isinstance(g, dict)}
+    for g in out.get("gpus") or []:
+        if isinstance(g, dict) and g.get("name") in desk:
+            d = desk[g["name"]]
+            g.update({k: d.get(k) for k in GPU_MODE_KEYS if k in d})
+            if g.get("bar_mb") is None and "bar_mb" in d:   # not read by the quick snapshot
+                g["bar_mb"] = d.get("bar_mb")
+    return out
 
 
 class SessionContext:
@@ -38,9 +54,8 @@ class SessionContext:
             info = sysinfo.collect(quick=quick, game_paths=paths, gpu_name=gpu)
             prev = self.col.exec("SELECT ts, info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
             old = json.loads(prev[1]) if prev else None
-            if quick and old:   # slow sections (disk health) and failed providers carry over: unread is not changed
-                info = {**{k: v for k, v in old.items() if k not in info or info[k] is None}, **{
-                    k: v for k, v in info.items() if v is not None}}
+            if quick and old:
+                info = quick_merge(old, info)
             changes = confdiff.diff(old, info) if old else []
             now = time.time()
             ts = prev[0] if prev else None
@@ -86,6 +101,8 @@ class SessionContext:
             self.sysinfo(quick=True, session=sid, extra_paths=[path] if path else ())
         except Exception:
             log.exception("session-start snapshot for session %s", sid)
+        finally:
+            winq.release()
 
     # ---------- while the game runs ----------
     def tick(self, now):
@@ -107,6 +124,7 @@ class SessionContext:
             return   # files untouched: no re-read
         snap = gamesettings.snapshot(g["exe"], g["path"], self.cfg)
         if not snap or "error" in snap:
+            st["next"] = now + 600   # no settings file (yet): look again rarely, this runs on the main loop
             return
         st["stamp"] = gamesettings.file_stamp(snap)
         if snap["hash"] == st["hash"]:

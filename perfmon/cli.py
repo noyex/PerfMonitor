@@ -14,7 +14,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from perfmon import analyze as an  # noqa: E402
-from perfmon import bottleneck, config, db, present  # noqa: E402
+from perfmon import bottleneck, confdiff, config, db, present  # noqa: E402
 from perfmon import experiments as exps  # noqa: E402
 from perfmon import ocanalyze as oc  # noqa: E402
 from perfmon import ocassist  # noqa: E402
@@ -469,12 +469,11 @@ def cmd_sysinfo(con, a):
     if a.diff:
         if len(rows) < 2:
             return out("Tylko jedna migawka - nie ma z czym porównać.")
-        old = json.loads(rows[1]["info"])
-        d = {k: {"before": old.get(k), "after": cur.get(k)} for k in set(cur) | set(old) if old.get(k) != cur.get(k)}
+        d = confdiff.diff(json.loads(rows[1]["info"]), cur)   # same rules as config_change incidents
         if a.json:
             return dump(d)
         out(f"## Zmiany konfiguracji {an.fmt_ts(rows[1]['ts'])} -> {an.fmt_ts(rows[0]['ts'])}")
-        return table([{"key": k, "before": v["before"], "after": v["after"]} for k, v in d.items()], maxw=300) if d else out("Brak zmian.")
+        return table([{"change": c["text"]} for c in d], maxw=300) if d else out("Brak zmian.")
     if a.json:
         return dump({"ts": rows[0]["ts"], "info": cur})
     out(f"## Konfiguracja systemu (migawka {an.fmt_ts(rows[0]['ts'])})")

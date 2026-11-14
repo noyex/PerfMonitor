@@ -82,7 +82,7 @@ class Parsers(Fake):
         p = self.tmp / "game" / "settings.json"
         p.parent.mkdir()
         p.write_text('{"video": {"ResolutionSizeX": 1920, "ResolutionSizeY": 1080, "vsync": true}}')
-        s = gs.snapshot("game.exe", r"C:\Games\game.exe", {"game_settings_paths": {"game.exe": [str(p)]}})
+        s = gs.snapshot("game.exe", r"C:\Games\game.exe", {"game_settings_paths": {"Game.exe": [str(p)]}})
         self.assertEqual(s["raw"]["video.vsync"], "True")
         self.assertEqual(s["normalized"]["resolution"], "1920x1080")
 

@@ -63,6 +63,8 @@ LABELS = {
 }
 
 NAME_KEYS = ("name", "monitor", "device", "path", "id")
+# lists whose items follow the games played (sysinfo game_paths): a new item is a new game, not a changed PC
+ITEMS_FOLLOW_GAMES = {"game_exes", "defender.games_excluded"}
 
 
 def _fmt(v):
@@ -141,7 +143,9 @@ def diff(old, new, volatile=VOLATILE, null_is_unknown=True):
         top = re.split(r"[.\[]", it, maxsplit=1)[0]
         parent = it[:it.rindex("[")]
         unread = (parent in fo and fo[parent] is None) or (parent in fn and fn[parent] is None)   # list was null
-        if top not in old or top not in new or unread or _volatile(it, volatile) or any(it.startswith(w) for w in whole):
+        follows = re.sub(r"\[[^\]]*\]", "", it) in ITEMS_FOLLOW_GAMES
+        if top not in old or top not in new or unread or follows or _volatile(it, volatile) \
+                or any(it.startswith(w) for w in whole):
             continue
         whole.add(it)
         added = it in inew
@@ -149,6 +153,8 @@ def diff(old, new, volatile=VOLATILE, null_is_unknown=True):
                     "text": f"{label(it)}: {'dodano' if added else 'usunięto'}"})
     for k in sorted(set(fo) | set(fn)):
         if _volatile(k, volatile) or any(k.startswith(w) for w in whole):
+            continue
+        if (k not in fo or k not in fn) and any(k.startswith(f + "[") for f in ITEMS_FOLLOW_GAMES):
             continue
         a, b = fo.get(k), fn.get(k)
         if a == b:

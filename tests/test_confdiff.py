@@ -50,6 +50,14 @@ class Diff(unittest.TestCase):
         self.assertEqual(cd.diff(old, new), [])
         self.assertEqual(cd.diff(snap(hags=2), snap(hags=None)), [])
 
+    def test_new_game_is_not_a_config_change(self):
+        exe = lambda p, fso=False: {"path": p, "gpu_preference": "default", "fso_disabled": fso}
+        old = snap(game_exes=[exe("D:\\cod.exe")], defender={"games_excluded": [{"path": "D:\\A", "excluded": False}]})
+        new = snap(game_exes=[exe("D:\\cod.exe", True), exe("D:\\bf6.exe")],
+                   defender={"games_excluded": [{"path": "D:\\A", "excluded": False}, {"path": "D:\\B", "excluded": True}]})
+        self.assertEqual([c["text"] for c in cd.diff(old, new)],
+                         ["wyłączone optymalizacje pełnego ekranu D:\\cod.exe: wył. → wł."])
+
     def test_details_and_title(self):
         new = snap(gpus=[{"name": GPU, "driver": "32.0.2", "refresh": 144}])
         ch = cd.diff(snap(), new)

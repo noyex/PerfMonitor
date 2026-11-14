@@ -237,8 +237,8 @@ def _expand(p):
 
 def locate(exe, exe_path, cfg=None):
     """([(path, parser, key prefix)], normalizer, searched patterns) or None when the game is not known at all."""
-    extra = [(_newest([_expand(p)]), _by_ext(p), "") for p in ((cfg or {}).get("game_settings_paths") or {}).get(
-        (exe or "").lower(), [])]
+    paths = {k.lower(): v for k, v in ((cfg or {}).get("game_settings_paths") or {}).items()}.get((exe or "").lower(), [])
+    extra = [(_newest([_expand(p)]), _by_ext(p), "") for p in paths]
     for rx, loc, norm in GAMES:
         if rx.match(exe or ""):
             files, searched = loc(exe_path)
@@ -247,7 +247,7 @@ def locate(exe, exe_path, cfg=None):
     if files:
         return files + extra, norm_ue, searched
     if extra:
-        return extra, norm_generic, [p for p in cfg["game_settings_paths"][exe.lower()]]
+        return extra, norm_generic, list(paths)
     return None
 
 

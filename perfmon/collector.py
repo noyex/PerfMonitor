@@ -875,6 +875,8 @@ class Collector:
             self.session_ctx.sysinfo(quick=False)
         except Exception:
             log.exception("system snapshot")
+        finally:
+            sessionctx.winq.release()
 
     # ---------- self reload ----------
     def check_reload(self, now):
