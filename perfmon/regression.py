@@ -151,14 +151,7 @@ def context_changes(con, before, after):
     """[{key, text}]: readable changes of the session context, game settings and system snapshot (ctxreport), the UV/OC
     profile, and config / GPU tuning incidents in between that the snapshots do not already name."""
     ch = ctxreport.changes_between(con, before, after)
-    out, values = [], set()
-    for k in ("context", "game", "system"):
-        for t in ch[k]:
-            v = t.split(": ", 1)[-1]
-            if k == "system" and "→" in v and v in values:
-                continue   # the driver change the context already names, seen again in the system snapshot
-            values.add(v)
-            out.append({"key": k, "text": t})
+    out = [{"key": k, "text": t} for k in ("context", "game", "system") for t in ch[k]]
     if before["profile_id"] != after["profile_id"]:
         out.append({"key": "oc_profile", "text": f"profil UV/OC: {before['profile_id']} → {after['profile_id']}"})
     seen = {c["text"] for c in out}

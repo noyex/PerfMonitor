@@ -63,8 +63,10 @@ def changes_between(con, old_row, new_row, cache=None):
     game, raw = _game_changes(a, b)
     sa = snapshot_at(con, a, old_row["start_ts"], cache)
     sb = snapshot_at(con, b, new_row["start_ts"], cache)
-    system = [c["text"] for c in confdiff.diff(sa, sb)] if sa and sb else []
-    return {"game": game, "game_raw_changed": raw, "system": system, "context": _ctx_changes(a, b)}
+    ctx = _ctx_changes(a, b)
+    seen = {t.split(": ", 1)[-1] for t in ctx}   # the driver change the context names, again in the snapshot
+    system = [t for t in (c["text"] for c in confdiff.diff(sa, sb)) if t.split(": ", 1)[-1] not in seen] if sa and sb else []
+    return {"game": game, "game_raw_changed": raw, "system": system, "context": ctx}
 
 
 def extend(con, rep, row):
