@@ -1,0 +1,50 @@
+name: Release
+
+# Push a tag matching perfmon/__init__.py's __version__ (e.g. v0.2.0): tests, the PyInstaller build, the installer and
+# a GitHub release with PerfMonitor-Setup-<version>.exe + SHA256SUMS.txt (the in-app updater needs both).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - run: pip install -r requirements-build.txt
+
+      - name: Check the tag matches the version
+        shell: pwsh
+        run: |
+          $version = python packaging/version_info.py
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} != __version__ $version" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - run: python -m unittest discover -s tests -t .
+      - run: pyinstaller packaging/perfmon.spec --noconfirm
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Q "/DAppVersion=$env:VERSION" packaging\PerfMonitor.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          $setup = "PerfMonitor-Setup-$env:VERSION.exe"
+          "$((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower())  $setup" | Out-File SHA256SUMS.txt -Encoding ascii
+          gh release create "${{ github.ref_name }}" $setup SHA256SUMS.txt --title "PerfMonitor $env:VERSION" --generate-notes
