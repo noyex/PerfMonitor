@@ -66,7 +66,7 @@ Pages.compare = (() => {
       );
       if (idx != null) read.append(h("span", { class: "t" }, fmtTime(data[0][idx])));
     };
-    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `13px ${css("--font-text")}` };
+    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: axisFont() };
     const H = 220;
     const u = new uPlot(
       {

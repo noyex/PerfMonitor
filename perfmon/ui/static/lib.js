@@ -39,6 +39,8 @@ const apiPost = async (name, body) => {
 };
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// uPlot draws its axes on a canvas, which does not follow CSS: pass the text face explicitly.
+const axisFont = () => `13px ${css("--font-text")}`;
 const SERIES = ["--s1", "--s2", "--s3", "--s4"];
 
 // ---------- formatting ----------
@@ -238,7 +240,7 @@ const chart = (container, opt, data) => {
     stroke: css("--muted"),
     grid: { stroke: css("--grid"), width: 1 },
     ticks: { show: false },
-    font: `13px ${css("--font-text")}`,
+    font: axisFont(),
   };
   const u = new uPlot(
     {
