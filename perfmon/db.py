@@ -150,6 +150,8 @@ CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
 CREATE INDEX IF NOT EXISTS ix_proc_events_ts ON proc_events(ts);
 CREATE INDEX IF NOT EXISTS ix_hw_detail_session ON hw_detail(session);
 CREATE INDEX IF NOT EXISTS ix_net_session ON net_samples(session);
+-- MAX(ts) of a session's samples was a 40 ms scan of samples per report; partial: only game seconds are indexed
+CREATE INDEX IF NOT EXISTS ix_samples_session ON samples(game_session, ts) WHERE game_session IS NOT NULL;
 """
 
 
