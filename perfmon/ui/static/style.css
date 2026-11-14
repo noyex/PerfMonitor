@@ -172,17 +172,17 @@ tbody tr:hover { background: var(--surface-2); }
 }
 
 /* ---------- desktop shell (src-tauri): frameless window, see titlebar.js ---------- */
-.tauri .drag { position: fixed; top: 0; left: 0; right: 0; height: 30px; z-index: 100; }
-.winctl { position: fixed; top: 0; right: 0; z-index: 101; display: flex; }
+/* The title bar is a 32 px row above the page, and the page scrolls inside .shell below it: nothing slides under the
+   drag strip or the window controls, and no viewport scrollbar pushes the controls off the window edge. */
+.titlebar { display: none; }
+.tauri, .tauri body { height: 100%; overflow: hidden; }
+.tauri .titlebar { position: relative; z-index: 30; display: flex; justify-content: flex-end; height: 32px; }
 .wc { width: 46px; height: 32px; padding: 0; border: 0; background: none; color: #d6d6dc; display: grid; place-items: center; cursor: default; transition: background-color .15s ease-out; }
 .wc:hover { background: rgba(255, 255, 255, .08); }
 .wc.close:hover { background: #c42b1c; color: #fff; }
 .wc:focus-visible { outline-offset: -3px; }
 .wc svg { display: block; }
-/* The page scrolls inside .shell, not the viewport: a viewport scrollbar would push the controls off the window edge. */
-.tauri, .tauri body { height: 100%; overflow: hidden; }
-.tauri .shell { height: 100vh; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #3a3a40 transparent; }
-/* The controls take the top right corner (4 px more room than the 30 px page padding): content moves, they do not. */
-.tauri .shell { padding-top: 34px; }
-.tauri .brand { top: 34px; }
+/* The row takes 32 px of the 34 px between the window top and the brand: brand and content stay where they were. */
+.tauri .shell { height: calc(100vh - 32px); min-height: 0; overflow-y: auto; padding-top: 2px; scrollbar-width: thin; scrollbar-color: #3a3a40 transparent; }
+.tauri .brand { top: 2px; }
 .tauri .oc-panel { top: 44px; }

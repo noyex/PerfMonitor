@@ -1,4 +1,4 @@
-// Custom title bar for the desktop shell (window has no native frame): a drag strip and the three window controls.
+// Custom title bar for the desktop shell (window has no native frame): the three window controls in the .titlebar row.
 // Does nothing in a browser or pywebview.
 (() => {
   if (!window.__TAURI__ || !window.__TAURI__.window) return;
@@ -26,8 +26,8 @@
   min.innerHTML = GLYPH.min;
   close.innerHTML = GLYPH.close;
 
-  // data-tauri-drag-region: drags the window, and a double click toggles maximize.
-  document.body.append(h("div", { class: "drag", "data-tauri-drag-region": "" }), h("div", { class: "winctl" }, min, max, close));
+  // The row itself (data-tauri-drag-region in index.html) drags the window, and a double click toggles maximize.
+  document.querySelector(".titlebar").append(min, max, close);
   // The state flips after the resize event that announced it, so read it once the resizing has settled.
   let settle;
   window.addEventListener("resize", () => {
