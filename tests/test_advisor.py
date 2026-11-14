@@ -129,6 +129,64 @@ class AdvisorTest(unittest.TestCase):
         self.assertEqual(r["unknown"], [])
         self.assertIn("rebar", keys(r))
 
+    def test_unclean_shutdowns_lead_and_disappear(self):
+        resets = [{"bugcheck_code": 0, "time": "2026-11-10 01:00:00"}, {"bugcheck_code": 0, "time": "2026-11-11 01:11:01"}]
+        d = data(health={"days": 14, "unclean_shutdowns": resets, "recurring_crashes": []})
+        d["info"]["fast_startup"] = 1
+        r = advisor.build(d)
+        self.assertEqual(keys(r)[0], "unclean_shutdowns")
+        it = r["items"][0]
+        self.assertIn("pm health", it["how"])
+        self.assertIn("2 nieoczekiwane wyłączenia", it["why"])
+        d["health"]["unclean_shutdowns"] = resets[:1]
+        self.assertNotIn("unclean_shutdowns", keys(advisor.build(d)))
+
+    def test_pagefile_space_needs_all_three_conditions(self):
+        def d_(auto=True, free=21.7, commits=5, disks=None):
+            d = data(health={"days": 14, "unclean_shutdowns": [], "recurring_crashes": [],
+                             "incidents_by_kind": {"commit_full": commits}})
+            d["info"].update(pagefile=["C:\\pagefile.sys alloc=8704MB peak=143MB"], pagefile_auto=auto, ram_total_gb=31.1,
+                             volumes=[{"letter": "C", "free_gb": free}, {"letter": "E", "free_gb": 930.6}],
+                             disks=disks or [{"media": "SSD"}, {"media": "SSD"}])
+            return d
+        it = next(i for i in advisor.build(d_())["items"] if i["key"] == "pagefile_space")
+        self.assertIn("21.7 GB", it["why"])
+        self.assertIn("E:", it["how"])
+        self.assertEqual(it["kind"], "stability")
+        self.assertNotIn("E:", next(i for i in advisor.build(d_(disks=[{"media": "SSD"}, {"media": "HDD"}]))["items"]
+                                    if i["key"] == "pagefile_space")["how"])   # never suggest a hard drive
+        for kw in ({"auto": False}, {"free": 120.0}, {"commits": 1}):
+            self.assertNotIn("pagefile_space", keys(advisor.build(d_(**kw))), kw)
+
+    def test_power_plan_is_a_test_not_a_promise(self):
+        d = data()
+        d["info"]["power_plan"] = "381b4222-f694-41f0-9685-ff5bb260df2e  (Zrównoważony)"   # old snapshot: no guid key
+        it = next(i for i in advisor.build(d)["items"] if i["key"] == "power_plan")
+        self.assertIn("pm test start", it["how"])
+        self.assertIn("--key power_plan", it["how"])
+        d["tests"] = {"power_plan": {"id": 3, "status": "done", "verdict": "bez zmian", "time": "2026-11-01"}}
+        r = advisor.build(d)
+        self.assertNotIn("power_plan", keys(r))
+        self.assertIn("power_plan", [n["key"] for n in r["not_worth"]])
+        d = data()
+        d["info"]["power_plan_guid"] = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"   # High performance already
+        self.assertNotIn("power_plan", keys(advisor.build(d)))
+
+    def test_wifi_driver_judged_by_network_data(self):
+        w = {"provider": "Netwtw14", "event_id": 6062, "n": 269, "adapter": "Intel(R) Wi-Fi 6E AX210",
+             "net_s": 86400, "wifi_pct": 100, "home": {"packet_loss": 4, "latency_spike": 2}}
+        r = advisor.build(data(wifi=w))
+        self.assertIn("wifi_driver", keys(r))
+        self.assertIn("packet_loss 4x", next(i for i in r["items"] if i["key"] == "wifi_driver")["why"])
+        r = advisor.build(data(wifi=dict(w, home={})))   # warnings but a clean network: refuted
+        self.assertNotIn("wifi_driver", keys(r))
+        self.assertIn("wifi_driver", [n["key"] for n in r["not_worth"]])
+        r = advisor.build(data(wifi=dict(w, wifi_pct=10)))   # on a cable
+        self.assertIn("kablem", next(n for n in r["not_worth"] if n["key"] == "wifi_driver")["why"])
+        r = advisor.build(data(wifi=dict(w, net_s=0, wifi_pct=None)))
+        self.assertIn("wifi_driver", [u["key"] for u in r["unknown"]])
+        self.assertNotIn("wifi_driver", keys(advisor.build(data(wifi=dict(w, n=5)))))
+
     def test_does_not_mutate_input(self):
         d = data()
         before = copy.deepcopy(d)

@@ -1,13 +1,15 @@
 """Local HTTP server for the UI: static files + JSON API over analyze.py (read-only DB)."""
+import gzip
 import json
 import mimetypes
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist
+from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression
 
 STATIC = Path(__file__).parent / "static"
 
@@ -50,6 +52,7 @@ ROUTES = {
     "range": lambda con, q: analyze.range_report(con, *_span(q)),
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts", time.time()), int(q.get("window", 30))),
     "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
+    "incident": lambda con, q: analyze.incident(con, int(q["id"])),
     "advise": lambda con, q: advisor.advise(con),
     "health": lambda con, q: analyze.health_overview(con, int(q.get("days", 14))),
     "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d"),
@@ -64,7 +67,61 @@ ROUTES = {
     "tests": lambda con, q: experiments.overview(con),
     "oc_stress": lambda con, q: ocanalyze.stress_runs(con, int(q.get("limit", 30))),
     "oc_next": lambda con, q: ocassist.next_step(con),
+    "regressions": lambda con, q: regression.overview(con, q.get("exe") or None),
 }
+
+
+def _brief(rows):
+    """Incident lists without `details` (the UI shows time, title, severity; /api/incident?id= has the rest): the
+    14-day list was 404 KB, mostly ETW and freeze snapshots."""
+    return [{k: v for k, v in r.items() if k != "details"} for r in rows or []]
+
+
+def _compact(name, res):
+    if not isinstance(res, (dict, list)):
+        return res
+    if name == "incidents":
+        return _brief(res)
+    if name == "health" and isinstance(res, dict):
+        return {**res, "diag_incidents": _brief(res.get("diag_incidents"))}
+    if name == "session" and isinstance(res, dict) and "incidents" in res:
+        return {**res, "incidents": _brief(res["incidents"])}
+    return res
+
+
+GZIP_MIN = 1024
+
+
+class _Pool:
+    """Read-only connections reused across requests: opening one costs ~7 ms (schema shim). A connection is dropped
+    when the collector migrated the schema, since its shim views were built for the schema at open time."""
+
+    def __init__(self, size=4):
+        self.size, self.free, self.lock = size, [], threading.Lock()
+
+    def get(self):
+        with self.lock:
+            while self.free:
+                con, ver = self.free.pop()
+                try:
+                    if con.execute("PRAGMA main.schema_version").fetchone()[0] == ver:
+                        return con, ver
+                except sqlite3.Error:
+                    pass
+                con.close()
+        con = db.connect(readonly=True)
+        return con, con.execute("PRAGMA main.schema_version").fetchone()[0]
+
+    def put(self, con, ver):
+        with self.lock:
+            if len(self.free) < self.size:
+                self.free.append((con, ver))
+                return
+        con.close()
+
+
+POOL = _Pool()
+_STATIC_GZ = {}   # (path, mtime_ns) -> gzipped bytes
 
 
 def _local_host(host):
@@ -105,13 +162,31 @@ POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action}   # the only
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # keep-alive: a page load fires a dozen API calls
+
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body: bytes, ctype):
+    def _gzip_ok(self):
+        return "gzip" in self.headers.get("Accept-Encoding", "")
+
+    def _send(self, code, body: bytes, ctype, cache="no-store", etag=None, gz=None):
+        """gz: pre-compressed body to send instead when the client accepts gzip."""
+        if gz is None and len(body) >= GZIP_MIN and self._gzip_ok():
+            gz = gzip.compress(body, 5)
+        use_gz = gz is not None and self._gzip_ok()
+        if use_gz:
+            body = gz
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        if etag:
+            self.send_header("ETag", etag)
+        if use_gz:
+            self.send_header("Content-Encoding", "gzip")
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -120,6 +195,7 @@ class Handler(BaseHTTPRequestHandler):
         """The write endpoints (POSTS: UV/OC profiles, tests). JSON-only + same-origin check: a web page in the browser
         cannot post here (non-simple content type needs a CORS preflight that this server never allows)."""
         u = urlparse(self.path)
+        self.close_connection = True   # early refusals leave the body unread: never reuse this connection
         origin = self.headers.get("Origin")
         host = self.headers.get("Host", "")
         if not _local_host(host):
@@ -158,15 +234,16 @@ class Handler(BaseHTTPRequestHandler):
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if not config.DB_PATH.exists():
                 return self._send(503, b'{"error":"no data yet"}', "application/json")
-            con = db.connect(readonly=True)
-            try:
-                res = fn(con, q)
-                body = json.dumps(res, ensure_ascii=False, default=str).encode("utf-8")
-                return self._send(200, body, "application/json; charset=utf-8")
+            con, ver = POOL.get()
+            try:   # back to the pool before sending: the next keep-alive request may arrive right after the body
+                body, err = json.dumps(_compact(name, fn(con, q)), ensure_ascii=False, default=str).encode("utf-8"), None
             except Exception as e:
-                return self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json")
+                body, err = None, e
             finally:
-                con.close()
+                POOL.put(con, ver)
+            if err is not None:
+                return self._send(500, json.dumps({"error": f"{type(err).__name__}: {err}"}).encode(), "application/json")
+            return self._send(200, body, "application/json; charset=utf-8")
         rel = u.path.lstrip("/") or "index.html"
         root = STATIC.resolve()
         p = (STATIC / rel).resolve()
@@ -175,7 +252,24 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
-        self._send(200, p.read_bytes(), ctype)
+        # revalidate every time (files change with an update, names are not versioned), but a match costs a 304
+        st = p.stat()
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        if etag in self.headers.get("If-None-Match", ""):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = p.read_bytes()
+        gz = None
+        if len(body) >= GZIP_MIN and not ctype.startswith(("image/", "font/")) and self._gzip_ok():
+            key = (str(p), st.st_mtime_ns)
+            gz = _STATIC_GZ.get(key)
+            if gz is None:
+                gz = _STATIC_GZ[key] = gzip.compress(body, 9)
+        self._send(200, body, ctype, cache="no-cache", etag=etag, gz=gz)
 
 
 def serve(port: int):

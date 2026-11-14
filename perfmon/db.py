@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS game_settings (      -- game config files parsed (per
     raw TEXT                                     -- JSON {key: value} as read from the files
 );
 CREATE INDEX IF NOT EXISTS ix_game_settings_exe ON game_settings(exe, ts);
+CREATE TABLE IF NOT EXISTS report_cache (      -- session_report of finished sessions (perfmon/reportcache.py)
+    session INTEGER PRIMARY KEY, ts REAL,        -- ts = session end (retention)
+    key TEXT,                                    -- code version + fingerprint of the session's data
+    report BLOB                                  -- zlib-compressed JSON
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
@@ -161,6 +166,8 @@ CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
 CREATE INDEX IF NOT EXISTS ix_proc_events_ts ON proc_events(ts);
 CREATE INDEX IF NOT EXISTS ix_hw_detail_session ON hw_detail(session);
 CREATE INDEX IF NOT EXISTS ix_net_session ON net_samples(session);
+-- MAX(ts) of a session's samples was a 40 ms scan of samples per report; partial: only game seconds are indexed
+CREATE INDEX IF NOT EXISTS ix_samples_session ON samples(game_session, ts) WHERE game_session IS NOT NULL;
 """
 
 

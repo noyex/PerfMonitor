@@ -18,6 +18,7 @@ import psutil
 from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, kdumps, marks, memdiag, memleak,
                ocanalyze, ocmon, presentmon, procwatch, resetforensics, sessionctx, shadercache)
 from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
+from .episodes import Tracker as EpisodeTracker, dwm_visible
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
 from .presentmon import FrameCapture
@@ -108,6 +109,7 @@ class Collector:
         self.net_prev_t = time.time()
         self.games = {}                # pid -> dict(session, capture, exe)
         self.open_incidents = {}       # kind -> incident id (for ongoing freezes/temps)
+        self.episodes = EpisodeTracker()   # flapping conditions: one incident per episode (perfmon/episodes.py)
         self.cores = psutil.cpu_percent(percpu=True)
         self.not_games = set()         # (pid, create_time) of processes already ruled out as games
         self.pending_crash_checks = [] # (session, exe, end_ts) re-checked for late WER crash events
@@ -300,11 +302,31 @@ class Collector:
         iid = self.open_incidents.get(kind)
         if active and iid is None:
             self.open_incidents[kind] = self.incident(kind, severity, title, details_fn(), ts=row["ts"])
+            self.episodes.start(kind, row)
             if kind in ("ui_freeze", "dwm_stall"):
                 self.etw.trigger(kind)
-        elif not active and iid is not None:
-            self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
-            del self.open_incidents[kind]
+        elif active:
+            if self.episodes.hit(kind, row):   # back within the gap: the episode is ongoing again
+                self.exec("UPDATE incidents SET end_ts=NULL WHERE id=?", (iid,))
+        elif iid is not None:
+            if self.episodes.off(kind, row["ts"]):
+                self._end_episode(kind, iid, row["ts"])
+            elif self.episodes.just_off(kind, row["ts"]):
+                # provisional end while the gap runs: a reset now must not read as "frozen until the reset"
+                self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (row["ts"], iid))
+
+    def _end_episode(self, kind, iid, now):
+        """Close an ongoing incident; its details get the episode's count and worst value."""
+        end, patch = self.episodes.close(kind, now)
+        old = self.exec("SELECT details FROM incidents WHERE id=?", (iid,)).fetchone()
+        try:
+            det = json.loads(old[0]) if old and old[0] else {}
+        except ValueError:
+            det = {}
+        if isinstance(det, dict):
+            det.update(patch)
+        self.exec("UPDATE incidents SET end_ts=?, details=? WHERE id=?", (end, json.dumps(det, ensure_ascii=False), iid))
+        self.open_incidents.pop(kind, None)
 
     def _held(self, key, active, now):
         """True once `active` has held for OC_ALERT_S seconds (debounce for UV/OC alerts)."""
@@ -360,7 +382,9 @@ class Collector:
                        "top_procs": self.snapshot_procs()}
         self._ongoing("ui_freeze", r["ui_ms"] >= FREEZE_MS, "critical",
                       "Pulpit (explorer) przestał odpowiadać", r, ctx)
-        self._ongoing("dwm_stall", r["dwm_ms"] >= FREEZE_MS, "critical",
+        # a stall nobody sees (display asleep while the user is away) is not a freeze: see perfmon/episodes.py
+        stall = r["dwm_ms"] >= FREEZE_MS and dwm_visible(r["user_idle_s"], r["game_session"])
+        self._ongoing("dwm_stall", stall, "critical",
                       "Kompozytor okien (DWM) się zaciął – obraz zamrożony", r, ctx)
         self._ongoing("app_not_responding", bool(r["fg_hung"]), "serious",
                       f"Okno nie odpowiada: {r['fg_exe']}", r, ctx)
@@ -839,8 +863,13 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples",
+                      "report_cache"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
+            # incidents and config snapshots outlive the raw data: comparisons mark config changes over 180 days
+            long_cut = now - max(self.cfg["incident_retention_days"], self.cfg["retention_days"]) * 86400
+            self.exec("DELETE FROM incidents WHERE ts < ?", (long_cut,))
+            self.exec("DELETE FROM system_info WHERE ts < ? AND ts < (SELECT MAX(ts) FROM system_info)", (long_cut,))
             with self.lock:
                 etwbox.retention(self.con, self.etw.s, now)
                 # rows outlive their trace file (kept for the analysis) until the general retention
@@ -1070,8 +1099,8 @@ class Collector:
         for pid in list(self.games):
             self.end_game(pid, "collector_stop")
         # Close ongoing incidents: an open one would later read as "lasted until the next reset"
-        for iid in self.open_incidents.values():
-            self.exec("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
+        for kind, iid in list(self.open_incidents.items()):
+            self._end_episode(kind, iid, time.time())
         self.open_incidents.clear()
         self.hotkey.stop()
         self.shader.stop()
