@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, gameplay, marks, stuttercause
+from . import bottleneck, crashinfo, diagreport, episodes, gameplay, marks, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -421,7 +421,7 @@ def session_report(con, session_id):
     rep["hardware"] = {k: _r(v, 1) for k, v in agg.items()} if agg else {}
 
     # --- events & incidents during the session
-    rep["incidents"] = incidents_between(con, start, end + 5)
+    rep["incidents"] = incidents_between(con, start, end + 5, group=True)
     rep["events"] = _rows(con, "SELECT ts, provider, event_id, level, substr(message,1,300) AS message FROM events "
                                "WHERE ts BETWEEN ? AND ? AND (level<=2 OR event_id IN (1000,1002,1001,10001)) "
                                "ORDER BY ts LIMIT 60", (start, end + 60))
@@ -596,23 +596,34 @@ def _session_findings(rep, row):
 # incidents / events
 # --------------------------------------------------------------------------
 
-def incidents_between(con, t0, t1, kinds=None, limit=500):
+def incidents_between(con, t0, t1, kinds=None, limit=500, group=False):
+    """group: repeating rows of one kind become one episode with count/worst (perfmon/episodes.py); `limit` then caps
+    the episodes, newest kept."""
     sql = "SELECT id, ts, end_ts, kind, severity, title, details FROM incidents WHERE ts BETWEEN ? AND ?"
     args = [t0, t1]
     if kinds:
         kinds = [kinds] if isinstance(kinds, str) else list(kinds)
         sql += f" AND kind IN ({','.join('?' * len(kinds))})"
         args += kinds
-    rows = _rows(con, sql + " ORDER BY ts LIMIT ?", args + [limit])
+    rows = _rows(con, sql + " ORDER BY ts LIMIT ?", args + [100000 if group else limit])
     for r in rows:
         r["details"] = _json(r["details"])
         r["time"] = fmt_ts(r["ts"])
-    return rows
+    return episodes.group(rows, con)[-limit:] if group else rows
+
+
+def incident(con, iid):
+    """One incident with its details (the lists send them without)."""
+    r = _one(con, "SELECT id, ts, end_ts, kind, severity, title, details FROM incidents WHERE id=?", (int(iid),))
+    if not r:
+        return {"error": f"Brak incydentu {iid}"}
+    r["details"], r["time"] = _json(r["details"]), fmt_ts(r["ts"])
+    return r
 
 
 def incidents(con, since, kinds=None):
     t0 = parse_time(since) if not isinstance(since, (int, float)) else since
-    return incidents_between(con, t0, time.time() + 1, kinds)
+    return incidents_between(con, t0, time.time() + 1, kinds, group=True)
 
 
 def events(con, since, level=None, grep=None, limit=200):
@@ -656,7 +667,7 @@ def range_report(con, t0, t1):
                         "GROUP BY fg_exe ORDER BY seconds DESC LIMIT 6", (t0, t1))
         rep["foreground"] = fg
     rep["stats"] = stats
-    rep["incidents"] = incidents_between(con, t0, t1)
+    rep["incidents"] = incidents_between(con, t0, t1, group=True)
     rep["freezes"] = [i for i in rep["incidents"] if i["kind"] in ("ui_freeze", "dwm_stall", "app_not_responding")]
     ev = _rows(con, "SELECT ts, provider, event_id, level, substr(message,1,300) AS message FROM events "
                     "WHERE ts BETWEEN ? AND ? AND level<=2 ORDER BY ts LIMIT 100", (t0, t1))
@@ -1035,7 +1046,8 @@ def _freezes(con, items):
     out = []
     for f in items:
         x = {"time": f["time"], "ts": f["ts"], "kind": f["kind"], "title": f["title"],
-             "duration_s": _r(f["end_ts"] - f["ts"]) if f["end_ts"] else None, "until_reset": False}
+             "duration_s": _r(f["end_ts"] - f["ts"]) if f["end_ts"] else None, "until_reset": False,
+             "count": f.get("count", 1)}
         if not f["end_ts"]:
             i = bisect.bisect_right(resets, f["ts"])
             # only trust a reset within 6 h that follows with no other freeze incident in between
@@ -1048,12 +1060,11 @@ def _freezes(con, items):
 
 def health_overview(con, days=14):
     t0 = time.time() - float(days) * 86400
-    by_kind = {r["kind"]: r["n"] for r in con.execute(
-        "SELECT kind, COUNT(*) AS n FROM incidents WHERE ts>=? GROUP BY kind ORDER BY n DESC", (t0,))}
-    per_day = defaultdict(dict)
-    for r in con.execute("SELECT date(ts,'unixepoch','localtime') AS d, kind, COUNT(*) AS n FROM incidents "
-                         "WHERE ts>=? GROUP BY d, kind", (t0,)):
-        per_day[r["d"]][r["kind"]] = r["n"]
+    eps = incidents_between(con, t0, time.time(), limit=100000, group=True)   # counts are episodes, not raw rows
+    by_kind = dict(Counter(e["kind"] for e in eps).most_common())
+    per_day = defaultdict(Counter)
+    for e in eps:
+        per_day[e["time"][:10]][e["kind"]] += 1
     unclean = _unclean_shutdowns(con, t0)
     crashes = _rows(con, "SELECT kind, title, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM incidents "
                          "WHERE kind IN ('app_crash','app_hang') AND ts>=? GROUP BY kind, title ORDER BY n DESC LIMIT 15", (t0,))
@@ -1065,11 +1076,11 @@ def health_overview(con, days=14):
     for c in cfg:
         d = c.get("details")
         c["changed"] = list(d.keys()) if isinstance(d, dict) else None
-    freezes = incidents_between(con, t0, time.time(), kinds=["ui_freeze", "dwm_stall", "app_not_responding"])
+    freezes = [e for e in eps if e["kind"] in ("ui_freeze", "dwm_stall", "app_not_responding")]
     cov = _one(con, "SELECT MIN(ts) AS first, MAX(ts) AS last, COUNT(*) AS n FROM samples")
     rep = {
         "days": days, "since": fmt_ts(t0), "incidents_by_kind": by_kind,
-        "incidents_per_day": {d: per_day[d] for d in sorted(per_day)},
+        "incidents_per_day": {d: dict(per_day[d]) for d in sorted(per_day)},
         "unclean_shutdowns": unclean, "recurring_crashes": crashes, "config_changes": cfg,
         "freezes": _freezes(con, freezes),
         "sample_coverage": {"first": fmt_ts(cov["first"]), "last": fmt_ts(cov["last"]), "samples": cov["n"]} if cov and cov["n"] else None,
