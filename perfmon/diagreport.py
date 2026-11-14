@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import bottleneck, config, crashinfo, diskinfo, etwbox, memleak, present, procwatch
+from . import bottleneck, config, crashinfo, diskinfo, disktemp, etwbox, memleak, present, procwatch
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -38,6 +38,7 @@ class StutterExt:
         self.starts = procwatch.StartCauses(con, start, end, row["exe"], self.culprits)
         self.resets = [r[0] for r in con.execute("SELECT ts FROM incidents WHERE kind IN ('nvme_reset','disk_retry') "
                                                  "AND ts BETWEEN ? AND ? ORDER BY ts", (start - 15, end + 15))]
+        self.disk_temp = disktemp.DiskTemp(con, row["path"] if "path" in row.keys() else None, start, end)
 
     def _win(self, ts_list, items, a, b):
         return items[bisect.bisect_left(ts_list, a):bisect.bisect_right(ts_list, b)]
@@ -72,6 +73,8 @@ class StutterExt:
             causes.insert(0, "disk_reset")
         if any((s.get("pagefile_pct") or 0) > 60 and (s.get("hard_faults_s") or 0) > 200 for s in win):
             causes.append("pagefile")
+        if self.disk_temp.hot(ts):
+            causes.append("disk_hot")
         if self.vram_shared(ts):
             causes.append("vram_shared")
         causes += [f"background_gpu:{n}" for n in self.background_gpu(ts)]
@@ -149,6 +152,7 @@ def extend(con, rep, row, start, end):
     rep["present"] = present.session_present(con, row, summ)
     rep["shader"] = shader_summary(con, row)
     rep["mem_growth"] = memleak.assess(con, row["id"], start, end)
+    rep["disk_temp"] = disktemp.session_summary(con, row["path"], start, end)
     win = etwbox.settings(config.load())["dump_last_s"]
     for w in (rep.get("stutters") or {}).get("worst") or []:
         if "dpc" in w["causes"]:
@@ -209,6 +213,7 @@ def findings(rep, row):
             "użyj prekompilacji w menu gry, nie czyść cache (Adrenalin -> Reset Shader Cache, Oczyszczanie dysku -> "
             "DirectX Shader Cache); jeśli dzieje się to w każdej sesji, cache jest kasowany.")
     f += memleak.finding(row["exe"], rep.get("mem_growth"))
+    f += disktemp.findings(rep)
     f += diskinfo.findings(rep)
     f += present.findings(rep)
     f += procwatch.findings(rep)

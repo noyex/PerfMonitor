@@ -17,6 +17,7 @@ import psutil
 
 from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memleak, ocanalyze, ocmon,
                presentmon, procwatch, shadercache, sysinfo)
+from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
 from .presentmon import FrameCapture
@@ -124,6 +125,7 @@ class Collector:
         self.last_gpu_od = 0.0
         self.last_oc_stats = 0.0
         self.vacuuming = False
+        self.storage_limits = None     # last NVMe thresholds written to meta
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -216,6 +218,8 @@ class Collector:
         vm = psutil.virtual_memory()
         cores = psutil.cpu_percent(percpu=True)
         p = self.pdh.read()
+        session = next(iter(self.games.values()))["session"] if self.games else next(iter(self.manual), None)
+        self.hw.storage_fast = session is not None
         h = self.hw.read()
         ui_ms, dwm_ms = self.wd.take()
         _, fg_pid, fg_hung = foreground()
@@ -244,10 +248,15 @@ class Collector:
         if not clock and p.get("perf_pct"):
             clock = 4500 * p["perf_pct"] / 100  # 7700X base clock * % Processor Performance
 
-        session = next(iter(self.games.values()))["session"] if self.games else next(iter(self.manual), None)
         extra = {"disks": extra_disks}
         if self.hw.storage_temps:
             extra["disk_temps"] = self.hw.storage_temps
+        if self.hw.storage_hot:
+            extra["disk_hot"] = self.hw.storage_hot   # NVMe: hottest sensor when above the composite
+        if self.hw.storage_limits and self.hw.storage_limits != self.storage_limits:
+            self.storage_limits = dict(self.hw.storage_limits)
+            with self.lock:
+                db.set_meta(self.con, STORAGE_LIMITS_KEY, json.dumps(self.storage_limits))
 
         row = dict(
             ts=now, cpu_total=sum(cores) / len(cores), cpu_core_max=max(cores), cpu_clock_mhz=clock,

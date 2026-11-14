@@ -9,6 +9,9 @@ import win32pdh
 log = logging.getLogger("perfmon.sensors")
 
 
+STORAGE_FAST_S = 10   # NVMe temperature cadence in game/stress sessions (a hot game disk throttles within seconds)
+
+
 def _rd(v, n=0):
     return round(v, n) if v is not None else None
 
@@ -24,8 +27,11 @@ class HardwareSensors:
         self.storage = []
         self._last_dimm = 0.0
         self.dimm_temp = None
-        self._last_storage = 0.0
-        self.storage_temps = {}
+        self._last_storage = self._last_nvme = 0.0
+        self.storage_temps = {}         # disk -> composite temperature (NVMe) / the only one (SATA)
+        self.storage_hot = {}           # NVMe disk -> hottest of its sensors (controller / NAND), when above composite
+        self.storage_limits = {}        # NVMe disk -> {"warn", "crit"}: the drive's own throttle thresholds
+        self.storage_fast = False       # collector: game/stress session -> NVMe temperatures every STORAGE_FAST_S
         try:
             os.environ.setdefault("PYTHONNET_RUNTIME", "netfx")
             sys.path.append(lhm_dir)
@@ -155,16 +161,39 @@ class HardwareSensors:
                 self.dimm_temp = max(temps) if temps else None
             det["dimm_temp"] = self.dimm_temp
             out["detail"] = det
-            if now - self._last_storage > 30:  # SMART is slow – every 30 s
-                self._last_storage = now
+            full = now - self._last_storage > 30   # SMART is slow: every 30 s, NVMe every 10 s in sessions
+            if full or (self.storage_fast and now - self._last_nvme > STORAGE_FAST_S):
+                self._last_nvme = now
+                if full:
+                    self._last_storage = now
                 for h in self.storage:
-                    h.Update()
-                    t = self._find(h, "Temperature", "Temperature")
-                    if t:
-                        self.storage_temps[h.Name] = round(t, 1)
+                    if full or self._nvme(h):
+                        h.Update()
+                        self._storage_temps(h)
         except Exception as e:
             log.debug("LHM read error: %s", e)
         return out
+
+    @staticmethod
+    def _nvme(h):
+        return "/nvme/" in str(h.Identifier)
+
+    def _storage_temps(self, h):
+        """NVMe drives expose Composite Temperature + Temperature #1..#n (controller, NAND) + their own Warning/Critical
+        thresholds; SATA drives a single Temperature."""
+        temps = {n: v for (t, n), v in self._map(h).items() if t == "Temperature" and v}
+        lim = {k: temps.pop(n) for k, n in (("warn", "Warning Temperature"), ("crit", "Critical Temperature")) if n in temps}
+        comp = temps.get("Composite Temperature") or temps.get("Temperature")
+        if not comp:
+            return
+        self.storage_temps[h.Name] = round(comp, 1)
+        hot = max(temps.values())
+        if hot > comp + 0.5:
+            self.storage_hot[h.Name] = round(hot, 1)
+        else:
+            self.storage_hot.pop(h.Name, None)
+        if lim:
+            self.storage_limits[h.Name] = lim
 
     def dump(self) -> list:
         """Every LHM sensor (incl. motherboard/Super I/O and memory) - for discovering what is readable."""
