@@ -170,6 +170,9 @@ def migrate(con):
     add_columns(con, "events", {"data": "TEXT"})
     add_columns(con, "samples", {"pagefile_pct": "REAL", "cpu_vcore": "REAL", "gpu_voltage": "REAL", "vrm_temp": "REAL",
                                   "cpu_eff_max": "REAL"})
+    # PSU rails / board temperatures (hard-reset forensics), GPU fan duty
+    add_columns(con, "hw_detail", {"v12": "REAL", "v5": "REAL", "v33": "REAL", "v3sb": "REAL", "sys_temp": "REAL",
+                                   "pch_temp": "REAL", "pcie_temp": "REAL", "gpu_fan_pct": "REAL"})
     add_columns(con, "frames", {"runtime": "TEXT", "sync_interval": "INTEGER", "tearing": "INTEGER", "dropped": "INTEGER",
                                 "click_lat": "REAL", "input_lat": "REAL", "frame_gen_pct": "REAL"})
 

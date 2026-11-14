@@ -39,6 +39,7 @@ DETAIL_COLS = [
     "ts", "session", "cpu_eff", "cpu_clk", "cpu_core_w", "thread_load", "cpu_vcore", "cpu_vsoc", "cpu_vmisc",
     "cpu_pkg_w", "tctl", "tccd", "vrm_temp", "vsoc_temp", "dimm_temp", "cpu_fan", "gpu_clk", "gpu_mem_clk", "gpu_v",
     "gpu_w", "gpu_load", "gpu_temp", "gpu_hot", "gpu_mem_temp", "gpu_fan",
+    "v12", "v5", "v33", "v3sb", "sys_temp", "pch_temp", "pcie_temp", "gpu_fan_pct",
 ]
 INSERT_DETAIL = f"INSERT OR REPLACE INTO hw_detail ({','.join(DETAIL_COLS)}) VALUES ({','.join('?' * len(DETAIL_COLS))})"
 

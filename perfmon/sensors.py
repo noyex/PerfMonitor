@@ -124,11 +124,13 @@ class HardwareSensors:
                     "gpu_mem_temp": g("Temperature", "GPU Memory"),
                     "gpu_power_w": g("Power", "GPU Package"),
                     "gpu_fan_rpm": g("Fan", "GPU Fan"),
+                    "gpu_fan_pct": g("Control", "GPU Fan"),
                     "gpu_voltage": self._nz(g("Voltage", "GPU Core")),
                 })
                 det.update(gpu_clk=out["gpu_clock_mhz"], gpu_mem_clk=out["gpu_mem_clock_mhz"], gpu_v=out["gpu_voltage"],
                            gpu_w=out["gpu_power_w"], gpu_temp=out["gpu_temp"], gpu_hot=out["gpu_hotspot"],
-                           gpu_mem_temp=out["gpu_mem_temp"], gpu_fan=out["gpu_fan_rpm"], gpu_load=out["gpu_load"])
+                           gpu_mem_temp=out["gpu_mem_temp"], gpu_fan=out["gpu_fan_rpm"], gpu_load=out["gpu_load"],
+                           gpu_fan_pct=out["gpu_fan_pct"])
             if self.board is not None:
                 bm = {}
                 for sub in self.board.SubHardware:   # the Super I/O chip is a sub-node of the board
@@ -137,7 +139,11 @@ class HardwareSensors:
                 b = lambda t, n: self._nz(bm.get((t, n)))
                 det.update(cpu_vcore=b("Voltage", "Vcore"), cpu_vsoc=b("Voltage", "Vcore SoC"),
                            cpu_vmisc=b("Voltage", "Vcore Misc"), vrm_temp=b("Temperature", "VRM MOS"),
-                           vsoc_temp=b("Temperature", "VSoC MOS"), cpu_fan=b("Fan", "CPU Fan"))
+                           vsoc_temp=b("Temperature", "VSoC MOS"), cpu_fan=b("Fan", "CPU Fan"),
+                           # PSU rails and board temperatures (hard-reset forensics): same Super I/O read, no extra cost
+                           v12=b("Voltage", "+12V"), v5=b("Voltage", "+5V"), v33=b("Voltage", "+3.3V"),
+                           v3sb=b("Voltage", "+3V Standby"), sys_temp=b("Temperature", "System"),
+                           pch_temp=b("Temperature", "PCH"), pcie_temp=b("Temperature", "PCIe x16"))
                 out["cpu_vcore"], out["vrm_temp"] = det["cpu_vcore"], det["vrm_temp"]
             now = time.time()
             if self.dimms and now - self._last_dimm > 10:   # SPD over SMBus: no need every second
