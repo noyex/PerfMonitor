@@ -7,6 +7,7 @@ import json
 import time
 from collections import defaultdict
 
+from . import framestats as fs
 from .analyze import _eff_ends, _json, _pct, _r, _rows, fmt_ts, parse_time
 
 STATUSES = ("testing", "stable", "rejected")
@@ -274,11 +275,15 @@ def session_stats(con, sid):
                        (s["start_ts"], end, s["id"])).fetchall()
     st = _detail_stats(rows)
     summ = _json(s.get("summary")) or {}
-    fps = summ.get("fps_avg") if isinstance(summ, dict) else None
+    summ = summ if isinstance(summ, dict) else {}
+    # application frames: frame generation would double the FPS/W of the session it was on in
+    gen = summ.get("frame_gen_pct") or (summ.get("present") or {}).get("frame_gen_pct")
+    fps = summ.get("app_fps_avg") or (None if gen else summ.get("fps_avg"))
     if fps is None:
-        fps = con.execute("SELECT SUM(frames)/SUM(frames/fps) FROM frames WHERE session=? AND fps>0", (s["id"],)).fetchone()[0]
+        fps = con.execute(f"SELECT SUM({fs.APP_FRAMES})/SUM({fs.APP_FRAMES}/{fs.APP_FPS}) FROM frames "
+                          f"WHERE session=? AND {fs.APP_FPS}>0", (s["id"],)).fetchone()[0]
     st["fps_avg"] = _r(fps)
-    st["fps_1low"] = _r(summ.get("fps_1low")) if isinstance(summ, dict) else None
+    st["fps_1low"] = _r(summ.get("app_fps_1low") or (None if gen else summ.get("fps_1low")))
     w = (st.get("cpu_pkg_w") or {}).get("avg"), (st.get("gpu_w") or {}).get("avg")
     st["power_w"] = _r(sum(x for x in w if x), 1) if any(w) else None
     st["fps_per_w"] = _r(fps / st["power_w"], 3) if fps and st["power_w"] else None
