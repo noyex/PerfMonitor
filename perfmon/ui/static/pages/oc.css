@@ -1,58 +1,53 @@
-/* Page-specific styles for #/oc (shared design tokens live in /style.css). */
+/* Page-specific styles for #/oc (shared design tokens live in /style.css). Panels are .tile / table glass. */
 .oc-active { font-size: 15px; }
-.oc-active .sub { font-size: 13px; }
-.btn.primary { background: var(--ink); color: var(--page); border-color: var(--ink); }
-.btn.primary:hover { background: var(--ink-2); color: var(--page); }
+.btn.primary, .btn.primary:hover { background: var(--glass-on); color: #000; }
 .tile .value.bad { color: var(--critical); }
-.oc-fail { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 12px; }
-.oc-note { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
-.oc-banner {
-  display: flex; align-items: center; gap: 16px; justify-content: space-between; margin-bottom: 16px;
-  padding: 12px 16px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); border-radius: var(--radius);
-  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
-}
+.oc-fail { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 14px; }
+.oc-note { color: var(--ink-2); font-size: 13px; margin: 10px 0 0; }
+.oc-banner { display: flex; align-items: center; gap: 16px; justify-content: space-between; margin-bottom: 12px; padding: 12px 12px 12px 20px; }
+.oc-banner > span:first-child { color: var(--warning); }
 .oc-banner .sub { font-size: 13px; }
-.oc-h2 { display: inline-block; margin-right: 12px; }
-.oc-game { padding-top: 3px; padding-bottom: 3px; font-size: 12px; }
-tr.cur td:first-child { font-weight: 500; }
+.oc-cmp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 36px 0 14px; }
+.oc-cmp-head h2 { margin: 0; }
+[data-page="oc"] tr.cur td:first-child { font-weight: 500; }
+[data-page="oc"] tbody tr { cursor: default; }
 .empty.small { padding: 40px 0; font-size: 13px; }
 .empty p { margin: 0 0 16px; }
 
-.oc-cores { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; }
-.oc-core { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
-.oc-core .n { color: var(--muted); font-size: 12px; }
-.oc-core .v { font-size: 20px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
-.oc-core .m { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.oc-core.bad { border-color: color-mix(in srgb, var(--critical) 55%, transparent); }
-.oc-core.bad .m { color: var(--critical); }
+.oc-cores { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
+.oc-core { padding: 14px 16px; }
+.oc-core .n { color: var(--label); font-size: 13px; }
+.oc-core .v { font-size: 24px; font-weight: 500; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.oc-core .m { color: var(--ink-2); font-size: 13px; margin-top: 2px; min-height: 16px; }
+.oc-core.bad .v, .oc-core.bad .m { color: var(--critical); }
 
-.oc-veil { position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, .35); }
+.oc-veil { position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, .55); }
 .oc-panel {
-  position: fixed; top: 0; right: 0; bottom: 0; z-index: 21; width: 420px; max-width: 100vw; overflow-y: auto;
-  padding: 20px 24px 28px; background: var(--page); border-left: 1px solid var(--border);
-  animation: oc-in .2s cubic-bezier(.2, .8, .2, 1);
+  position: fixed; top: 12px; right: 12px; bottom: 12px; z-index: 21; width: 440px; max-width: calc(100vw - 24px); overflow-y: auto;
+  padding: 22px 24px 26px; animation: oc-in .2s cubic-bezier(.2, .8, .2, 1);
 }
 @keyframes oc-in { from { transform: translateX(24px); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .oc-panel { animation: none; } }
 .oc-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.oc-panel-head h2 { margin: 0; font-size: 26px; }
 .oc-panel h2 { margin: 24px 0 10px; }
-.oc-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 12px; color: var(--muted); }
-.oc-field input, .oc-field select, .oc-panel textarea { width: 100%; color: var(--ink); text-align: left; font-size: 14px; }
+.oc-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 13px; color: var(--label); }
+.oc-field input, .oc-field select, .oc-panel textarea { width: 100%; max-width: none; font: inherit; color: var(--ink); text-align: left; }
 .oc-field small { color: var(--muted); }
 .oc-panel textarea { resize: vertical; margin-bottom: 10px; }
 .oc-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 8px; }
 .oc-co { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
-.oc-co input { padding: 6px 4px; text-align: center; }
+.oc-co input { padding: 9px 4px 8px; text-align: center; }
 .oc-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
 .oc-err { color: var(--critical); font-size: 13px; min-height: 18px; margin: 8px 0; }
 .oc-actions { display: flex; gap: 8px; }
 
 @media (max-width: 1000px) { .oc-cores { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 
-.oc-next { margin-bottom: 16px; }
-.oc-next-title { font-size: 18px; font-weight: 600; margin-top: 6px; letter-spacing: -0.01em; }
-.oc-next-text { margin: 6px 0 0; font-size: 14px; }
-.oc-cmdrow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-.oc-cmd { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.oc-next { margin-bottom: 12px; }
+.oc-next-title { font-size: 21px; font-weight: 500; margin-top: 4px; letter-spacing: -.01em; }
+.oc-next-text { margin: 6px 0 0; font-size: 15px; }
+.oc-cmdrow { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.oc-cmd { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--label); }
 .oc-checks { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 10px; }
 .oc-checks .oc-note { flex-basis: 100%; margin: 0 0 2px; }

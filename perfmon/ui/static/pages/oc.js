@@ -110,7 +110,7 @@ Pages.oc = (() => {
           idx == null ? null : h("span", { class: "v" }, ` ${fmt(data[k + 1][idx], 3)} V`))));
       if (idx != null) read.append(h("span", { class: "t" }, `${fmt(data[0][idx])} MHz`));
     };
-    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `11px system-ui, "Segoe UI", sans-serif` };
+    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `13px Nohemi, system-ui, sans-serif` };
     const u = new uPlot({
       width: Math.max(300, el.clientWidth || wrap.clientWidth / 2 - 40), height: 190, padding: [6, 8, 0, 0],
       legend: { show: false }, cursor: { y: false, points: { size: 7, width: 2, fill: css("--surface") } },
@@ -131,7 +131,7 @@ Pages.oc = (() => {
     if (!pc.cores.length) return h("div", { class: "empty small" }, "Brak danych per rdzeń (wymaga kolektora z uprawnieniami admina).");
     return h("div", {},
       h("div", { class: "oc-cores" }, pc.cores.map((c) =>
-        h("div", { class: `oc-core${c.suspect ? " bad" : ""}`, title: `Pod pełnym obciążeniem: ${fmt(c.loaded_min, 0)} min, śr. zegar efektywny ${fmt(c.eff_loaded_avg)} MHz, maks. ${fmt(c.eff_max)} MHz` },
+        h("div", { class: `tile oc-core${c.suspect ? " bad" : ""}`, title: `Pod pełnym obciążeniem: ${fmt(c.loaded_min, 0)} min, śr. zegar efektywny ${fmt(c.eff_loaded_avg)} MHz, maks. ${fmt(c.eff_max)} MHz` },
           h("div", { class: "n" }, `Rdzeń ${c.core}`),
           h("div", { class: "v" }, c.stretch_pct == null ? "–" : `${fmt(c.stretch_pct, 1)}%`),
           h("div", { class: "m" }, c.whea19 || c.whea18 ? `WHEA ${c.whea19 + c.whea18}×` : "")))),
@@ -148,7 +148,7 @@ Pages.oc = (() => {
     const gpu = (p && p.gpu) || {};
     const pbo = cpu.pbo || {};
     const co = cpu.co_per_core || [];
-    const panel = h("aside", { class: "oc-panel" });
+    const panel = h("aside", { class: "slab oc-panel" });
     const close = () => { panel.remove(); veil.remove(); };
     const veil = h("div", { class: "oc-veil", onclick: close });
     const coInputs = Array.from({ length: 8 }, (_, i) => input(`co${i}`, co[i], { placeholder: "0", title: `Rdzeń ${i}` }));
@@ -195,7 +195,7 @@ Pages.oc = (() => {
       }
     };
     panel.append(
-      h("div", { class: "oc-panel-head" }, h("h1", {}, p && p.id ? "Edytuj profil" : "Nowy profil"), h("button", { class: "btn", onclick: close }, "Zamknij")),
+      h("div", { class: "oc-panel-head" }, h("h2", {}, p && p.id ? "Edytuj profil" : "Nowy profil"), h("button", { class: "btn", onclick: close }, "Zamknij")),
       field("Nazwa", f.name),
       h("h2", {}, "CPU (BIOS)"),
       field("Curve Optimizer per rdzeń", h("div", { class: "oc-co" }, coInputs), "ujemne = mniejsze napięcie"),
@@ -264,7 +264,7 @@ Pages.oc = (() => {
       return;
     }
     if (ov.gpu_change) {
-      view.append(h("div", { class: "oc-banner" },
+      view.append(h("div", { class: "tile oc-banner" },
         h("span", {}, `Ustawienia GPU zmieniły się ${fmtTime(ov.gpu_change.ts)}`, h("span", { class: "sub" }, ` · ${(ov.gpu_change.changes || []).slice(0, 3).join(", ")}`)),
         h("button", { class: "btn", onclick: () => editor(copyOf(active), st, reload) }, "Oznacz nowym profilem")));
     }
@@ -274,8 +274,8 @@ Pages.oc = (() => {
     else if (!active) view.append(h("p", { class: "oc-note" }, "Żaden profil nie jest aktywny – wybierz go z listy „Aktywuj profil…”."));
 
     // comparison
-    const cmpHead = h("h2", { class: "oc-h2" }, "Porównanie profili");
-    view.append(cmpHead);
+    const cmpHead = h("h2", {}, "Porównanie profili");
+    view.append(h("div", { class: "oc-cmp-head" }, cmpHead));
     const cmpBox = h("div");
     view.append(cmpBox);
     const loadCmp = async (exe) => {
@@ -288,7 +288,7 @@ Pages.oc = (() => {
     const games = await api("games").catch(() => []);
     const cmp = await loadCmp(params.exe);
     if (games.length > 1) {
-      const sel = h("select", { class: "btn oc-game" }, games.map((g) => h("option", { value: g.exe, selected: g.exe === cmp.exe || null }, gameName(g.exe))));
+      const sel = h("select", { class: "btn" }, games.map((g) => h("option", { value: g.exe, selected: g.exe === cmp.exe || null }, gameName(g.exe))));
       sel.onchange = () => {
         history.replaceState(null, "", `#/oc?exe=${encodeURIComponent(sel.value)}`);
         loadCmp(sel.value);

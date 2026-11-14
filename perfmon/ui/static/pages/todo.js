@@ -28,9 +28,9 @@ Pages.todo = (() => {
     h("td", { class: "num" }, fmt(m.after, 1)),
     h("td", { class: `num${m.significant ? (m.better ? " up" : " down") : ""}` }, m.change_pct == null ? "–" : `${m.change_pct > 0 ? "+" : "−"}${fmt(Math.abs(m.change_pct), 1)}%`));
 
-  const openTest = (t) => h("section", { class: "td-open" },
+  const openTest = (t) => h("section", { class: "tile td-open" },
     h("div", { class: "td-open-hd" },
-      h("div", {}, h("div", { class: "td-k" }, `Test w toku · ${gameName(t.exe)}`), h("div", { class: "td-name" }, t.name)),
+      h("div", {}, h("div", { class: "label" }, `Test w toku · ${gameName(t.exe)}`), h("div", { class: "td-name" }, t.name)),
       verdict(t.verdict)),
     t.metrics.length
       ? h("table", {},
@@ -70,7 +70,7 @@ Pages.todo = (() => {
       a.game ? h("span", { class: "sub" }, `${gameName(a.game)}${b.kind ? ` · ogranicza ${b.kind.toUpperCase().replace("_", " ")} przez ${fmt(b.share_pct)}% grania` : ""}`) : null));
     if (t.open) el.append(openTest(t.open));
     if (a.items.length) {
-      el.append(h("div", { class: "td-list" }, a.items.map((i, n) => item(i, n + 1, !!t.open, a.test_exe))));
+      el.append(h("div", { class: "list" }, a.items.map((i, n) => item(i, n + 1, !!t.open, a.test_exe))));
     } else {
       el.append(h("div", { class: "empty" }, a.game ? "Nic nie wymaga zmiany." : "Za mało rozegranych sesji, żeby coś doradzić."));
     }
