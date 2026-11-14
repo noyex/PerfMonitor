@@ -18,7 +18,8 @@ a = Analysis(
     # modules are started by name (runpy) and pywin32 imports some lazily
     hiddenimports=MODULES + ["win32timezone"],
     datas=[(str(ROOT / "perfmon" / "ui" / "static"), "perfmon/ui/static"),
-           (str(ROOT / "perfmon" / "etw"), "perfmon/etw")],
+           (str(ROOT / "perfmon" / "etw"), "perfmon/etw"),
+           (str(ROOT / "perfmon" / "agent"), "perfmon/agent")],
     excludes=["tkinter", "unittest", "pydoc_data"],
     noarchive=False,
 )

@@ -29,7 +29,7 @@ The screenshots show synthetic demo data.
 - **Undervolt and overclock.** UV/OC profiles, stress tests and idle soaks, WHEA error attribution, per-core stability, and a single suggested next step. PerfMonitor only reads: it never changes a BIOS, Adrenalin or registry setting.
 - **CLI.** `pm` exposes the same data: `pm status`, `pm advise`, `pm sessions`, `pm session <id>`, `pm compare`, `pm health`, `pm incidents`, `pm net`, `pm oc`, `pm sql` and more (`pm --help`).
 
-The window has seven pages: Przegląd (overview), Co zrobić (advice), Oś czasu (timeline), Gry (games), Porównania (compare), Problemy (problems) and Podkręcanie (overclocking). The "Zapytaj agenta" buttons copy a ready-made prompt for an AI coding agent that can read the database.
+The window has seven pages: Przegląd (overview), Co zrobić (advice), Oś czasu (timeline), Gry (games), Porównania (compare), Problemy (problems) and Podkręcanie (overclocking). The "Zapytaj agenta" buttons copy a ready-made prompt for any AI agent that can run terminal commands (Claude Code, Codex, Cursor and similar). The prompt points the agent at the guide bundled with the app ([`perfmon/agent/AGENT.md`](perfmon/agent/AGENT.md)) and at the `pm` CLI by full path, so there is nothing to set up: paste it and the agent analyses your own data.
 
 ## Requirements
 

@@ -160,6 +160,10 @@ def test_action(con, body):
 
 POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action,   # the only write endpoints
          "/api/update": lambda con, body: updater.start_install()}
+NO_DB_ROUTES = {
+    "update": lambda q: updater.status(q.get("force") == "1"),   # GitHub
+    "agent": lambda q: {"guide": str(config.AGENT_GUIDE), "cli": str(config.cli_path())},   # "Zapytaj agenta" prompt
+}
 NO_DB = {"/api/update"}   # POSTs that never touch the database (work before the first sample, never wait on a lock)
 
 
@@ -234,8 +238,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, b'{"error":"forbidden"}', "application/json")
             name = u.path[5:]
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
-            if name == "update":   # GitHub, not the database: works before the first sample too
-                return self._send(200, json.dumps(updater.status(q.get("force") == "1")).encode(), "application/json")
+            if name in NO_DB_ROUTES:   # not the database: works before the first sample too
+                return self._send(200, json.dumps(NO_DB_ROUTES[name](q), ensure_ascii=False).encode("utf-8"),
+                                  "application/json; charset=utf-8")
             fn = ROUTES.get(name)
             if not fn:
                 return self._send(404, b'{"error":"not found"}', "application/json")

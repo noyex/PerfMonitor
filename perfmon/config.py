@@ -106,6 +106,14 @@ DEFAULTS = {
 }
 
 
+AGENT_GUIDE = Path(__file__).resolve().parent / "agent" / "AGENT.md"   # what "Zapytaj agenta" points an AI agent at
+
+
+def cli_path() -> Path:
+    """The `pm` CLI as a user's AI agent should call it: pm.exe next to the installed build, else pm.cmd."""
+    return Path(sys.executable).with_name("pm.exe") if FROZEN else ROOT / "pm.cmd"
+
+
 def module_argv(module, *args, console=False):
     """argv running `python -m module args`: the installed exe dispatches "-m" itself (perfmon/launcher.py).
     console: python.exe rather than pythonw.exe in a source checkout (a child whose output is read)."""
