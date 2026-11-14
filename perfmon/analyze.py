@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, episodes, gameplay, marks, reportcache, stuttercause
+from . import bottleneck, crashinfo, diagreport, episodes, gameplay, marks, regression, reportcache, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -436,6 +436,7 @@ def session_report(con, session_id):
     rep["marks"] = marks.report(con, start, end + 5, exe)
     diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
+    regression.attach(con, rep, row)   # vs earlier sessions of the same game
     return rep
 
 

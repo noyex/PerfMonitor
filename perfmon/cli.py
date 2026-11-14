@@ -138,6 +138,21 @@ def cmd_advise(con, a):
             out(f"- {u['title']}: {u['check']}")
 
 
+def cmd_regress(con, a):
+    from perfmon import regression
+    rows = regression.overview(con, a.exe, a.limit)
+    if a.json:
+        return dump(rows)
+    out("## Regresje wydajności vs wcześniejsze sesje tej samej gry" + (f" ({a.exe})" if a.exe else ""))
+    if not rows:
+        return out("Za mało porównywalnych sesji.")
+    for r in rows:
+        if r["verdict"] == "insufficient":
+            out(f"- #{r['session']} {r.get('time', '')} {r.get('exe', '')}: brak oceny ({r['reason']})")
+        else:
+            out(f"- #{r['session']} {r['time']} {r['exe']} [{r['verdict']}]: {r['message']}")
+
+
 def cmd_health(con, a):
     h = an.health_overview(con, a.days)
     if a.json:
@@ -335,7 +350,7 @@ def cmd_incidents(con, a):
     out(f"## Incydenty od {an.fmt_ts(an.parse_time(a.since))}" + (f" ({a.kind})" if a.kind else ""))
     for r in rows:
         r["dur_s"] = round(r["end_ts"] - r["ts"]) if r["end_ts"] else None
-    table(rows, ["time", "kind", "severity", "dur_s", "title"])
+    table(rows, ["time", "kind", "severity", "dur_s", "count", "title"])
 
 
 def cmd_events(con, a):
@@ -913,6 +928,9 @@ def build():
     add("mark", cmd_mark, help="mark a lag/problem right now").add_argument("text", nargs="*")
     add("advise", cmd_advise, help="ranked concrete changes backed by your own data")
     add("health", cmd_health).add_argument("--days", type=float, default=14)
+    s = add("regress", cmd_regress, help="per-game FPS / 1%% low / stutter / latency vs earlier sessions + what changed")
+    s.add_argument("--exe")
+    s.add_argument("--limit", type=int, default=10)
     add("sessions", cmd_sessions).add_argument("--limit", type=int, default=20)
     add("session", cmd_session).add_argument("id", type=int)
     s = add("incidents", cmd_incidents)
