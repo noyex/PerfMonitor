@@ -110,7 +110,7 @@ Pages.oc = (() => {
           idx == null ? null : h("span", { class: "v" }, ` ${fmt(data[k + 1][idx], 3)} V`))));
       if (idx != null) read.append(h("span", { class: "t" }, `${fmt(data[0][idx])} MHz`));
     };
-    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `13px Nohemi, system-ui, sans-serif` };
+    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `13px ${css("--font-text")}` };
     const u = new uPlot({
       width: Math.max(300, el.clientWidth || wrap.clientWidth / 2 - 40), height: 190, padding: [6, 8, 0, 0],
       legend: { show: false }, cursor: { y: false, points: { size: 7, width: 2, fill: css("--surface") } },

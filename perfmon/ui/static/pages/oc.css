@@ -9,7 +9,7 @@
 .oc-banner .sub { font-size: 13px; }
 .oc-cmp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 36px 0 14px; }
 .oc-cmp-head h2 { margin: 0; }
-[data-page="oc"] tr.cur td:first-child { font-weight: 500; }
+[data-page="oc"] tr.cur td:first-child { font-weight: 600; }
 [data-page="oc"] tbody tr { cursor: default; }
 [data-page="oc"] tbody tr:hover { background: transparent; }
 .empty.small { padding: 40px 0; font-size: 13px; }
@@ -18,7 +18,7 @@
 .oc-cores { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
 .oc-core { padding: 14px 16px; }
 .oc-core .n { color: var(--label); font-size: 13px; }
-.oc-core .v { font-size: 24px; font-weight: 500; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.oc-core .v { font-family: var(--font-display); font-size: 24px; font-weight: 500; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
 .oc-core .m { color: var(--ink-2); font-size: 13px; margin-top: 2px; min-height: 16px; }
 .oc-core.bad .v, .oc-core.bad .m { color: var(--critical); }
 
@@ -46,7 +46,7 @@
 @media (max-width: 1000px) { .oc-cores { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 
 .oc-next { margin-bottom: 12px; }
-.oc-next-title { font-size: 21px; font-weight: 500; margin-top: 4px; letter-spacing: -.01em; }
+.oc-next-title { font-family: var(--font-display); font-size: 21px; font-weight: 500; margin-top: 4px; letter-spacing: -.01em; }
 .oc-next-text { margin: 6px 0 0; font-size: 15px; }
 .oc-cmdrow { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
 .oc-cmd { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--label); }

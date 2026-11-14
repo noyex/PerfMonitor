@@ -228,7 +228,7 @@ const chart = (container, opt, data) => {
     stroke: css("--muted"),
     grid: { stroke: css("--grid"), width: 1 },
     ticks: { show: false },
-    font: `13px Nohemi, system-ui, sans-serif`,
+    font: `13px ${css("--font-text")}`,
   };
   const u = new uPlot(
     {
