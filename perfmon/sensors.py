@@ -9,6 +9,9 @@ import win32pdh
 log = logging.getLogger("perfmon.sensors")
 
 
+STORAGE_FAST_S = 10   # NVMe temperature cadence in game/stress sessions (a hot game disk throttles within seconds)
+
+
 def _rd(v, n=0):
     return round(v, n) if v is not None else None
 
@@ -24,8 +27,11 @@ class HardwareSensors:
         self.storage = []
         self._last_dimm = 0.0
         self.dimm_temp = None
-        self._last_storage = 0.0
-        self.storage_temps = {}
+        self._last_storage = self._last_nvme = 0.0
+        self.storage_temps = {}         # disk -> composite temperature (NVMe) / the only one (SATA)
+        self.storage_hot = {}           # NVMe disk -> hottest of its sensors (controller / NAND), when above composite
+        self.storage_limits = {}        # NVMe disk -> {"warn", "crit"}: the drive's own throttle thresholds
+        self.storage_fast = False       # collector: game/stress session -> NVMe temperatures every STORAGE_FAST_S
         try:
             os.environ.setdefault("PYTHONNET_RUNTIME", "netfx")
             sys.path.append(lhm_dir)
@@ -124,11 +130,13 @@ class HardwareSensors:
                     "gpu_mem_temp": g("Temperature", "GPU Memory"),
                     "gpu_power_w": g("Power", "GPU Package"),
                     "gpu_fan_rpm": g("Fan", "GPU Fan"),
+                    "gpu_fan_pct": g("Control", "GPU Fan"),
                     "gpu_voltage": self._nz(g("Voltage", "GPU Core")),
                 })
                 det.update(gpu_clk=out["gpu_clock_mhz"], gpu_mem_clk=out["gpu_mem_clock_mhz"], gpu_v=out["gpu_voltage"],
                            gpu_w=out["gpu_power_w"], gpu_temp=out["gpu_temp"], gpu_hot=out["gpu_hotspot"],
-                           gpu_mem_temp=out["gpu_mem_temp"], gpu_fan=out["gpu_fan_rpm"], gpu_load=out["gpu_load"])
+                           gpu_mem_temp=out["gpu_mem_temp"], gpu_fan=out["gpu_fan_rpm"], gpu_load=out["gpu_load"],
+                           gpu_fan_pct=out["gpu_fan_pct"])
             if self.board is not None:
                 bm = {}
                 for sub in self.board.SubHardware:   # the Super I/O chip is a sub-node of the board
@@ -137,7 +145,11 @@ class HardwareSensors:
                 b = lambda t, n: self._nz(bm.get((t, n)))
                 det.update(cpu_vcore=b("Voltage", "Vcore"), cpu_vsoc=b("Voltage", "Vcore SoC"),
                            cpu_vmisc=b("Voltage", "Vcore Misc"), vrm_temp=b("Temperature", "VRM MOS"),
-                           vsoc_temp=b("Temperature", "VSoC MOS"), cpu_fan=b("Fan", "CPU Fan"))
+                           vsoc_temp=b("Temperature", "VSoC MOS"), cpu_fan=b("Fan", "CPU Fan"),
+                           # PSU rails and board temperatures (hard-reset forensics): same Super I/O read, no extra cost
+                           v12=b("Voltage", "+12V"), v5=b("Voltage", "+5V"), v33=b("Voltage", "+3.3V"),
+                           v3sb=b("Voltage", "+3V Standby"), sys_temp=b("Temperature", "System"),
+                           pch_temp=b("Temperature", "PCH"), pcie_temp=b("Temperature", "PCIe x16"))
                 out["cpu_vcore"], out["vrm_temp"] = det["cpu_vcore"], det["vrm_temp"]
             now = time.time()
             if self.dimms and now - self._last_dimm > 10:   # SPD over SMBus: no need every second
@@ -149,16 +161,39 @@ class HardwareSensors:
                 self.dimm_temp = max(temps) if temps else None
             det["dimm_temp"] = self.dimm_temp
             out["detail"] = det
-            if now - self._last_storage > 30:  # SMART is slow – every 30 s
-                self._last_storage = now
+            full = now - self._last_storage > 30   # SMART is slow: every 30 s, NVMe every 10 s in sessions
+            if full or (self.storage_fast and now - self._last_nvme > STORAGE_FAST_S):
+                self._last_nvme = now
+                if full:
+                    self._last_storage = now
                 for h in self.storage:
-                    h.Update()
-                    t = self._find(h, "Temperature", "Temperature")
-                    if t:
-                        self.storage_temps[h.Name] = round(t, 1)
+                    if full or self._nvme(h):
+                        h.Update()
+                        self._storage_temps(h)
         except Exception as e:
             log.debug("LHM read error: %s", e)
         return out
+
+    @staticmethod
+    def _nvme(h):
+        return "/nvme/" in str(h.Identifier)
+
+    def _storage_temps(self, h):
+        """NVMe drives expose Composite Temperature + Temperature #1..#n (controller, NAND) + their own Warning/Critical
+        thresholds; SATA drives a single Temperature."""
+        temps = {n: v for (t, n), v in self._map(h).items() if t == "Temperature" and v}
+        lim = {k: temps.pop(n) for k, n in (("warn", "Warning Temperature"), ("crit", "Critical Temperature")) if n in temps}
+        comp = temps.get("Composite Temperature") or temps.get("Temperature")
+        if not comp:
+            return
+        self.storage_temps[h.Name] = round(comp, 1)
+        hot = max(temps.values())
+        if hot > comp + 0.5:
+            self.storage_hot[h.Name] = round(hot, 1)
+        else:
+            self.storage_hot.pop(h.Name, None)
+        if lim:
+            self.storage_limits[h.Name] = lim
 
     def dump(self) -> list:
         """Every LHM sensor (incl. motherboard/Super I/O and memory) - for discovering what is readable."""
@@ -211,6 +246,13 @@ class PdhCounters:
         "commit_bytes": r"\Memory\Committed Bytes",
         "commit_limit": r"\Memory\Commit Limit",
         "pagefile_pct": r"\Paging File(_Total)\% Usage",
+        # memory lists (perfmon/memdiag.py): what the RAM not in use by processes holds
+        "standby_core": r"\Memory\Standby Cache Core Bytes",
+        "standby_normal": r"\Memory\Standby Cache Normal Priority Bytes",
+        "standby_reserve": r"\Memory\Standby Cache Reserve Bytes",
+        "modified_bytes": r"\Memory\Modified Page List Bytes",
+        "free_zero_bytes": r"\Memory\Free & Zero Page List Bytes",
+        "pool_np_bytes": r"\Memory\Pool Nonpaged Bytes",
     }
     MULTI = {
         "lat": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",

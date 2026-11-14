@@ -238,6 +238,9 @@ def _cause_item(tag, hits, n_sessions):
                      "Zamknij przeglądarkę i launchery; plik stronicowania trzymaj na dysku NVMe."),
         "disk_reset": ("Sprawdź kontroler dysku NVMe", "koniec zacięć przy resetach dysku", "brak",
                        "Zaktualizuj firmware (Samsung Magician), sprawdź osadzenie M.2 i wyłącz Link State Power Management."),
+        "disk_hot": ("Schłodź dysk z grą (NVMe)", "mniej stutterów od throttlingu dysku, jeśli to on je powoduje", "brak",
+                     "Załóż radiator M.2 (z płyty lub osobny) i zapewnij przepływ powietrza przy slocie pod kartą graficzną; "
+                     "temperaturę dysku widać w raporcie sesji."),
         "background_scan": ("Przesuń skany Defendera poza granie", "mniej stutterów, jeśli to skany je powodują", "brak",
                             "Dodaj folder gry do wykluczeń: Zabezpieczenia Windows > Ochrona przed wirusami > Wykluczenia."),
         "shader_compile": ("Skompiluj shadery przed grą", "mniej stutterów w kolejnych sesjach", "dłuższy start gry",

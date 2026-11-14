@@ -1069,6 +1069,7 @@ def _unclean_shutdowns(con, t0):
         if msg:
             info["message"] = msg[:300]
         info.update(parse_kernel_power_41(msg))
+        info["forensics"] = det.get("forensics") if isinstance(det, dict) else None   # stored by the collector
         # data before the event: when did we last see samples, what happened right before
         last = _one(con, "SELECT ts, cpu_temp, gpu_hotspot, gpu_load, ram_pct, fg_exe, ui_ms, dwm_ms FROM samples "
                          "WHERE ts<? AND ts>? ORDER BY ts DESC LIMIT 1", (r["ts"], r["ts"] - 6 * 3600))
@@ -1094,6 +1095,8 @@ def _unclean_shutdowns(con, t0):
                 merged[-1] = u
             continue
         merged.append(u)
+    from .resetforensics import fill   # local: resetforensics imports this module
+    fill(con, merged)   # events stored before the collector kept forensics
     return merged
 
 
