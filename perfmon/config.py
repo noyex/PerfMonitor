@@ -35,8 +35,9 @@ DEFAULTS = {
     # extra config files per exe {"game.exe": ["%LOCALAPPDATA%\\Game\\settings.ini"]}, parsed by extension
     "game_settings_poll_s": 30,
     "game_settings_paths": {},
-    # DLLs in the game process (overlays/hooks): first scan once the game settled, then this often; False = never
-    "game_modules": True,
+    # DLLs in the game process (overlays/hooks): first scan once the game settled, then this often; False = never.
+    # Off by default: the module snapshot opens the game with VM_READ, which kernel anti-cheats may log; opt in
+    "game_modules": False,
     "game_modules_settle_s": 120,
     "game_modules_poll_s": 600,
     # ETW black box (perfmon/etwbox.py): kernel trace in memory, dumped on these triggers; mode game|always|off
