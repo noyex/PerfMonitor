@@ -1,5 +1,6 @@
 ﻿# Builds the PerfMonitor window (src-tauri, Rust) and puts it at <root>\PerfMonitor.exe, where install.ps1 looks for it.
 # Run: powershell -ExecutionPolicy Bypass -File build-ui.ps1
+# Needed again only after changes in src-tauri: the window reads perfmon\ui\static from disk at runtime.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -33,3 +34,4 @@ try {
     throw "Nie można zastąpić $exe. Zamknij okno PerfMonitor i uruchom skrypt ponownie."
 }
 Write-Host "Gotowe: $exe" -ForegroundColor Green
+Write-Host "Uruchom install.ps1, żeby skróty na pulpicie i w menu Start otwierały PerfMonitor.exe."
