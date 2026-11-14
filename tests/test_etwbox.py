@@ -14,6 +14,9 @@ START_FT = 134375000000000000          # FILETIME of the trace start
 BOOT_QPC = 3_000_000_000_000           # QPC ticks at trace start (10 MHz)
 
 
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "etw_disk_rundown.csv")
+
+
 def ev(name, typ, opcode, clock, *data, pid="0x00000004", tid="0x00000010"):
     cols = [name, typ, "0", "2", "0", "0", str(opcode), "0", "0x0000000000000000", pid, tid, "0", "", "",
             "{00000000-0000-0000-0000-000000000000}", "", str(clock), "0", "0"]
@@ -21,7 +24,7 @@ def ev(name, typ, opcode, clock, *data, pid="0x00000004", tid="0x00000010"):
 
 
 def header(perf_freq=10_000_000, clock_type="0x1"):
-    data = [4096, 83951626, 26200, 16, START_FT + 600 * 10**7, 156250, 0, "0x5", 5, 1, 8, 3, 4491, "0xA", "0x7",
+    data = [4096, 83951626, 26200, 16, START_FT + 100 * 10**7, 156250, 0, "0x5", 5, 1, 8, 3, 4491, "0xA", "0x7",
             START_FT - 10**12, perf_freq, START_FT, clock_type, 0, '"PerfMonBox"', '"C:\\x.etl"']
     return ev("EventTrace", "Header", 0, START_FT, *data)
 
@@ -72,17 +75,41 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(dpc["ndis.sys"]["max_us"], 119)
         self.assertEqual(dpc["ndis.sys"]["sum_us"], 0 + 1 + 119)
         self.assertEqual(dpc["?"]["max_us"], 2)
-        self.assertEqual(s["isr_top"], [{"driver": "stornvme.sys", "count": 1, "sum_us": 49, "max_us": 49}])
+        self.assertEqual(s["isr_top"], [{"driver": "stornvme.sys", "count": 1, "sum_us": 49, "max_us": 49,
+                                        "max_at_s": None}])
         self.assertEqual(s["events_lost"], 3)
         self.assertEqual(s["window_s"], 60)
         disk = {r["process"]: r for r in s["disk_top"]}
         self.assertEqual(disk["game.exe"]["read_mb"], 1.0)
         self.assertEqual(disk["game.exe"]["max_ms"], 250.0)
         self.assertEqual(disk["?"]["write_mb"], 0.5)                # thread 999 unknown
+        self.assertEqual(s["disk_unattributed_pct"], 33.3)
         sev, title = etwbox.headline(s)
         self.assertEqual(sev, "warning")                            # disk 250 ms
         self.assertIn("ndis.sys", title)
         self.assertIn("game.exe 250 ms", title)
+
+    def test_real_rows_rundown_at_the_end(self):
+        """Rows recorded from a real trace: the disk I/O comes first, the Thread/Process/FileIo rundown that names
+        its threads and files only at the end of the trace (before: all of it was process "?")."""
+        end_ft = 134391444129907800
+        s = etwbox.parse_csv(FIXTURE, 60, trigger_ts=end_ft / 1e7 - etwbox.FT_UNIX - 1,
+                             devices={r"\Device\HarddiskVolume2": "C:", r"\Device\HarddiskVolume4": "D:"})
+        self.assertEqual(s["window_s"], 19.1)                       # header StartTime..EndTime
+        self.assertEqual(s["trigger_at_s"], -1.0)
+        disk = {r["process"]: r for r in s["disk_top"]}
+        self.assertEqual(set(disk), {"System", "MsMpEng.exe", "cod.exe"})
+        self.assertEqual(s["disk_unattributed_pct"], 0.0)
+        self.assertEqual(disk["System"]["read_mb"], 1.0)
+        self.assertEqual(disk["System"]["max_ms"], 0.5)
+        self.assertEqual(disk["System"]["max_at_s"], -18.0)
+        self.assertEqual(disk["cod.exe"]["max_file"],
+                         r"D:\SteamLibrary\steamapps\common\Call of Duty HQ\msvcp140.dll")
+        self.assertEqual(s["disk_files"][0]["file"], r"C:\Program Files\AMD\CNext\CNext\RadeonSoftware.exe")
+        dpc = {r["driver"]: r for r in s["dpc_top"]}
+        # 3 storport DPCs of 8.2/17.8/12.9 us, offset = the shortest DPC seen (0.9 us)
+        self.assertEqual(dpc["storport.sys"], {"driver": "storport.sys", "count": 3, "sum_us": 36, "max_us": 17,
+                                               "max_at_s": 0.16})
 
     def test_headline_long_dpc(self):
         sev, title = etwbox.headline({"dpc_top": [{"driver": "amdkmdag.sys", "count": 9, "sum_us": 9000, "max_us": 6200}]})

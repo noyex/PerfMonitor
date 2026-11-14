@@ -3,9 +3,10 @@ WPR and written to data/traces when something goes wrong (user mark, frozen desk
 
 The capture is analysed later in a separate low-priority process (`python -m perfmon.etwbox analyze ID`, also
 `pm etw analyze ID`): tracerpt converts the .etl to CSV (no xperf/WPA without the ADK) and the last `dump_last_s`
-seconds are aggregated into the top DPC/ISR drivers and disk I/O per process. Needs admin (the collector has it)."""
+seconds are aggregated into the top DPC/ISR drivers and disk I/O per process and file. Needs admin (the collector has it)."""
 import bisect
 import csv
+import ctypes
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict
+from array import array
 from pathlib import Path
 
 from . import config
@@ -299,9 +300,13 @@ def _fail(con, cid, summ, error):
 # tracerpt CSV: 19 header columns then the event's user data in MOF order.
 C_NAME, C_TYPE, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 6, 9, 10, 16, 19
 DPC_OPS, ISR_OPS = {"66", "68", "69"}, {"67", "50"}     # ThreadDPC, DPC, TimerDPC / ISR, ISR-MSI
-IMAGE_OPS, PROC_OPS, THREAD_OPS = {"10", "3", "4"}, {"1", "3", "4"}, {"1", "3", "4"}
+IMAGE_OPS = {"10", "3", "4"}
+PROC_OPS = {"1", "2", "3", "4", "39"}                    # Start, End, DCStart, DCEnd, Defunct
+THREAD_OPS = {"1", "2", "3", "4"}
+FILE_NAME_OPS = {"0", "32", "35", "36"}                  # FileIo Name/FileCreate/FileDelete/FileRundown
 DISK_OPS = {"10": "read", "11": "write"}
 TOP = 10
+FT_UNIX = 11644473600                                    # seconds from 1601 (FILETIME) to 1970
 
 
 def _int(v):
@@ -311,95 +316,103 @@ def _int(v):
         return None
 
 
-def _tail_clock(path, nbytes=2 << 20):
-    """Largest Clock-Time in the last nbytes of the CSV (tracerpt writes events in time order)."""
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        f.seek(max(0, f.tell() - nbytes))
-        lines = f.read().decode("utf-8", "replace").splitlines()[1:]
-    best = None
-    for row in csv.reader(lines, skipinitialspace=True):
-        if len(row) > C_CLOCK:
-            c = _int(row[C_CLOCK])
-            if c is not None and (best is None or c > best):
-                best = c
-    return best
+def _str(v):
+    return v.strip().strip('"')
 
 
 def _proc_name(data):
-    """ImageFileName of a Process event: the first file-name-like field after the fixed numeric ones."""
+    """ImageFileName of a Process event: field 8 (after the SID) since version 3, the command line after it can
+    contain quotes that break tracerpt's CSV. Older layouts: the first file-name-like field after the fixed ones."""
+    if len(data) > 8 and _str(data[8]) and not _str(data[8]).lower().startswith("0x"):
+        return _str(data[8])
     for v in data[7:]:
-        v = v.strip().strip('"')
+        v = _str(v)
         if re.fullmatch(r"[^\\/:*?\"<>|]+\.[A-Za-z0-9]{2,4}", v) and not v.lower().startswith("0x"):
             return v
     return None
 
 
+def parse_rows(lines, last_s=60, trigger_ts=None, devices=None):
+    """Aggregate tracerpt CSV lines (any iterable of str), single pass so the CSV can be streamed.
 
-
-def parse_csv(path, last_s=60):
-    """Aggregate a tracerpt CSV. DPC/ISR duration = event time - InitialTime; both clocks are reduced to 100 ns
-    units and their offset is the smallest difference seen (durations are relative to the shortest DPC, ~1 us)."""
-    end = _tail_clock(path)
-    perf_freq, clock_type, start_ft, lost = 10_000_000, 1, None, 0
-    images = []                                   # (base, end, name) kernel images
-    dpc, isr = defaultdict(list), defaultdict(list)   # routine -> raw (event time - InitialTime) values
-    thread_pid, pid_name = {}, {}
-    disk = defaultdict(lambda: {"bytes": 0, "ios": 0, "max_ms": 0.0, "read": 0, "write": 0})
+    The analysis window is the last `last_s` seconds before the trace's EndTime from the EventTrace header (the
+    first row). DPC/ISR duration = event time - InitialTime; both clocks are reduced to 100 ns units and their offset
+    is the smallest difference seen (durations are relative to the shortest DPC, ~1 us).
+    Disk I/O carries only the issuing thread id and the file object: threads -> processes and file objects -> paths
+    come from Thread/Process/FileIo events, mostly the rundown at the END of the trace, so they are resolved after
+    the pass. `at_s` fields are seconds relative to trigger_ts (negative = before the trigger)."""
+    perf_freq, clock_type, start_ft, end_ft, lost = 10_000_000, 1, None, None, 0
+    images = []                                         # (base, end, name) kernel images
+    dpc, isr = {}, {}                                   # routine -> (array of event time - InitialTime, array of times)
+    thread_pid, pid_name, file_name = {}, {}, {}
+    disk = {}               # (pid or None, tid when pid unknown yet, file object) -> [bytes, ios, rd, wr, max resp, at]
     events = 0
     filetime_clock = None
-    with open(path, encoding="utf-8", errors="replace", newline="") as f:
-        for row in csv.reader(f, skipinitialspace=True):
-            if len(row) <= C_DATA:
+    cutoff = None
+    for row in csv.reader(lines, skipinitialspace=True):
+        if len(row) <= C_DATA:
+            continue
+        name, op = row[C_NAME].strip(), row[C_OPCODE].strip()
+        data = row[C_DATA:]
+        if name == "EventTrace":
+            if row[C_TYPE].strip() == "Header" and len(data) >= 7:
+                pf, ct, st = _int(data[-6]), _int(data[-4]), _int(data[-5])
+                perf_freq = pf if pf and 10_000 <= pf <= 10**10 else perf_freq
+                clock_type, start_ft, end_ft = ct or clock_type, st, _int(data[4])
+                lost = (_int(data[11]) or 0) if len(data) > 11 else 0
+            continue
+        clock = _int(row[C_CLOCK])
+        if clock is None:
+            continue
+        if filetime_clock is None:   # tracerpt prints FILETIME for converted clocks, raw ticks otherwise
+            filetime_clock = bool(start_ft and abs(clock - start_ft) < 30 * 86400 * 10**7)
+            if filetime_clock and end_ft and end_ft > start_ft:
+                cutoff = end_ft - int(last_s * 10**7)
+        if name == "Image" and op in IMAGE_OPS:
+            base, size = _int(data[0]), _int(data[1])
+            if base and size and base >= 1 << 63:     # kernel-mode image
+                images.append((base, base + size, os.path.basename(_str(data[-1])) or "?"))
+            continue
+        if name == "Process" and op in PROC_OPS and len(data) > 1:
+            pid = _int(data[1])
+            if pid is not None:
+                pid_name[pid] = _proc_name(data) or pid_name.get(pid)
+            continue
+        if name == "Thread" and op in THREAD_OPS and len(data) > 1:
+            pid, tid = _int(data[0]), _int(data[1])
+            if tid is not None and pid is not None:
+                thread_pid[tid] = pid
+            continue
+        if name == "FileIo" and op in FILE_NAME_OPS and len(data) >= 2:
+            file_name[_str(data[0])] = _str(data[-1])
+            continue
+        if cutoff is not None and clock < cutoff:
+            continue
+        if name == "PerfInfo" and (op in DPC_OPS or op in ISR_OPS) and len(data) >= 2:
+            init, routine = _int(data[0]), _int(data[1])
+            if init is None or routine is None:
                 continue
-            name, op = row[C_NAME].strip(), row[C_OPCODE].strip()
-            data = row[C_DATA:]
-            if name == "EventTrace":
-                if row[C_TYPE].strip() == "Header" and len(data) >= 7:
-                    pf, ct, st = _int(data[-6]), _int(data[-4]), _int(data[-5])
-                    perf_freq = pf if pf and 10_000 <= pf <= 10**10 else perf_freq
-                    clock_type, start_ft = ct or clock_type, st
-                    lost = _int(data[11]) or 0 if len(data) > 11 else 0
-                continue
-            clock = _int(row[C_CLOCK])
-            if clock is None:
-                continue
-            if filetime_clock is None:   # tracerpt prints FILETIME for converted clocks, raw ticks otherwise
-                filetime_clock = bool(start_ft and abs(clock - start_ft) < 30 * 86400 * 10**7)
-            if name == "Image" and op in IMAGE_OPS:
-                base, size = _int(data[0]), _int(data[1])
-                if base and size and base >= 1 << 63:     # kernel-mode image
-                    images.append((base, base + size, os.path.basename(data[-1].strip().strip('"')) or "?"))
-                continue
-            if name == "Process" and op in PROC_OPS and len(data) > 1:
-                pid = _int(data[1])
-                if pid is not None:
-                    pid_name[pid] = _proc_name(data) or pid_name.get(pid)
-                continue
-            if name == "Thread" and op in THREAD_OPS and len(data) > 1:
-                pid, tid = _int(data[0]), _int(data[1])
-                if tid is not None:
-                    thread_pid[tid] = pid
-                continue
-            if end is not None and clock < end - _units(last_s, filetime_clock, perf_freq):
-                continue
-            if name == "PerfInfo" and (op in DPC_OPS or op in ISR_OPS) and len(data) >= 2:
-                init, routine = _int(data[0]), _int(data[1])
-                if init is None or routine is None:
-                    continue
-                if filetime_clock and clock_type == 1:
-                    init = init * 10_000_000 // perf_freq
-                (dpc if op in DPC_OPS else isr)[routine].append(clock - init)
-                events += 1
-            elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
-                size, resp, tid = _int(data[2]) or 0, _int(data[7]) or 0, _int(data[8])
-                pid = thread_pid.get(tid)
-                d = disk[pid]
-                d["bytes"] += size
-                d["ios"] += 1
-                d[DISK_OPS[op]] += size
-                d["max_ms"] = max(d["max_ms"], resp * 1000 / perf_freq)
-                events += 1
+            if filetime_clock and clock_type == 1:
+                init = init * 10_000_000 // perf_freq
+            a = (dpc if op in DPC_OPS else isr).get(routine)
+            if a is None:
+                a = (dpc if op in DPC_OPS else isr)[routine] = (array("q"), array("q"))
+            a[0].append(clock - init)
+            a[1].append(clock)
+            events += 1
+        elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
+            size, resp, tid, fobj = _int(data[2]) or 0, _int(data[7]) or 0, _int(data[8]), _str(data[5])
+            pid = thread_pid.get(tid)   # a thread started inside the trace; else the end-of-trace rundown
+            k = (pid, None if pid is not None else tid, fobj)
+            d = disk.get(k)
+            if d is None:
+                d = disk[k] = [0, 0, 0, 0, -1, None]
+            d[0] += size
+            d[1] += 1
+            d[2 if op == "10" else 3] += size
+            if resp > d[4]:
+                d[4], d[5] = resp, clock
+            events += 1
     images.sort()
     starts = [i[0] for i in images]
 
@@ -408,42 +421,99 @@ def parse_csv(path, last_s=60):
         return images[k][2] if k >= 0 and addr < images[k][1] else "?"
 
     to_us = (lambda v: v / 10) if filetime_clock else (lambda v: v * 1e6 / perf_freq)
+    trig_ft = (trigger_ts + FT_UNIX) * 10**7 if trigger_ts and filetime_clock else None
+
+    def at(clock):
+        return round((clock - trig_ft) / 1e7, 2) if trig_ft and clock else None
+
     # The offset of the two clocks = the shortest DPC; a low percentile, because start and end paired across a clock
     # jump give absurd values both ways (seen: "56497207 ms"), and those are dropped against the final offset
-    diffs = sorted(v for aggs in (dpc, isr) for vals in aggs.values() for v in vals)
+    diffs = sorted(v for aggs in (dpc, isr) for vals, _ in aggs.values() for v in vals)
     offset = diffs[len(diffs) // 1000] if diffs else None
+    del diffs
     limit = _units(MAX_DPC_US / 1e6, filetime_clock, perf_freq)
 
     def top(aggs):
-        by = defaultdict(lambda: [0, 0, 0])       # driver -> [count, sum raw, max raw] (offset removed)
-        for routine, vals in aggs.items():
-            real = [max(0, v - offset) for v in vals if abs(v - offset) <= limit]
-            if real:
-                b = by[driver(routine)]
-                b[0] += len(real)
-                b[1] += sum(real)
-                b[2] = max(b[2], max(real))
-        rows = [{"driver": k, "count": v[0], "sum_us": round(to_us(v[1])), "max_us": round(to_us(v[2]))}
-                for k, v in by.items()]
+        by = {}                                   # driver -> [count, sum raw, max raw, clock of the max]
+        for routine, (vals, clocks) in aggs.items():
+            b = None
+            for v, c in zip(vals, clocks):
+                if abs(v - offset) > limit:
+                    continue
+                v = max(0, v - offset)
+                if b is None:
+                    b = by.setdefault(driver(routine), [0, 0, -1, None])
+                b[0] += 1
+                b[1] += v
+                if v > b[2]:
+                    b[2], b[3] = v, c
+        rows = [{"driver": k, "count": v[0], "sum_us": round(to_us(v[1])), "max_us": round(to_us(v[2])),
+                 "max_at_s": at(v[3])} for k, v in by.items()]
         return sorted(rows, key=lambda r: -r["sum_us"])[:TOP]
 
+    def proc(k):
+        pid = k[0] if k[0] is not None else thread_pid.get(k[1])
+        return pid_name.get(pid) or (f"pid {pid}" if pid is not None else "?")
+
+    def path(fobj):
+        p = file_name.get(fobj)
+        if not p:
+            return None
+        for dev, letter in (devices or {}).items():
+            if p.lower().startswith(dev.lower() + "\\"):
+                return letter + p[len(dev):]
+        return p
+
+    procs, files = {}, {}
+    for k, d in disk.items():
+        pname, fname = proc(k), path(k[2])
+        for agg, key in ((procs, pname), (files, (fname, pname))):
+            a = agg.setdefault(key, [0, 0, 0, 0, -1, None, None])
+            a[0] += d[0]
+            a[1] += d[1]
+            a[2] += d[2]
+            a[3] += d[3]
+            if d[4] > a[4]:
+                a[4], a[5], a[6] = d[4], d[5], fname
+    ms = lambda raw: round(raw * 1000 / perf_freq, 1)
+    mb = lambda b: round(b / 2**20, 1)
+    proc_rows = [{"process": p, "mb": mb(a[0]), "read_mb": mb(a[2]), "write_mb": mb(a[3]), "ios": a[1],
+                  "max_ms": ms(a[4]), "max_at_s": at(a[5]), "max_file": a[6]} for p, a in procs.items()]
+    file_rows = [{"file": f or "?", "process": p, "mb": mb(a[0]), "read_mb": mb(a[2]), "write_mb": mb(a[3]),
+                  "ios": a[1], "max_ms": ms(a[4])} for (f, p), a in files.items()]
     window = None
-    if end is not None and start_ft and filetime_clock:
-        window = round(min(last_s, (end - start_ft) / 1e7), 1)
-    procs = [{"process": pid_name.get(pid) or (f"pid {pid}" if pid is not None else "?"),
-              "mb": round(d["bytes"] / 2**20, 1), "read_mb": round(d["read"] / 2**20, 1),
-              "write_mb": round(d["write"] / 2**20, 1), "ios": d["ios"], "max_ms": round(d["max_ms"], 1)}
-             for pid, d in disk.items()]
+    if cutoff is not None:
+        window = round(min(last_s, (end_ft - start_ft) / 1e7), 1)
+    total = sum(d[0] for d in disk.values())
     return {
         "window_s": window, "events": events, "events_lost": lost, "images": len(images),
+        "trigger_at_s": round((end_ft - trig_ft) / -1e7, 1) if trig_ft and end_ft else None,
         "dpc_top": top(dpc), "isr_top": top(isr),
-        "disk_top": sorted(procs, key=lambda r: -r["mb"])[:TOP],
-        "disk_slowest": sorted(procs, key=lambda r: -r["max_ms"])[:5],
+        "disk_top": sorted(proc_rows, key=lambda r: -r["mb"])[:TOP],
+        "disk_slowest": sorted(proc_rows, key=lambda r: -r["max_ms"])[:5],
+        "disk_files": sorted(file_rows, key=lambda r: -r["mb"])[:TOP],
+        "disk_unattributed_pct": round(100 * sum(d[0] for k, d in disk.items() if proc(k) == "?") / total, 1)
+        if total else None,
     }
+
+
+def parse_csv(path, last_s=60, trigger_ts=None, devices=None):
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        return parse_rows(f, last_s, trigger_ts, devices)
 
 
 def _units(seconds, filetime_clock, perf_freq):
     return int(seconds * (10_000_000 if filetime_clock else perf_freq))
+
+
+def dos_devices():
+    """\\Device\\HarddiskVolumeN -> C: for the file paths of disk I/O."""
+    out = {}
+    buf = ctypes.create_unicode_buffer(1024)
+    for c in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        if ctypes.windll.kernel32.QueryDosDeviceW(f"{c}:", buf, len(buf)):
+            out[buf.value] = f"{c}:"
+    return out
 
 
 def headline(summary):
@@ -477,7 +547,7 @@ def analyze(con, cid, keep_csv=False):
     r = con.execute("SELECT ts, trigger, path, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
     if not r:
         raise ValueError(f"Brak zrzutu ETW {cid}")
-    ts, trigger, path, old = r[0], r[1], r[2], json.loads(r[3]) if r[3] else {}
+    ts, trigger, path, old = r[0], r[1], r[2], _loads(r[3])
     if not path or not os.path.exists(path):
         raise ValueError(f"Plik zrzutu {cid} nie istnieje (retencja?)")
     s = settings(config.load())
@@ -490,7 +560,11 @@ def analyze(con, cid, keep_csv=False):
             raise RuntimeError(f"tracerpt {tr.returncode}: {(tr.stdout + tr.stderr).strip()[-300:]}")
         t_conv = time.time() - t0
         csv_mb = os.path.getsize(out) / 2**20
-        summ = parse_csv(out, s["dump_last_s"])
+        try:
+            devices = dos_devices()
+        except (OSError, AttributeError):
+            devices = {}
+        summ = parse_csv(out, s["dump_last_s"], ts, devices)
     except Exception as e:
         old.update(error=str(e)[:300])
         con.execute("UPDATE etw_captures SET status='failed', summary=? WHERE id=?", (json.dumps(old), cid))
@@ -506,7 +580,8 @@ def analyze(con, cid, keep_csv=False):
     con.execute("INSERT INTO incidents(ts, end_ts, kind, severity, title, details) VALUES (?,?,?,?,?,?)",
                 (ts, None, "etw_capture", sev, f"{title} ({trigger})",
                  json.dumps({"capture": cid, "trigger": trigger, "dpc_top": summ["dpc_top"][:3],
-                             "isr_top": summ["isr_top"][:3], "disk_top": summ["disk_top"][:3]}, ensure_ascii=False)))
+                             "isr_top": summ["isr_top"][:3], "disk_top": summ["disk_top"][:3],
+                             "disk_files": summ["disk_files"][:3]}, ensure_ascii=False)))
     con.commit()
     return summ
 

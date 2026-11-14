@@ -614,9 +614,10 @@ def cmd_etw(con, a):
             f"{r['status']}")
         kv({"plik": r["path"] or "(usunięty)", "MB": r["size_mb"], "okno s": sm.get("window_s"),
             "zdarzenia": sm.get("events"), "utracone": sm.get("events_lost"), "analiza s": sm.get("analysis_s"),
-            "błąd": sm.get("error")})
+            "dysk bez procesu %": sm.get("disk_unattributed_pct"), "błąd": sm.get("error")})
         for key, title in (("dpc_top", "DPC wg sterownika"), ("isr_top", "ISR wg sterownika"),
-                           ("disk_top", "Dysk wg procesu (MB)"), ("disk_slowest", "Najwolniejsze I/O wg procesu")):
+                           ("disk_top", "Dysk wg procesu (MB)"), ("disk_slowest", "Najwolniejsze I/O wg procesu"),
+                           ("disk_files", "Dysk wg pliku (MB)")):
             if sm.get(key):
                 out(f"### {title}")
                 table(sm[key])
