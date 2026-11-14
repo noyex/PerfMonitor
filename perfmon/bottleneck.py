@@ -1,9 +1,10 @@
 """What limits a game session and what would actually help: one `kind` with the reason and the advice.
 
-Inputs: per-second frames (bound from PresentMon, or GPU load when PresentMon has no GPU timing), samples (GPU load,
+Inputs: per-second frames (bound from PresentMon's busy times, or GPU load for rows without GPU timing), samples (GPU load,
 power, clock) and game_proc (busiest game thread, shared VRAM). Human-readable strings are Polish."""
 from . import analyze as an
 from . import diagreport as dr
+from . import framestats as fs
 from . import gameplay
 
 VRAM_SHARED_SHARE = 10      # % of game samples with shared VRAM above the spill limit
@@ -33,8 +34,9 @@ def _pct(part, whole):
 
 def compute(con, sid, start, end, vram_total_mb=None):
     """{kind, why, advice, metrics} for a session, or None without frame data."""
-    frames = an._rows(con, "SELECT ts, fps, ft_avg, cpu_busy, bound FROM frames WHERE session=? AND fps>0 ORDER BY ts",
-                      (sid,))
+    # application frames: with frame generation the presented frametime is half the one the CPU busy time belongs to
+    frames = an._rows(con, f"SELECT ts, {fs.APP_FPS} AS fps, {fs.APP_FT_AVG} AS ft_avg, cpu_busy, bound FROM frames "
+                           f"WHERE session=? AND {fs.APP_FPS}>0 ORDER BY ts", (sid,))
     if not frames:
         return None
     samples = an._rows(con, "SELECT ts, gpu_load, gpu_power_w, gpu_clock_mhz, gpu_vram_total_mb, user_idle_s, cpu_total, "
@@ -44,15 +46,17 @@ def compute(con, sid, start, end, vram_total_mb=None):
         frames = played
     load_at = {int(s["ts"]): s["gpu_load"] for s in samples if s["gpu_load"] is not None}
 
-    # bound per second; production PresentMon on this AMD card writes no GPUBusy, so fall back to GPU load
-    source = "presentmon" if any(f["bound"] for f in frames) else "gpu_load"
+    # bound per second from PresentMon's busy times; seconds recorded before the parser knew the 2.x columns
+    # (gpu_busy NULL) fall back to GPU load
+    measured = sum(1 for f in frames if f["bound"])
+    source = "presentmon" if measured == len(frames) else "gpu_load" if not measured else "mixed"
     counts = {"GPU": 0, "CPU": 0, "limit": 0}
     fps_sorted = sorted(f["fps"] for f in frames)
     med = fps_sorted[len(fps_sorted) // 2]
     limit_low = 0
     for f in frames:
         b = f["bound"]
-        if source == "gpu_load":
+        if not b:
             load = load_at.get(int(f["ts"]), load_at.get(int(f["ts"]) - 1))
             if load is not None and load >= GPU_LOAD_BOUND:
                 b = "GPU"

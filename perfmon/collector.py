@@ -49,7 +49,7 @@ OC_ALERT_S = 5        # UV/OC alerts fire only after the condition held this lon
 STRETCH_MAX = 0.97    # effective / reference clock of a fully loaded core below this = clock stretching
 CRASH_LATE_S = 75     # how long after a game exits a WER crash event may still show up
 BSOD_LOCK = threading.Lock()
-ANALYSIS_VERSION = "2"
+ANALYSIS_VERSION = "3"   # 3: gameplay FPS / bottleneck on application frames (frame generation left out)
 BOTTLENECK_EVERY_S = 300   # summary.bottleneck refresh while a game runs (and once at its end)
 
 SRC_DIR = Path(__file__).resolve().parent

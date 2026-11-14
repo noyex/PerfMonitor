@@ -37,11 +37,14 @@ class FrameStatsTest(unittest.TestCase):
                         "VALUES (?,1,?,?,?,?,?,?)", [(1, 200, 200, 6, 100, 100, 12),     # frame generation
                                                     (2, 100, 100, 11, None, None, None),  # recorded before
                                                     (3, 4, 200, 6, 0, None, None)])       # only generated frames
+        con.execute("INSERT INTO frames(ts, session, frames, fps, ft_avg, ft_p99, frame_gen_pct) "
+                    "VALUES (4, 1, 200, 200, 5, 6, 50)")   # recorded before, with frame generation
         got = con.execute(f"SELECT {fs.APP_FPS}, {fs.APP_FRAMES}, {fs.APP_FT_P99}, {fs.APP_FT_AVG} FROM frames "
                           "ORDER BY ts").fetchall()
         self.assertEqual(got[0], (100, 100, 12, 10.0))
         self.assertEqual(got[1][:3], (100, 100, 11))
         self.assertEqual(got[2][:2], (None, 0))
+        self.assertEqual(got[3], (100, 100, 12, 10))
 
     def test_side_ranking(self):
         st = [{"side": "cpu"}] * 6 + [{"side": "gpu"}] * 2 + [{"side": None}]

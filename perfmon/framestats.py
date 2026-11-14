@@ -6,12 +6,14 @@ from . import stuttercause
 BUSY_BOUND = 0.85      # busy share of the application frametime that makes a second CPU- or GPU-bound
 STUTTER_BUSY = 0.5     # busy share of a stutter frame that puts it on that side
 
-# Application frames per second; rows from before app_frames existed have no frame generation data, so their
-# presented frames are the best there is. A second with only generated frames has app_fps NULL (and fps>0 skips it).
-APP_FPS = "(CASE WHEN app_frames IS NULL THEN fps ELSE app_fps END)"
-APP_FRAMES = "COALESCE(app_frames, frames)"
-APP_FT_P99 = "(CASE WHEN app_frames IS NULL THEN ft_p99 ELSE app_ft_p99 END)"
-APP_FT_AVG = "(CASE WHEN app_frames IS NULL THEN ft_avg WHEN app_fps>0 THEN 1000.0/app_fps END)"
+# Application frames per second. Rows from before app_frames existed are scaled by their frame_gen_pct, so old
+# sessions with frame generation compare with new ones (exact for FPS; the p99 frametime is an estimate) and rows
+# without frame type data stay as recorded. A second with only generated frames has app_fps NULL (fps>0 skips it).
+_NATIVE = "(1 - COALESCE(frame_gen_pct, 0) / 100.0)"
+APP_FPS = f"(CASE WHEN app_frames IS NULL THEN fps * {_NATIVE} ELSE app_fps END)"
+APP_FRAMES = f"COALESCE(app_frames, frames * {_NATIVE})"
+APP_FT_P99 = f"(CASE WHEN app_frames IS NULL THEN ft_p99 / {_NATIVE} ELSE app_ft_p99 END)"
+APP_FT_AVG = f"(CASE WHEN app_frames IS NULL THEN ft_avg / {_NATIVE} WHEN app_fps>0 THEN 1000.0/app_fps END)"
 
 SIDES = ("cpu", "gpu", "present")
 BOUND_SIDE = {"CPU": "cpu", "GPU": "gpu", "limit": "present"}   # what a normal second's bound means as a side
