@@ -5,12 +5,7 @@ Pages.todo = (() => {
   const KIND = { stability: "Stabilność", smoothness: "Płynność", latency: "Opóźnienie", fps: "FPS" };
   let view = null;
 
-  const post = async (body) => {
-    const r = await fetch("/api/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.statusText);
-    return j;
-  };
+  const post = (body) => apiPost("test", body);
   const act = (body) => async () => {
     try {
       await post(body);

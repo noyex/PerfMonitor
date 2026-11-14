@@ -10,12 +10,7 @@ Pages.oc = (() => {
   const deltaCell = (v, goodUp = true) =>
     h("td", { class: `num${v ? ((v > 0) === goodUp ? " up" : " down") : ""}` }, pct(v));
 
-  const post = async (body) => {
-    const r = await fetch("/api/oc_profile", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.statusText);
-    return j;
-  };
+  const post = (body) => apiPost("oc_profile", body);
 
   // ---------- stability ----------
   const check = (st, prefix) => st.checks.find((c) => c.check.startsWith(prefix)) || {};
@@ -110,7 +105,7 @@ Pages.oc = (() => {
           idx == null ? null : h("span", { class: "v" }, ` ${fmt(data[k + 1][idx], 3)} V`))));
       if (idx != null) read.append(h("span", { class: "t" }, `${fmt(data[0][idx])} MHz`));
     };
-    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: `13px Nohemi, system-ui, sans-serif` };
+    const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { show: false }, font: axisFont() };
     const u = new uPlot({
       width: Math.max(300, el.clientWidth || wrap.clientWidth / 2 - 40), height: 190, padding: [6, 8, 0, 0],
       legend: { show: false }, cursor: { y: false, points: { size: 7, width: 2, fill: css("--surface") } },

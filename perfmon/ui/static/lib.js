@@ -1,15 +1,46 @@
 // Shared helpers: API, formatting, DOM, charts. Pages register themselves in window.Pages.
 window.Pages = {};
 
+// In the desktop shell the page is served by Tauri, window.__PERFMON_API__ is the origin of the window's own Python API
+// server and window.__PERFMON_TOKEN__ the per-launch token its POSTs must carry. In a browser or pywebview the page
+// comes from the API server itself: URLs stay relative and there is no token.
+const API_BASE = window.__PERFMON_API__ || "";
+const API_TOKEN = window.__PERFMON_TOKEN__ || "";
+const apiUrl = (path) => `${API_BASE}${path}`;
+// The shell starts its Python server together with the window (~1 s until it listens): during the first 10 s after page
+// load, connection failures are retried quietly instead of reaching the page as errors. After that, or in a browser,
+// a failure surfaces at once.
+const API_START_DEADLINE = API_BASE ? 10000 : 0;   // ms since page load (performance.now)
+
 const api = async (name, params = {}) => {
   const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""));
-  const r = await fetch(`/api/${name}?${q}`);
+  let r;
+  for (let wait = 150; ; wait = Math.min(wait * 1.5, 800)) {
+    try {
+      r = await fetch(apiUrl(`/api/${name}?${q}`));
+      break;
+    } catch (e) {
+      if (performance.now() >= API_START_DEADLINE) throw e;
+      await new Promise((done) => setTimeout(done, Math.min(wait, API_START_DEADLINE - performance.now())));
+    }
+  }
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+};
+
+// The write endpoints (/api/oc_profile, /api/test): JSON body, JSON answer.
+const apiPost = async (name, body) => {
+  const headers = { "Content-Type": "application/json", ...(API_TOKEN && { "X-PerfMon-Token": API_TOKEN }) };
+  const r = await fetch(apiUrl(`/api/${name}`), { method: "POST", headers, body: JSON.stringify(body) });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 };
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// uPlot draws its axes on a canvas, which does not follow CSS: pass the text face explicitly.
+const axisFont = () => `13px ${css("--font-text")}`;
 const SERIES = ["--s1", "--s2", "--s3", "--s4"];
 
 // ---------- formatting ----------
@@ -209,7 +240,7 @@ const chart = (container, opt, data) => {
     stroke: css("--muted"),
     grid: { stroke: css("--grid"), width: 1 },
     ticks: { show: false },
-    font: `13px Nohemi, system-ui, sans-serif`,
+    font: axisFont(),
   };
   const u = new uPlot(
     {

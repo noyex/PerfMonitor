@@ -11,6 +11,7 @@ if (-not $isAdmin) {
 
 $pyw = Join-Path $root '.venv\Scripts\pythonw.exe'
 if (-not (Test-Path $pyw)) { throw "Brak środowiska Python: $pyw" }
+$exe = Join-Path $root 'PerfMonitor.exe'   # the window from build-ui.ps1; without it the shortcuts open the Python window
 $user = "$env:USERDOMAIN\$env:USERNAME"
 
 Write-Host "1/3 Zadanie w harmonogramie (kolektor przy logowaniu, z uprawnieniami admina)..."
@@ -28,10 +29,16 @@ Write-Host "2/3 Skróty PerfMonitor (pulpit + menu Start)..."
 $shell = New-Object -ComObject WScript.Shell
 foreach ($dir in @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
     $lnk = $shell.CreateShortcut((Join-Path $dir 'PerfMonitor.lnk'))
-    $lnk.TargetPath = $pyw
-    $lnk.Arguments = '-m perfmon.ui.app'
+    if (Test-Path $exe) {
+        $lnk.TargetPath = $exe
+        $lnk.Arguments = ''
+        $lnk.IconLocation = "$exe,0"
+    } else {
+        $lnk.TargetPath = $pyw
+        $lnk.Arguments = '-m perfmon.ui.app'
+        $lnk.IconLocation = "$root\perfmon\ui\static\favicon.ico"
+    }
     $lnk.WorkingDirectory = $root
-    $lnk.IconLocation = "$root\perfmon\ui\static\favicon.ico"
     $lnk.Description = 'PerfMonitor - wydajność i problemy'
     $lnk.Save()
 }
