@@ -269,3 +269,12 @@ const chart = (container, opt, data) => {
 
 // Builds uPlot data arrays from analyze.series() output ({ts:[], col:[]}), optional value transform.
 const cols = (s, keys, map = {}) => [s.ts || [], ...keys.map((k) => (s[k] || []).map((v) => (v == null ? null : map[k] ? map[k](v) : v)))];
+
+// "Ping" chart from net_series() output: router / internet / game server lines, packet loss as markers. Returns null without data.
+const pingChart = (container, n, opt) => {
+  const has = (k) => (n[k] || []).some((v) => v != null);
+  if (!has("gw_ms") && !has("inet_ms") && !has("game_ms")) return null;
+  const keys = [["gw_ms", "Router"], ["inet_ms", "Internet"], ["game_ms", "Serwer gry"]].filter(([k]) => has(k));
+  const loss = (n.ts || []).filter((_, i) => n.inet_loss[i] > 0).map((ts) => ({ ts, color: css("--warning") }));
+  return chart(container, { title: "Ping", unit: "ms", series: keys.map(([, label]) => ({ label })), yFloor: 50, markers: () => loss, ...opt }, cols(n, keys.map(([k]) => k)));
+};

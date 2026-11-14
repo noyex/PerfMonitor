@@ -9,14 +9,21 @@ import win32pdh
 log = logging.getLogger("perfmon.sensors")
 
 
+def _rd(v, n=0):
+    return round(v, n) if v is not None else None
+
+
 class HardwareSensors:
     """Temperatures, clocks, CPU/GPU power. Full CPU data requires administrator rights."""
 
     def __init__(self, lhm_dir: str):
         self.ok = False
         self.computer = None
-        self.cpu = self.gpu = None
+        self.cpu = self.gpu = self.board = None
+        self.dimms = []
         self.storage = []
+        self._last_dimm = 0.0
+        self.dimm_temp = None
         self._last_storage = 0.0
         self.storage_temps = {}
         try:
@@ -29,6 +36,8 @@ class HardwareSensors:
             c.IsCpuEnabled = True
             c.IsGpuEnabled = True
             c.IsStorageEnabled = True
+            c.IsMotherboardEnabled = True   # Super I/O: Vcore, VSoC, VRM temperatures (UV/OC detail)
+            c.IsMemoryEnabled = True        # DIMM temperatures
             c.Open()
             self.computer = c
             gpus = []
@@ -42,6 +51,10 @@ class HardwareSensors:
                     gpus.append((total, h))
                 elif t == "Storage":
                     self.storage.append(h)
+                elif t == "Motherboard":
+                    self.board = h
+                elif t == "Memory" and h.Name not in ("Virtual Memory", "Total Memory"):   # DIMM SPD hubs
+                    self.dimms.append(h)
             if gpus:
                 self.gpu = max(gpus, key=lambda x: x[0])[1]  # dedicated card = most VRAM
             self.ok = True
@@ -62,20 +75,43 @@ class HardwareSensors:
     def _nz(v):
         return v if v else None  # 0.0 without admin rights = no data
 
+    @staticmethod
+    def _map(h):
+        """{(sensor type, name): value} for one hardware node (values None when unreadable)."""
+        m = {}
+        for s in h.Sensors:
+            v = s.Value
+            m[(str(s.SensorType), s.Name)] = float(v) if v is not None else None
+        return m
+
     def read(self) -> dict:
+        """Per-second values for `samples` plus out["detail"]: the UV/OC telemetry for `hw_detail`."""
         out = {}
         if not self.ok:
             return out
         try:
+            det = {}
             if self.cpu is not None:
                 self.cpu.Update()
-                f = lambda t, n: self._find(self.cpu, t, n)
+                cm = self._map(self.cpu)
+                f = lambda t, n: cm.get((t, n))
                 out["cpu_temp"] = self._nz(f("Temperature", "Core (Tctl/Tdie)"))
                 out["cpu_power_w"] = self._nz(f("Power", "Package"))
                 out["cpu_clock_mhz"] = self._nz(f("Clock", "Cores (Average Effective)")) or self._nz(f("Clock", "Cores (Average)"))
+                n = 0
+                while ("Clock", f"Core #{n + 1}") in cm:
+                    n += 1
+                eff = [_rd(f("Clock", f"Core #{i} (Effective)")) for i in range(1, n + 1)]
+                det.update(
+                    cpu_eff=eff, cpu_clk=[_rd(f("Clock", f"Core #{i}")) for i in range(1, n + 1)],
+                    cpu_core_w=[_rd(f("Power", f"Core #{i} (SMU)"), 2) for i in range(1, n + 1)],
+                    cpu_pkg_w=self._nz(f("Power", "Package")), tctl=self._nz(f("Temperature", "Core (Tctl/Tdie)")),
+                    tccd=self._nz(f("Temperature", "CCD1 (Tdie)")), bus_mhz=self._nz(f("Clock", "Bus Speed")))
+                out["cpu_eff_max"] = max((e for e in eff if e), default=None)
             if self.gpu is not None:
                 self.gpu.Update()
-                g = lambda t, n: self._find(self.gpu, t, n)
+                gm = self._map(self.gpu)
+                g = lambda t, n: gm.get((t, n))
                 out.update({
                     "gpu_load": g("Load", "GPU Core"),
                     "gpu_3d": g("Load", "D3D 3D"),
@@ -88,8 +124,31 @@ class HardwareSensors:
                     "gpu_mem_temp": g("Temperature", "GPU Memory"),
                     "gpu_power_w": g("Power", "GPU Package"),
                     "gpu_fan_rpm": g("Fan", "GPU Fan"),
+                    "gpu_voltage": self._nz(g("Voltage", "GPU Core")),
                 })
+                det.update(gpu_clk=out["gpu_clock_mhz"], gpu_mem_clk=out["gpu_mem_clock_mhz"], gpu_v=out["gpu_voltage"],
+                           gpu_w=out["gpu_power_w"], gpu_temp=out["gpu_temp"], gpu_hot=out["gpu_hotspot"],
+                           gpu_mem_temp=out["gpu_mem_temp"], gpu_fan=out["gpu_fan_rpm"], gpu_load=out["gpu_load"])
+            if self.board is not None:
+                bm = {}
+                for sub in self.board.SubHardware:   # the Super I/O chip is a sub-node of the board
+                    sub.Update()
+                    bm.update(self._map(sub))
+                b = lambda t, n: self._nz(bm.get((t, n)))
+                det.update(cpu_vcore=b("Voltage", "Vcore"), cpu_vsoc=b("Voltage", "Vcore SoC"),
+                           cpu_vmisc=b("Voltage", "Vcore Misc"), vrm_temp=b("Temperature", "VRM MOS"),
+                           vsoc_temp=b("Temperature", "VSoC MOS"), cpu_fan=b("Fan", "CPU Fan"))
+                out["cpu_vcore"], out["vrm_temp"] = det["cpu_vcore"], det["vrm_temp"]
             now = time.time()
+            if self.dimms and now - self._last_dimm > 10:   # SPD over SMBus: no need every second
+                self._last_dimm = now
+                temps = []
+                for h in self.dimms:
+                    h.Update()
+                    temps += [v for (t, n), v in self._map(h).items() if t == "Temperature" and n.startswith("DIMM") and v]
+                self.dimm_temp = max(temps) if temps else None
+            det["dimm_temp"] = self.dimm_temp
+            out["detail"] = det
             if now - self._last_storage > 30:  # SMART is slow – every 30 s
                 self._last_storage = now
                 for h in self.storage:
@@ -106,31 +165,26 @@ class HardwareSensors:
         if not self.ok:
             return []
         c = self.computer
-        c.IsMotherboardEnabled = True
-        c.IsMemoryEnabled = True
         out = []
-        try:
-            def walk(h, parent=None):
-                h.Update()
-                for s in h.Sensors:
-                    v, mn, mx = s.Value, s.Min, s.Max
-                    out.append({"hardware": h.Name, "hw_type": str(h.HardwareType), "parent": parent,
-                                "type": str(s.SensorType), "name": s.Name, "id": str(s.Identifier),
-                                "value": float(v) if v is not None else None,
-                                "min": float(mn) if mn is not None else None,
-                                "max": float(mx) if mx is not None else None})
-                for sub in h.SubHardware:
-                    walk(sub, h.Name)
-            for h in c.Hardware:  # first pass primes rate/effective-clock sensors
-                h.Update()
-                for sub in h.SubHardware:
-                    sub.Update()
-            time.sleep(0.5)
-            for h in c.Hardware:
-                walk(h)
-        finally:
-            c.IsMotherboardEnabled = False
-            c.IsMemoryEnabled = False
+
+        def walk(h, parent=None):
+            h.Update()
+            for s in h.Sensors:
+                v, mn, mx = s.Value, s.Min, s.Max
+                out.append({"hardware": h.Name, "hw_type": str(h.HardwareType), "parent": parent,
+                            "type": str(s.SensorType), "name": s.Name, "id": str(s.Identifier),
+                            "value": float(v) if v is not None else None,
+                            "min": float(mn) if mn is not None else None,
+                            "max": float(mx) if mx is not None else None})
+            for sub in h.SubHardware:
+                walk(sub, h.Name)
+        for h in c.Hardware:  # first pass primes rate/effective-clock sensors
+            h.Update()
+            for sub in h.SubHardware:
+                sub.Update()
+        time.sleep(0.5)
+        for h in c.Hardware:
+            walk(h)
         return out
 
     def describe(self) -> dict:

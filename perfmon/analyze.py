@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, marks
+from . import bottleneck, crashinfo, diagreport, gameplay, marks, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -126,6 +126,10 @@ def latest(con):
         sess["running_s"] = round(now - sess["start_ts"])
     if s:
         s["extra"] = _json(s.get("extra"))
+    net = None
+    if _has_net(con):
+        net = _one(con, "SELECT ts, gw_ms, inet_ms, inet_loss, game_ms FROM net_samples WHERE ts>=? ORDER BY ts DESC LIMIT 1",
+                   (now - 10,))
     cnt = _one(con, "SELECT (SELECT COUNT(*) FROM incidents) AS incidents, (SELECT COUNT(*) FROM sessions) AS sessions,"
                     " (SELECT MIN(ts) FROM samples) AS first_sample")
     return {
@@ -139,6 +143,7 @@ def latest(con):
         "collector_stopped": float(meta["collector_stopped"]) if meta.get("collector_stopped") else None,
         "hw": _json(meta.get("hw")),
         "open_session": sess,
+        "net": net,
         "counts": cnt,
     }
 
@@ -288,7 +293,7 @@ def _flatten_session(r, stutters=None, ends=None):
         "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": end if r["end_ts"] is not None else None,
         "end_reason": r["end_reason"], "end_estimated": estimated,
         "duration_s": round((end or time.time()) - r["start_ts"]) if r["start_ts"] else None,
-        "running": running,
+        "running": running, "kind": r.get("kind") or "game", "profile_id": r.get("profile_id"),
     }
     for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error"):
         d[k] = summ.get(k)
@@ -301,8 +306,11 @@ def _flatten_session(r, stutters=None, ends=None):
     return d
 
 
+GAMES_ONLY = "COALESCE(kind, 'game')='game'"   # sessions that are not stress tests / idle soaks
+
+
 def sessions(con, limit=20):
-    rows = _rows(con, "SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (int(limit),))
+    rows = _rows(con, f"SELECT * FROM sessions WHERE {GAMES_ONLY} ORDER BY id DESC LIMIT ?", (int(limit),))
     if not rows:
         return []
     ids = [r["id"] for r in rows]
@@ -316,7 +324,7 @@ def sessions(con, limit=20):
 
 def game_list(con):
     """Games with at least one session, most played first (cheap list for pickers)."""
-    return _rows(con, "SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions "
+    return _rows(con, f"SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions WHERE {GAMES_ONLY} "
                       "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
 
 
@@ -331,7 +339,7 @@ def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=
         return max(v) if v else None
 
     if win:
-        if (mx("disk_lat_ms") or 0) > 30 or (mx("hard_faults_s") or 0) > 200:
+        if (mx("disk_lat_ms") or 0) > 30:   # hard faults alone are normal streaming (45% of seconds in a CoD session)
             causes.append("disk")
         vr = [s["gpu_vram_mb"] / s["gpu_vram_total_mb"] for s in win if s["gpu_vram_mb"] and s["gpu_vram_total_mb"]]
         if vr and max(vr) > 0.95:
@@ -402,7 +410,8 @@ def session_report(con, session_id):
     st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
     samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, pagefile_pct, "
                          "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
-                         "fg_exe FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts", (start - 3, end + 3))
+                         "fg_exe, gpu_power_w, user_idle_s, cpu_total FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts",
+                    (start - 3, end + 3))
     procs = _rows(con, "SELECT ts, name, cpu_pct FROM procs WHERE kind='cpu' AND ts BETWEEN ? AND ? ORDER BY ts",
                   (start - 6, end + 6))
     s_ts, p_ts = [s["ts"] for s in samples], [p["ts"] for p in procs]
@@ -416,11 +425,21 @@ def session_report(con, session_id):
             cause_counts[c] += 1
             if c.startswith("background:"):
                 bg_counts[c.split(":", 1)[1]] += 1
+    ranked = _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext)
+    if ranked is not None:   # keep only what stutters have more often than normal gameplay
+        confirmed = {r["tag"] for r in ranked if r["verdict"] in ("confirmed", "weak")}
+        cause_counts = Counter()
+        for s in st:
+            s["causes"] = [c for c in s["causes"] if c in confirmed] or ["shader_or_unknown"]
+            cause_counts.update(s["causes"])
+        bg_counts = Counter({k: v for k, v in bg_counts.items() if f"background:{k}" in confirmed})
     worst = sorted(st, key=lambda s: -s["ft_ms"])[:15]
     rep["stutters"] = {
         "count": len(st), "per_min": _r(len(st) / (dur / 60), 2),
         "worst_ft_ms": _r(max((s["ft_ms"] for s in st), default=None)),
         "cause_counts": dict(cause_counts.most_common()),
+        "cause_ranking": ranked,
+        "ambient": [r for r in ranked or [] if r["verdict"] == "ambient" and r["tag"] != "shader_or_unknown"],
         "background_procs": dict(bg_counts.most_common(5)),
         "worst": [{"ts": w["ts"], "time": fmt_ts(w["ts"]), "ft_ms": _r(w["ft_ms"]), "median_ms": _r(w["median_ms"]),
                    "causes": w["causes"]} for w in worst],
@@ -448,10 +467,29 @@ def session_report(con, session_id):
                                "ORDER BY ts LIMIT 60", (start, end + 60))
     for e in rep["events"]:
         e["time"] = fmt_ts(e["ts"])
+    # --- network during the session + does it line up with the stutters (network lag vs local stutter)
+    nrows = _net_rows(con, start, end)
+    rep["net"] = net_summary(con, start, end, rows=nrows)
+    rep["net"]["correlation"] = (net_correlation(con, nrows, [s["ts"] for s in st], start, end)
+                                 if rep["net"]["seconds"] else None)
     rep["marks"] = marks.report(con, start, end + 5, exe)
     diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
     return rep
+
+
+def _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext):
+    """stuttercause.rank over gameplay seconds, or None when the session has too little gameplay to judge."""
+    keep = gameplay.select(frames, samples, start)
+    if len(keep) < gameplay.MIN_GAMEPLAY_S:
+        return None
+    secs = {int(f["ts"]) for f in keep}
+    played = [s for s in st if int(s["ts"]) in secs]
+    if not played:
+        return None
+    base = stuttercause.baseline_ts([f["ts"] for f in keep], [s["ts"] for s in st])
+    base_tags = [_causes_for_stutter({"ts": t}, s_ts, samples, p_ts, procs, exe, ext) for t in base]
+    return stuttercause.rank([s["causes"] for s in played], base_tags)
 
 
 def _session_findings(rep, row):
@@ -534,6 +572,14 @@ def _session_findings(rep, row):
             add("info", "Większość stutterów bez przyczyny systemowej",
                 "Zwykle kompilacja shaderów lub streaming zasobów w grze. Pomaga: wstępna kompilacja shaderów, "
                 "aktualne sterowniki Adrenalin, gra na szybkim SSD, ReBAR/SAM włączony.")
+        amb = st.get("ambient") or []
+        if st.get("cause_ranking") is None:
+            add("info", "Za mało rozgrywki, by ocenić przyczyny stutterów",
+                "Sesja to głównie menu, ładowanie lub kompilacja shaderów. Podane przyczyny są niepotwierdzone.")
+        if amb:
+            add("info", "Stałe warunki, których nie da się ocenić w tej sesji",
+                ", ".join(f"{r['tag']} ({r['base_pct']:.0f}% zwykłych sekund)" for r in amb[:3]) +
+                ": występują także bez stutterów. Sprawdź je testem przed/po (pm test start).")
 
     if hw:
         tc, th = hw.get("cpu_temp_max"), hw.get("gpu_hotspot_max")
@@ -549,8 +595,34 @@ def _session_findings(rep, row):
         if (hw.get("ui_ms_max") or 0) >= 2000 or (hw.get("dwm_ms_max") or 0) >= 2000:
             add("critical", "Zawieszenie pulpitu/DWM podczas sesji",
                 f"ui_ms max {hw.get('ui_ms_max')}, dwm_ms max {hw.get('dwm_ms_max')} - szczegóły w incydentach.")
+    net = rep.get("net") or {}
+    if net.get("seconds"):
+        ninc = Counter(i["kind"] for i in net.get("incidents") or [])
+        gl = (net.get("targets") or {}).get("game") or {}
+        if ninc.get("net_down") or ninc.get("net_link_down"):
+            add("serious", f"Utrata połączenia z internetem podczas gry ({ninc['net_down'] + ninc['net_link_down']}x)",
+                "Szczegóły i miejsce awarii (dom/operator/internet) w incydentach net_down / net_link_down.")
+        if ninc.get("game_lag"):
+            add("warning", f"Lag do serwera gry ({ninc['game_lag']}x)",
+                "Wzrost pingu lub utrata pakietów do serwera gry - to lag sieciowy, nie przycięcia PC. Pole `where` w "
+                "incydencie game_lag wskazuje winowajcę (dom/operator/internet/serwer gry).")
+        if ninc.get("packet_loss"):
+            add("warning", f"Utrata pakietów podczas gry ({ninc['packet_loss']}x)",
+                "; ".join(i["title"] for i in net["incidents"] if i["kind"] == "packet_loss") or "Sprawdź sekcję net.")
+        if (gl.get("loss_pct") or 0) >= 1:
+            add("warning", f"Utrata pakietów do serwera gry {gl['loss_pct']}%", "Rubber-banding / lag w grze online.")
+        cor = net.get("correlation") or {}
+        near_pct = cor.get("stutters_near_net_problem_pct") or 0
+        if (cor.get("stutters_near_net_problem") or 0) >= 2 and near_pct >= 30 and near_pct > 2 * (cor.get("chance_pct") or 0):
+            add("warning", f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów zbiega się z problemami sieci",
+                f"W oknie +-{cor['window_s']:g} s od skoku pingu / utraty pakietów ({cor['stutters_near_net_problem_pct']}% "
+                f"stutterów przy {cor['chance_pct']}% czasu z problemami sieci) - przycięcia mogą być lagiem sieciowym.")
+        elif cor.get("bad_seconds") and cor.get("stutters") and near_pct < 30:
+            add("info", "Stuttery w większości nie pokrywają się z problemami sieci",
+                f"{cor['stutters_near_net_problem']} z {cor['stutters']} stutterów blisko skoku pingu / utraty pakietów - "
+                "pozostałe przycięcia są raczej lokalne (PC), nie sieciowe.")
     for inc in rep.get("incidents") or []:
-        if inc["kind"] in ("gpu_driver", "whea", "bsod"):
+        if inc["kind"] in ("gpu_driver", "whea", "whea_fatal", "whea_corrected", "whea_pcie", "bsod"):
             add("critical", f"{inc['title']} ({fmt_ts(inc['ts'])})", "Błąd sterownika/sprzętu w trakcie gry - nie ignoruj, sprawdź events.")
     f += diagreport.findings(rep, row)
     if not f:
@@ -649,6 +721,7 @@ def range_report(con, t0, t1):
                        "AND start_ts>=?)) ORDER BY start_ts", (t1, t1, t0, t0 - 86400))
     ends = _eff_ends(con, srows)
     rep["sessions"] = [_flatten_session(r, ends=ends) for r in srows if (ends[r["id"]] or t1) >= t0]
+    rep["net"] = net_summary(con, t0, t1)
     return rep
 
 
@@ -678,11 +751,242 @@ def moment(con, ts, window=30):
         e["time"] = fmt_ts(e["ts"])
     prev = _one(con, "SELECT ts FROM samples WHERE ts<? ORDER BY ts DESC LIMIT 1", (t0,))
     nxt = _one(con, "SELECT ts FROM samples WHERE ts>? ORDER BY ts LIMIT 1", (t1,))
-    return {"at": fmt_ts(ts), "window_s": window, "samples": rows, "procs": procs, "events": evs,
+    nrows = _net_rows(con, t0, t1)
+    for r in nrows:
+        r["time"] = fmt_ts(r["ts"])
+        r["t_rel"] = _r(r["ts"] - ts, 0)
+        r["extra"] = _json(r["extra"])
+        for k, v in r.items():
+            if isinstance(v, float) and k not in ("ts",):
+                r[k] = _r(v, 2)
+    near = min(nrows, key=lambda r: abs(r["ts"] - ts)) if nrows else None
+    net = {"nearest": near if near and abs(near["ts"] - ts) <= max(5.0, window) else None, "samples": nrows[-301:],
+           "summary": net_summary(con, t0, t1)}
+    return {"at": fmt_ts(ts), "window_s": window, "samples": rows, "procs": procs, "events": evs, "net": net,
             "incidents": incidents_between(con, t0, t1),
             "sample_gap_note": None if rows else "Brak próbek w tym oknie (kolektor nie działał - np. komputer był wyłączony).",
             "nearest_sample_before": fmt_ts(prev["ts"]) if prev else None,
             "nearest_sample_after": fmt_ts(nxt["ts"]) if nxt else None}
+
+
+# --------------------------------------------------------------------------
+# network quality (net_samples, written by perfmon/netmon.py)
+# --------------------------------------------------------------------------
+
+NET_TARGETS = ("gw", "isp", "inet", "game")
+NET_TARGET_PL = {"gw": "router", "isp": "pierwszy węzeł operatora", "inet": "internet", "game": "serwer gry"}
+NET_KINDS = ["net_down", "net_link_down", "packet_loss", "latency_spike", "game_lag", "wifi_weak"]
+NET_COLS = ["gw_ms", "gw_loss", "isp_ms", "isp_loss", "inet_ms", "inet_loss", "game_ms", "game_loss", "dns_ms", "link",
+            "wifi_signal", "wifi_rssi"]
+NET_DOWNLOAD_KBS = 2000  # net_rx_kbs above this during a latency spike = a download is saturating the line
+_REASON = re.compile(r"(?<![A-Za-z])Reason=([^;\]\r\n]+)")
+_REASON_CODE = re.compile(r"ReasonCode=(\d+)")
+
+
+def _has_net(con):
+    return bool(_table_cols(con, "net_samples"))
+
+
+def _net_rows(con, t0, t1):
+    if not _has_net(con):
+        return []
+    return _rows(con, f"SELECT ts, session, {','.join(NET_COLS)}, extra FROM net_samples WHERE ts BETWEEN ? AND ? "
+                      "ORDER BY ts", (float(t0), float(t1)))
+
+
+def _ms_stats(vals):
+    return {"avg": _r(sum(vals) / len(vals), 1) if vals else None, "p50": _r(_pct(vals, 0.5), 1),
+            "p95": _r(_pct(vals, 0.95), 1), "p99": _r(_pct(vals, 0.99), 1), "max": _r(max(vals), 1) if vals else None}
+
+
+def _net_target(rows, k):
+    ms = [r[f"{k}_ms"] for r in rows if r[f"{k}_ms"] is not None]
+    losses = [r[f"{k}_loss"] for r in rows if r[f"{k}_loss"] is not None]
+    # jitter = mean absolute difference of rtts in consecutive seconds
+    diffs, prev = [], None
+    for r in rows:
+        v = r[f"{k}_ms"]
+        if v is not None and prev is not None and r["ts"] - prev[0] <= 2.5:
+            diffs.append(abs(v - prev[1]))
+        prev = (r["ts"], v) if v is not None else None
+    d = _ms_stats(ms)
+    d.update(jitter=_r(sum(diffs) / len(diffs), 2) if diffs else None, probes=len(losses),
+             loss_pct=_r(100 * sum(losses) / len(losses), 2) if losses else None,
+             loss_seconds=sum(1 for v in losses if v > 0))
+    return d
+
+
+def _net_wifi_disconnects(con, t0, t1):
+    out = []
+    for e in _rows(con, "SELECT ts, message FROM events WHERE provider LIKE '%WLAN-AutoConfig%' AND event_id=8003 "
+                        "AND ts BETWEEN ? AND ? ORDER BY ts", (t0, t1)):
+        msg = e["message"] or ""
+        m, c = _REASON.search(msg), _REASON_CODE.search(msg)
+        code = int(c.group(1)) if c else None
+        out.append({"ts": e["ts"], "time": fmt_ts(e["ts"]), "reason_code": code,
+                    "reason": m.group(1).strip() if m else None, "user_initiated": code == 3})
+    return out
+
+
+def net_summary(con, t0, t1, rows=None):
+    """Network quality over a time range: per-target latency/jitter/loss, DNS, link, Wi-Fi, NIC errors, incidents,
+    and a short Polish verdict. Always returns the same shape (empty stats when there is no net data)."""
+    t0, t1 = float(t0), float(t1)
+    rows = _net_rows(con, t0, t1) if rows is None else rows
+    rep = {"from": fmt_ts(t0), "to": fmt_ts(t1), "seconds": len(rows), "targets": {}, "dns": None,
+           "disconnected_s": 0, "link_s": {}, "wifi": None, "nic_errors": {}, "incidents": [], "verdict": []}
+    rep["targets"] = {k: _net_target([], k) for k in NET_TARGETS}
+    if _has_net(con):
+        rep["incidents"] = incidents_between(con, t0, t1, kinds=NET_KINDS)
+    if not rows:
+        rep["verdict"] = ["Brak danych sieciowych w tym zakresie (monitor sieci nie działał lub starsza baza)."]
+        return rep
+    rep["targets"] = {k: _net_target(rows, k) for k in NET_TARGETS}
+    dns = [r["dns_ms"] for r in rows if r["dns_ms"] is not None]
+    # extra only stores changes: seed the state (SSID/BSSID/channel) that was current when the range started
+    extras = [{}]
+    seed = _rows(con, "SELECT extra FROM net_samples WHERE ts < ? AND extra IS NOT NULL ORDER BY ts DESC LIMIT 200",
+                 (t0,)) if rows[0]["link"] == "wifi" else []
+    for r in reversed(seed):
+        x = _json(r["extra"])
+        if isinstance(x, dict):
+            extras[0].update({k: v for k, v in x.items() if k.startswith("wifi_")})
+    for r in rows:
+        x = _json(r["extra"]) if r["extra"] else None
+        extras.append(x if isinstance(x, dict) else {})
+    fails = sum(1 for x in extras if x.get("dns_failed"))
+    rep["dns"] = {"probes": len(dns) + fails, "avg": _r(sum(dns) / len(dns), 1) if dns else None,
+                  "p95": _r(_pct(dns, 0.95), 1), "failures": fails}
+    rep["disconnected_s"] = sum(1 for r in rows if r["link"] is None)
+    rep["link_s"] = dict(Counter(r["link"] for r in rows if r["link"]))
+    nic = Counter()
+    for x in extras:
+        if isinstance(x.get("nic_errors"), dict):
+            for k, v in x["nic_errors"].items():
+                nic[k] += v or 0
+    rep["nic_errors"] = {**nic, "total": sum(nic.values())} if nic else {}
+
+    sig = [r["wifi_signal"] for r in rows if r["wifi_signal"] is not None]
+    rssi = [r["wifi_rssi"] for r in rows if r["wifi_rssi"] is not None]
+    bssids = list(dict.fromkeys(x["wifi_bssid"] for x in extras if x.get("wifi_bssid")))
+    chans = list(dict.fromkeys(x["wifi_channel"] for x in extras if x.get("wifi_channel") is not None))
+    ssids = list(dict.fromkeys(x["wifi_ssid"] for x in extras if x.get("wifi_ssid")))
+    disc = _net_wifi_disconnects(con, t0, t1)
+    if sig or rssi or disc:
+        rep["wifi"] = {
+            "seconds": len(sig), "signal_min": min(sig) if sig else None,
+            "signal_avg": _r(sum(sig) / len(sig), 1) if sig else None,
+            "rssi_min": min(rssi) if rssi else None, "rssi_max": max(rssi) if rssi else None,
+            "ssids": ssids, "bssids": bssids, "channels": chans,
+            "disconnects": len(disc), "unexpected_disconnects": sum(1 for d in disc if not d["user_initiated"]),
+            "disconnect_events": disc}
+    rep["verdict"] = _net_verdict(con, rep, t0, t1)
+    return rep
+
+
+def _net_verdict(con, rep, t0, t1):
+    v = []
+    tg = rep["targets"]
+    n = rep["seconds"]
+    if rep["disconnected_s"]:
+        v.append(f"Brak łącza sieciowego przez {rep['disconnected_s']} s ({100 * rep['disconnected_s'] / n:.1f}% czasu)")
+    # loss: report at the closest-to-user hop that already shows it, that is where the problem starts
+    # Routers rate-limit ICMP to themselves, so a hop is only blamed when the traffic behind it is lossy too
+    end_lossy = [k for k in ("inet", "game") if (tg[k]["loss_pct"] or 0) >= 1]
+    lossy = [(k, tg[k]["loss_pct"]) for k in NET_TARGETS if (tg[k]["loss_pct"] or 0) >= 1]
+    if end_lossy:
+        k, pct = lossy[0]
+        where = {"gw": "problem po stronie Wi-Fi/routera (sieci domowej)",
+                 "isp": "problem po stronie operatora (łącze/pierwszy węzeł)",
+                 "inet": "problem w internecie lub u operatora",
+                 "game": "problem na trasie do serwera gry"}[k]
+        v.append(f"Utrata pakietów {pct:.1f}% ({NET_TARGET_PL[k]}) - {where}")
+    for k in NET_TARGETS:
+        t = tg[k]
+        if t["probes"] < 20 or t["p50"] is None:
+            continue
+        if t["p99"] > max(3 * t["p50"], t["p50"] + 40):
+            v.append(f"Skoki pingu do: {NET_TARGET_PL[k]} (mediana {t['p50']} ms, p99 {t['p99']} ms, max {t['max']} ms)")
+        elif (t["jitter"] or 0) > max(5, 0.5 * t["p50"]):
+            v.append(f"Niestabilny ping do: {NET_TARGET_PL[k]} (jitter {t['jitter']} ms przy medianie {t['p50']} ms)")
+    gw = tg.get("gw") or {}
+    if (gw.get("p95") or 0) > 15 and rep["link_s"].get("wifi"):
+        v.append(f"Wysokie opóźnienie do routera przez Wi-Fi (p95 {gw['p95']} ms) - zakłócenia/zasięg, rozważ kabel")
+    dns = rep["dns"] or {}
+    if dns.get("failures"):
+        v.append(f"Błędy DNS: {dns['failures']} (serwer DNS operatora/routera)")
+    elif (dns.get("p95") or 0) > 150:
+        v.append(f"Wolny DNS (p95 {dns['p95']} ms) - rozważ 1.1.1.1 / 8.8.8.8")
+    w = rep["wifi"]
+    if w:
+        if w["signal_min"] is not None and w["signal_min"] < 40:
+            v.append(f"Słaby sygnał Wi-Fi (min {w['signal_min']}%, śr. {w['signal_avg']}%)")
+        if w["unexpected_disconnects"]:
+            v.append(f"{w['unexpected_disconnects']} nieoczekiwanych rozłączeń Wi-Fi")
+        if len(w["bssids"]) > 1:
+            v.append(f"Zmiana punktu dostępowego Wi-Fi ({len(w['bssids'])} BSSID) - roaming może dawać przerwy")
+    if rep["nic_errors"].get("total"):
+        v.append(f"Błędy karty sieciowej: {rep['nic_errors']['total']} (kabel/sterownik)")
+    spikes = [i for i in rep["incidents"] if i["kind"] in ("latency_spike", "packet_loss", "game_lag")]
+    if spikes and "net_rx_kbs" in _table_cols(con, "samples"):
+        heavy = 0
+        for i in spikes:
+            if i["kind"] != "latency_spike":
+                continue
+            a = _one(con, "SELECT AVG(net_rx_kbs) AS a FROM samples WHERE ts BETWEEN ? AND ?",
+                     (i["ts"], i["end_ts"] or i["ts"] + 30))
+            if a and (a["a"] or 0) >= NET_DOWNLOAD_KBS:
+                heavy += 1
+        if heavy:
+            v.append(f"Skoki pingu w trakcie pobierania ({heavy}) - łącze zapchane; ogranicz pobieranie lub włącz QoS/SQM")
+    if not v:
+        inet = tg.get("inet") or {}
+        v.append("Ping stabilny" + (f" (internet: mediana {inet['p50']} ms, p99 {inet['p99']} ms)" if inet.get("p50") is not None else ""))
+    return v
+
+
+def net_series(con, t0, t1, max_points=1500):
+    """Chart series like series(): ts + gw/isp/inet/game ms (max per bucket), inet_loss in % (max), wifi_signal (min)."""
+    t0, t1 = float(t0), float(t1)
+    cols = ["gw_ms", "isp_ms", "inet_ms", "game_ms", "inet_loss", "wifi_signal"]
+    if not _has_net(con):
+        return {"ts": [], "step_s": 1.0, **{c: [] for c in cols}}
+    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
+    rows = con.execute("SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, MAX(gw_ms) AS gw_ms, MAX(isp_ms) AS isp_ms, "
+                       "MAX(inet_ms) AS inet_ms, MAX(game_ms) AS game_ms, MAX(inet_loss) AS inet_loss, "
+                       "MIN(wifi_signal) AS wifi_signal FROM net_samples WHERE ts BETWEEN ? AND ? GROUP BY b ORDER BY b",
+                       (t0, step, t0, t1)).fetchall()
+    out = {"ts": [r["ts"] for r in rows], "step_s": step}
+    for c in cols:
+        if c == "inet_loss":
+            out[c] = [_r(100 * r[c], 1) if r[c] is not None else None for r in rows]
+        else:
+            out[c] = [_r(r[c], 2) for r in rows]
+    return out
+
+
+def _net_bad_seconds(rows):
+    """Timestamps of seconds with packet loss or a latency spike on any target (spike = well above that target's median)."""
+    med = {k: _pct([r[f"{k}_ms"] for r in rows if r[f"{k}_ms"] is not None], 0.5) for k in NET_TARGETS}
+    bad = []
+    for r in rows:
+        for k in NET_TARGETS:
+            ms, loss, m = r[f"{k}_ms"], r[f"{k}_loss"], med[k]
+            if (loss or 0) > 0 or (ms is not None and m is not None and ms > max(2 * m, m + 30)):
+                bad.append(r["ts"])
+                break
+    return bad
+
+
+def net_correlation(con, rows, stutter_ts, t0, t1, window=2.0):
+    """How many stutters fall within +-window s of a lossy / spiking network second (network lag vs local stutter)."""
+    bad = _net_bad_seconds(rows)
+    near = sum(1 for t in stutter_ts if bad and bisect.bisect_right(bad, t + window) - bisect.bisect_left(bad, t - window) > 0)
+    covered = len({int(b + d) for b in bad for d in range(-int(window), int(window) + 1)})
+    return {"bad_seconds": len(bad), "stutters": len(stutter_ts), "stutters_near_net_problem": near,
+            "stutters_near_net_problem_pct": _r(100 * near / len(stutter_ts)) if stutter_ts else None,
+            "chance_pct": _r(100 * min(covered, max(1, t1 - t0)) / max(1.0, t1 - t0)),
+            "window_s": window}
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +1046,14 @@ def _unclean_shutdowns(con, t0):
             last = {k: (_r(v) if isinstance(v, float) else v) for k, v in last.items()}
             last["time"] = fmt_ts(last["ts"])
             info["last_sample_before"] = last
+            from .ocanalyze import reset_context   # local: ocanalyze imports this module
+            ctx = reset_context(con, r["ts"])
+            if ctx:
+                info["low_load"] = ctx["low_load"]
+                if ctx["low_load"]:
+                    info.setdefault("interpretation", []).append(
+                        f"Reset przy niskim obciążeniu (CPU śr. {ctx['cpu_avg']}% przed resetem) - typowy objaw za "
+                        "agresywnego Curve Optimizera na biegu jałowym (jeśli był włączony UV/OC)")
         out.append(info)
     # Kernel-Power 41 and EventLog 6008 usually both exist for the same crash; merge entries within 10 min
     merged = []
@@ -846,15 +1158,35 @@ def diagnose(rep, con=None, t0=None):
                     "Usługa Gigabyte/AORUS - rozważ odinstalowanie (GCC/Control Center, AORUS LCD)." if re.search(r"aorus|gigabyte|gcc|lcd", c["app"], re.I)
                     else f"Moduł {c['module']}, kod {c['code']}: {c['verdict']}." if c.get("verdict")
                     else "Zaktualizuj/przeinstaluj aplikację; sprawdź WER (zdarzenie 1001) po moduł powodujący błąd."))
+    net_titles = {"net_down": "brak internetu", "net_link_down": "brak łącza (Wi-Fi/kabel rozłączony)",
+                  "packet_loss": "utrata pakietów", "latency_spike": "skok pingu", "game_lag": "lag do serwera gry",
+                  "wifi_weak": "słaby sygnał Wi-Fi"}
+    nets = {k: bk[k] for k in net_titles if bk.get(k)}
+    if nets:
+        where = Counter()
+        if con is not None and t0 is not None:
+            for i in incidents_between(con, t0, time.time(), kinds=list(nets)):
+                w = i["details"].get("where") if isinstance(i["details"], dict) else None
+                if w:
+                    where[w] += 1
+        loc = {"home": "dom (Wi-Fi/router)", "isp": "operator", "internet": "internet", "game": "serwer gry"}
+        add("serious" if nets.get("net_down") or nets.get("net_link_down") else "warning",
+            "Problemy sieciowe: " + ", ".join(f"{net_titles[k]} {v}x" for k, v in nets.items()),
+            ("Miejsce problemu: " + ", ".join(f"{loc.get(w, w)} {n}x" for w, n in where.most_common()) + ". " if where else "") +
+            "Szczegóły: `pm net --since " + str(rep["days"]) + "d`.")
     for k, name, desc in (
             ("whea", "błąd sprzętowy WHEA", "Błędy sprzętowe WHEA - niestabilny CPU/RAM/PCIe; wyłącz EXPO/PBO na test, zaktualizuj BIOS."),
+            ("whea_fatal", "krytyczny błąd CPU (WHEA 18)", "Niestabilny CPU/SoC - cofnij ostatnią zmianę UV/OC (`pm oc stability`)."),
+            ("whea_corrected", "skorygowany błąd CPU (WHEA 19)", "Rdzeń na granicy stabilności - zwykle za mocny Curve Optimizer na tym rdzeniu (`pm oc stability`)."),
+            ("whea_pcie", "błąd PCIe (WHEA 17)", "Błędy łącza PCIe - sprawdź osadzenie karty, tryb PCIe w BIOS, riser."),
             ("gpu_driver", "problem sterownika GPU", "Resety/timeouty sterownika GPU - czysta instalacja Adrenalin (DDU), wyłącz iGPU, sprawdź zasilanie karty."),
             ("bsod", "blue screen", "Blue screeny - sprawdź kod w zdarzeniach BugCheck."),
             ("disk", "błąd dysku", "Błędy dysku - sprawdź SMART (CrystalDiskInfo) i kable/slot."),
             ("low_memory", "brak pamięci wirtualnej", "Kończyła się pamięć wirtualna - zwiększ plik wymiany/zamknij aplikacje."),
             ("throttle", "throttling CPU", "Throttling CPU - sprawdź chłodzenie i zasilanie VRM.")):
         if bk.get(k):
-            add("critical" if k in ("whea", "bsod") else "serious" if k in ("gpu_driver", "disk", "low_memory") else "warning",
+            add("critical" if k in ("whea", "whea_fatal", "bsod") else
+                "serious" if k in ("gpu_driver", "disk", "low_memory", "whea_corrected", "whea_pcie") else "warning",
                 f"{bk[k]}x {name}", desc)
     cfg = rep["config_changes"]
     if cfg and un:
@@ -880,7 +1212,7 @@ def diagnose(rep, con=None, t0=None):
 def _session_metrics(con, exe=None, since=None):
     """One dict per finished-or-running session with fps/stutter/bound metrics (oldest first)."""
     t0 = parse_time(since) if since is not None else 0
-    sql, args = "SELECT * FROM sessions WHERE start_ts>=?", [t0]
+    sql, args = f"SELECT * FROM sessions WHERE start_ts>=? AND {GAMES_ONLY}", [t0]
     if exe:
         sql += " AND lower(exe)=lower(?)"
         args.append(exe)
@@ -908,13 +1240,22 @@ def _session_metrics(con, exe=None, since=None):
         if low1 is None and x and x["p99"]:
             low1 = 1000 / x["p99"]
         ctx = _ctx(r)
+        gp = (_json(r["summary"]) or {}).get("gameplay")
+        stutters = st.get(r["id"], 0)
+        if gp and gp.get("seconds"):   # menus and loading screens do not count
+            fps, low1, stutters, minutes = gp["fps_avg"], gp["fps_1low"], gp["stutters"], gp["seconds"] / 60
+        bn = (_json(r["summary"]) or {}).get("bottleneck") or {}
         out.append({
             "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": f["end_ts"], "minutes": _r(minutes),
             "fps_avg": _r(fps), "fps_1low": _r(low1), "fps_01low": f.get("fps_01low"),
-            "stutters": st.get(r["id"], 0), "stutters_per_min": _r(st.get(r["id"], 0) / minutes, 2) if minutes > 0.5 else None,
+            "stutters": stutters, "stutters_per_min": _r(stutters / minutes, 2) if minutes > 0.5 else None,
+            "usable": gp.get("usable", True) if gp else True,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            "_g": (x["g"] or 0) if x else 0, "_c": (x["c"] or 0) if x else 0, "_l": (x["l"] or 0) if x else 0,
+            # PresentMon writes no GPUBusy on this PC: `bound` stays empty, the shares come from summary.bottleneck
+            "_g": (x["g"] or 0 if x else 0) or (bn.get("gpu_bound_pct") or 0) * minutes,
+            "_c": (x["c"] or 0 if x else 0) or (bn.get("cpu_bound_pct") or 0) * minutes,
+            "_l": (x["l"] or 0 if x else 0) or (bn.get("limit_pct") or 0) * minutes,
             "_n": x["n"] if x else 0,
             "_secs": x["secs"] if x else 0, **ext.get(r["id"], {}),
         })
@@ -956,7 +1297,7 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
         b = resolve_point(con, before, exe)
         split = (b, resolve_point(con, after, exe) if after is not None else b)
     groups = {}
-    metrics = _session_metrics(con, exe, None if split else since)
+    metrics = [s for s in _session_metrics(con, exe, None if split else since) if s["usable"]]
     diagreport.fill_bottleneck(con, metrics)
     for s in metrics:
         if split:

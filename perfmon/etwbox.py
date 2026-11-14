@@ -34,6 +34,7 @@ ANALYZE_DELAY_S = 30       # let the disk settle after writing the .etl
 RETRY_S = 600              # after a failed wpr -start (no admin, another kernel logger, ...)
 BURST_WINDOW_S = 10
 DPC_TRIGGER_S = 2
+MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
 
 
 def settings(cfg):
@@ -283,16 +284,6 @@ def _proc_name(data):
     return None
 
 
-class _Agg:
-    __slots__ = ("n", "raw_sum", "raw_max")
-
-    def __init__(self):
-        self.n, self.raw_sum, self.raw_max = 0, 0, None
-
-    def add(self, raw):
-        self.n += 1
-        self.raw_sum += raw
-        self.raw_max = raw if self.raw_max is None or raw > self.raw_max else self.raw_max
 
 
 def parse_csv(path, last_s=60):
@@ -301,11 +292,10 @@ def parse_csv(path, last_s=60):
     end = _tail_clock(path)
     perf_freq, clock_type, start_ft, lost = 10_000_000, 1, None, 0
     images = []                                   # (base, end, name) kernel images
-    dpc, isr = defaultdict(_Agg), defaultdict(_Agg)
+    dpc, isr = defaultdict(list), defaultdict(list)   # routine -> raw (event time - InitialTime) values
     thread_pid, pid_name = {}, {}
     disk = defaultdict(lambda: {"bytes": 0, "ios": 0, "max_ms": 0.0, "read": 0, "write": 0})
     events = 0
-    min_diff = None
     filetime_clock = None
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
         for row in csv.reader(f, skipinitialspace=True):
@@ -348,9 +338,7 @@ def parse_csv(path, last_s=60):
                     continue
                 if filetime_clock and clock_type == 1:
                     init = init * 10_000_000 // perf_freq
-                diff = clock - init
-                min_diff = diff if min_diff is None or diff < min_diff else min_diff
-                (dpc if op in DPC_OPS else isr)[routine].add(diff)
+                (dpc if op in DPC_OPS else isr)[routine].append(clock - init)
                 events += 1
             elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
                 size, resp, tid = _int(data[2]) or 0, _int(data[7]) or 0, _int(data[8])
@@ -369,14 +357,21 @@ def parse_csv(path, last_s=60):
         return images[k][2] if k >= 0 and addr < images[k][1] else "?"
 
     to_us = (lambda v: v / 10) if filetime_clock else (lambda v: v * 1e6 / perf_freq)
+    # The offset of the two clocks = the shortest DPC; a low percentile, because start and end paired across a clock
+    # jump give absurd values both ways (seen: "56497207 ms"), and those are dropped against the final offset
+    diffs = sorted(v for aggs in (dpc, isr) for vals in aggs.values() for v in vals)
+    offset = diffs[len(diffs) // 1000] if diffs else None
+    limit = _units(MAX_DPC_US / 1e6, filetime_clock, perf_freq)
 
     def top(aggs):
         by = defaultdict(lambda: [0, 0, 0])       # driver -> [count, sum raw, max raw] (offset removed)
-        for routine, a in aggs.items():
-            b = by[driver(routine)]
-            b[0] += a.n
-            b[1] += a.raw_sum - a.n * min_diff
-            b[2] = max(b[2], a.raw_max - min_diff)
+        for routine, vals in aggs.items():
+            real = [max(0, v - offset) for v in vals if abs(v - offset) <= limit]
+            if real:
+                b = by[driver(routine)]
+                b[0] += len(real)
+                b[1] += sum(real)
+                b[2] = max(b[2], max(real))
         rows = [{"driver": k, "count": v[0], "sum_us": round(to_us(v[1])), "max_us": round(to_us(v[2]))}
                 for k, v in by.items()]
         return sorted(rows, key=lambda r: -r["sum_us"])[:TOP]
@@ -390,7 +385,7 @@ def parse_csv(path, last_s=60):
              for pid, d in disk.items()]
     return {
         "window_s": window, "events": events, "events_lost": lost, "images": len(images),
-        "dpc_top": top(dpc) if min_diff is not None else [], "isr_top": top(isr) if min_diff is not None else [],
+        "dpc_top": top(dpc), "isr_top": top(isr),
         "disk_top": sorted(procs, key=lambda r: -r["mb"])[:TOP],
         "disk_slowest": sorted(procs, key=lambda r: -r["max_ms"])[:5],
     }
@@ -415,6 +410,15 @@ def headline(summary):
         parts.append(f"dysk: {disk['process']} {disk['max_ms']:.0f} ms")
         sev = "warning" if sev == "info" else sev
     return sev, "ETW: " + (", ".join(parts) if parts else "brak długich DPC/ISR")
+
+
+def fix_old_headlines(con):
+    """Incidents stored before impossible DPC/ISR durations were dropped."""
+    for iid, title in con.execute("SELECT id, title FROM incidents WHERE kind='etw_capture'").fetchall():
+        m = re.search(r"(DPC|ISR): \S+ ([\d.]+) ms max", title)
+        if m and float(m[2]) * 1000 >= MAX_DPC_US:
+            con.execute("UPDATE incidents SET severity='info', title=? WHERE id=?",
+                        (f"ETW: pominięty błędny pomiar {m[1]}", iid))
 
 
 def analyze(con, cid, keep_csv=False):

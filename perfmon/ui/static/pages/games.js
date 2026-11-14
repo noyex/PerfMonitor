@@ -156,10 +156,11 @@ Pages.games = (() => {
     if (!known) {
       wrap.append(h("div", { class: "empty" }, "Brak danych sesji"));
     } else {
-      const [sr, diag, gp] = await Promise.all([
+      const [sr, diag, gp, net] = await Promise.all([
         api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 }),
         diagMarkers(t0, t1),
         api("game_proc", { session: id, points: 1200 }),
+        api("net_series", { from: t0, to: t1, points: 1200 }),
       ]);
       const worst = (st.worst || []).map((w) => ({ ts: w.ts, severity: "serious" }));
       const markers = () => [...worst, ...diag.lines];
@@ -172,6 +173,8 @@ Pages.games = (() => {
         wrap.append(h("div", { class: "empty" }, "Brak danych o klatkach (PresentMon)"));
       }
       if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(sr, def.keys)));
+      const ping = pingChart(wrap, net, { height: 130, markers: diagLines, onSelect: zoom, xRange });
+      if (ping) charts.push(ping);
       if (diag.legend && charts.length) charts[0].el.append(diag.legend);
 
       // Game VRAM: toggled on demand, only when the session has per-process data

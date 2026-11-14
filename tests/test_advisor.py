@@ -1,0 +1,140 @@
+import copy
+import unittest
+
+from perfmon import advisor
+from tests.test_bottleneck import new_db
+
+
+def report(sid, causes=(), bg=(), minutes=10, gpu_pct=90, modes=None, shared=500):
+    return {
+        "summary": {"gameplay": {"seconds": minutes * 60, "usable": True},
+                    "bottleneck": {"kind": "gpu", "gpu_bound_pct": gpu_pct},
+                    "present": {"modes": modes or {"Hardware: Independent Flip": 100.0}, "click_lat_avg": 12.0},
+                    "vram_shared_max_mb": shared},
+        "stutters": {"cause_ranking": [{"tag": t, "n": 9, "stutter_pct": 30.0, "base_pct": 5.0, "lift": 6.0,
+                                        "verdict": v} for t, v in causes]},
+        "gpu_background": [{"name": n, "avg_pct": p, "max_pct": p, "seen_pct": 100, "vram_avg_mb": 100} for n, p in bg],
+        "hardware": {"commit_peak_gb": 40.0, "commit_limit_gb": 41.0, "disk_lat_max_ms": 200},
+    }
+
+
+def data(**kw):
+    d = {"now": 1.8e9, "info": {"fast_startup": 0, "game_dvr": 0, "memory_integrity": 0, "hags": 2, "rebar": True,
+                                "gpus": [], "displays": [], "background_tools": []},
+         "has_info": True, "game": "cod.exe", "reports": [report(i, minutes=10, gpu_pct=40) for i in range(3)],
+         "health": {"days": 14, "unclean_shutdowns": [], "recurring_crashes": []}, "bg_cpu": None, "bg_cpu_top": []}
+    d.update(kw)
+    return d
+
+
+def keys(r):
+    return [i["key"] for i in r["items"]]
+
+
+class AdvisorTest(unittest.TestCase):
+    def test_empty_db(self):
+        r = advisor.advise(new_db())
+        self.assertEqual(r["items"], [])
+        self.assertIsNone(r["bottleneck"]["kind"])
+
+    def test_fast_startup_fires_and_disappears(self):
+        h = {"days": 14, "unclean_shutdowns": [{"during_shutdown": True}, {"during_shutdown": False}], "recurring_crashes": []}
+        d = data(health=h)
+        d["info"]["fast_startup"] = 1
+        self.assertIn("fast_startup", keys(advisor.build(d)))
+        d["info"]["fast_startup"] = 0
+        self.assertNotIn("fast_startup", keys(advisor.build(d)))
+        d["info"]["fast_startup"] = 1
+        d["health"] = dict(h, unclean_shutdowns=[{"during_shutdown": False}])
+        self.assertNotIn("fast_startup", keys(advisor.build(d)))
+
+    def test_gigabyte_by_process_or_crash(self):
+        d = data()
+        d["info"]["background_tools"] = ["Discord"]
+        self.assertNotIn("gigabyte_bloat", keys(advisor.build(d)))
+        d["info"]["background_tools"] = ["GCC"]
+        self.assertIn("gigabyte_bloat", keys(advisor.build(d)))
+        d["info"]["background_tools"] = []
+        d["health"]["recurring_crashes"] = [{"app": "AorusLcdService.exe", "n": 2}]
+        self.assertIn("gigabyte_bloat", keys(advisor.build(d)))
+
+    def test_igpu_monitor_vs_refuted(self):
+        d = data()
+        d["info"]["gpus"] = [{"name": "iGPU", "igpu": True}, {"name": "dGPU", "igpu": False}]
+        d["info"]["displays"] = [{"adapter": "dGPU", "monitor": "A", "mode": "2560x1440@280 Hz"}]
+        r = advisor.build(d)
+        self.assertNotIn("igpu_monitor", keys(r))
+        self.assertIn("igpu_monitor", [n["key"] for n in r["not_worth"]])
+        d["info"]["displays"].append({"adapter": "iGPU", "monitor": "B", "mode": "2560x1440@144 Hz"})
+        r = advisor.build(d)
+        self.assertIn("igpu_monitor", keys(r))
+        self.assertNotIn("igpu_monitor", [n["key"] for n in r["not_worth"]])
+
+    def test_background_gpu_amd_is_honest_about_ambient(self):
+        d = data(reports=[report(i, causes=[("background_gpu:AMDRSServ.exe", "ambient")], bg=[("AMDRSServ.exe", 60)])
+                          for i in range(3)])
+        it = next(i for i in advisor.build(d)["items"] if i["key"] == "background_gpu:AMDRSServ.exe")
+        self.assertIn("Instant Replay", it["title"])
+        self.assertIn("przed/po", it["why"])
+        d["reports"] = [report(i, bg=[("AMDRSServ.exe", 3)]) for i in range(3)]
+        self.assertFalse([k for k in keys(advisor.build(d)) if k.startswith("background_gpu")])
+
+    def test_composed_threshold(self):
+        d = data(reports=[report(i, modes={"Composed: Flip": 90.0, "Hardware: Independent Flip": 10.0}) for i in range(3)])
+        self.assertIn("composed", keys(advisor.build(d)))
+        d["reports"] = [report(i, modes={"Composed: Flip": 20.0, "Hardware: Independent Flip": 80.0}) for i in range(3)]
+        self.assertNotIn("composed", keys(advisor.build(d)))
+
+    def test_cause_needs_two_sessions(self):
+        reps = [report(0, causes=[("vram_shared", "confirmed")]), report(1), report(2)]
+        self.assertNotIn("vram_shared", keys(advisor.build(data(reports=reps))))
+        reps[1] = report(1, causes=[("vram_shared", "confirmed")])
+        self.assertIn("vram_shared", keys(advisor.build(data(reports=reps))))
+        reps[1] = report(1, causes=[("vram_shared", "ambient")])   # not confirmed = not counted
+        self.assertNotIn("vram_shared", keys(advisor.build(data(reports=reps))))
+
+    def test_upscaler_and_not_worth(self):
+        reps = [report(i, gpu_pct=95) for i in range(3)]
+        r = advisor.build(data(reports=reps, bg_cpu=2.0, bg_cpu_top=[("steam.exe", 1.0)]))
+        self.assertIn("upscaler", keys(r))
+        self.assertEqual({n["key"] for n in r["not_worth"]}, {"cpu_ram", "autostart"})
+        self.assertIn("2.0%", next(n for n in r["not_worth"] if n["key"] == "autostart")["why"])
+        r = advisor.build(data(reports=[report(i, gpu_pct=30) for i in range(3)], bg_cpu=12.0))
+        self.assertNotIn("upscaler", keys(r))
+        self.assertEqual(r["not_worth"], [])
+
+    def test_order_stability_first_memory_integrity_last(self):
+        d = data(reports=[report(i, gpu_pct=95, causes=[("vram_shared", "confirmed")]) for i in range(3)],
+                 health={"days": 14, "unclean_shutdowns": [{"during_shutdown": True}], "recurring_crashes": []})
+        d["info"].update(fast_startup=1, memory_integrity=1, game_dvr=1)
+        r = advisor.build(d)
+        ks = keys(r)
+        self.assertEqual(ks[0], "fast_startup")
+        self.assertEqual(ks[-1], "memory_integrity")
+        self.assertLess(ks.index("vram_shared"), ks.index("game_dvr"))
+        self.assertEqual([i["priority"] for i in r["items"]], list(range(1, len(ks) + 1)))
+        for i in r["items"]:
+            self.assertTrue({"key", "title", "why", "expected", "risk", "undo", "how", "kind", "priority"} <= set(i))
+            self.assertNotRegex(i["expected"], r"\d+\s*%")
+            self.assertIn(i["kind"], {"stability", "smoothness", "latency", "fps"})
+
+    def test_unknown_not_items(self):
+        d = data()
+        d["info"].update(hags=None, rebar=None)
+        r = advisor.build(d)
+        self.assertEqual({u["key"] for u in r["unknown"]}, {"hags", "rebar"})
+        self.assertNotIn("rebar", keys(r))
+        d["info"].update(hags=1, rebar=False)
+        r = advisor.build(d)
+        self.assertEqual(r["unknown"], [])
+        self.assertIn("rebar", keys(r))
+
+    def test_does_not_mutate_input(self):
+        d = data()
+        before = copy.deepcopy(d)
+        advisor.build(d)
+        self.assertEqual(d, before)
+
+
+if __name__ == "__main__":
+    unittest.main()

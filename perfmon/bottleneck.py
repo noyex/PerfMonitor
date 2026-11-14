@@ -4,6 +4,7 @@ Inputs: per-second frames (bound from PresentMon, or GPU load when PresentMon ha
 power, clock) and game_proc (busiest game thread, shared VRAM). Human-readable strings are Polish."""
 from . import analyze as an
 from . import diagreport as dr
+from . import gameplay
 
 VRAM_SHARED_SHARE = 10      # % of game samples with shared VRAM above the spill limit
 POWER_LIMITED_SHARE = 50    # % of GPU-busy seconds at the power limit with clocks pulled down
@@ -12,7 +13,7 @@ THREAD_P95 = 90
 LIMIT_SHARE = 40
 LIMIT_LOW_FPS = 20
 GPU_SHARE = 60
-GPU_LOAD_BOUND = 95         # GPU load counted as GPU-bound when PresentMon gives no GPUBusy
+GPU_LOAD_BOUND = 90         # GPU load counted as GPU-bound when PresentMon gives no GPUBusy (95 flipped CoD to CPU at 92%)
 
 ADVICE = {
     "vram": "obniż jakość tekstur / rozdzielczość tekstur - VRAM przelewa się do RAM",
@@ -36,8 +37,11 @@ def compute(con, sid, start, end, vram_total_mb=None):
                       (sid,))
     if not frames:
         return None
-    samples = an._rows(con, "SELECT ts, gpu_load, gpu_power_w, gpu_clock_mhz, gpu_vram_total_mb FROM samples "
-                            "WHERE ts BETWEEN ? AND ?", (start, end + 1))
+    samples = an._rows(con, "SELECT ts, gpu_load, gpu_power_w, gpu_clock_mhz, gpu_vram_total_mb, user_idle_s, cpu_total, "
+                            "fg_exe FROM samples WHERE ts BETWEEN ? AND ?", (start, end + 1))
+    played = gameplay.select(frames, samples, start)
+    if len(played) >= gameplay.MIN_GAMEPLAY_S:   # menus and loading screens say nothing about the game's limit
+        frames = played
     load_at = {int(s["ts"]): s["gpu_load"] for s in samples if s["gpu_load"] is not None}
 
     # bound per second; production PresentMon on this AMD card writes no GPUBusy, so fall back to GPU load
@@ -111,6 +115,19 @@ def classify(m):
     if g >= GPU_SHARE:
         return "gpu", f"GPU-bound {g}% czasu"
     return "mixed", f"GPU {g}% / CPU {c}% / limit {lim}%"
+
+
+def refresh_all(con, merge_summary):
+    """Recompute stored bottlenecks and gameplay stats of finished sessions with the current rules."""
+    rows = con.execute(f"SELECT id, start_ts, end_ts FROM sessions WHERE end_ts IS NOT NULL AND {an.GAMES_ONLY}").fetchall()
+    for sid, start, end in rows:
+        gp = gameplay.stats(con, sid, start, end)
+        extra = {"gameplay": gp} if gp else {}
+        b = compute(con, sid, start, end)
+        if b:
+            extra["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
+        merge_summary(sid, extra)
+    return len(rows)
 
 
 def describe(b):

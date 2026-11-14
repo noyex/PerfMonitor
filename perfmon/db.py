@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS samples (            -- every 1 s, whole system
     user_idle_s REAL,                            -- seconds since last keyboard/mouse input
     game_session INTEGER,                        -- game session id if running
     pagefile_pct REAL,                           -- Paging File(_Total) % Usage
+    cpu_vcore REAL, gpu_voltage REAL,            -- V: board Vcore (Super I/O), GPU core voltage
+    vrm_temp REAL, cpu_eff_max REAL,             -- CPU VRM MOS temperature; highest per-core effective clock (MHz)
     extra TEXT                                   -- JSON: disks separately, disk temperatures etc.
 );
 CREATE TABLE IF NOT EXISTS sessions (           -- game session (from start to exe close)
@@ -31,7 +33,9 @@ CREATE TABLE IF NOT EXISTS sessions (           -- game session (from start to e
     exe TEXT, path TEXT, pid INTEGER,
     start_ts REAL, end_ts REAL, end_reason TEXT, -- exit | crash | collector_stop | unknown
     summary TEXT,                                -- JSON: fps, 1%/0.1% low, stutters, bottleneck...
-    context TEXT                                 -- JSON at start: gpu_driver, adrenalin, os_build, bios, game_version, steam build
+    context TEXT,                                -- JSON at start: gpu_driver, adrenalin, os_build, bios, game_version, steam build
+    kind TEXT,                                   -- NULL/game | stress (known stress-test exe) | manual (pm stress start) | idle_soak
+    profile_id INTEGER                           -- oc_profiles.id active when the session started
 );
 CREATE TABLE IF NOT EXISTS frames (             -- frame aggregate every 1 s from PresentMon
     ts REAL, session INTEGER,
@@ -85,13 +89,62 @@ CREATE TABLE IF NOT EXISTS etw_captures (       -- ETW black box dumps (perfmon/
     status TEXT,                                 -- captured | analyzed | failed
     summary TEXT                                 -- JSON: top DPC/ISR drivers, disk I/O per process, timings
 );
+CREATE TABLE IF NOT EXISTS net_samples (        -- network quality every 1 s (perfmon/netmon.py)
+    ts REAL PRIMARY KEY,
+    session INTEGER,                             -- game session id if running
+    gw_ms REAL, gw_loss REAL,                    -- ping to the router (default gateway); loss = 0..1 this second
+    isp_ms REAL, isp_loss REAL,                  -- ping to the first operator router behind it
+    inet_ms REAL, inet_loss REAL,                -- ping to internet targets (1.1.1.1, 8.8.8.8 averaged)
+    game_ms REAL, game_loss REAL,                -- ping to the game server (when detected and it answers ICMP)
+    dns_ms REAL,                                 -- uncached DNS lookup time, every 30 s (NULL = not probed / failed)
+    link TEXT,                                   -- wifi | ethernet | NULL = no route (disconnected)
+    wifi_signal INTEGER, wifi_rssi INTEGER,      -- Wi-Fi signal quality % / dBm
+    extra TEXT                                   -- JSON, only what changed: gateway, isp_hop, adapter, wifi_*,
+                                                 -- game_ip, nic_errors, dns_failed
+);                                               -- *_ms NULL = lost or not probed; *_loss NULL = not probed
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS hw_detail (          -- UV/OC telemetry: every 1 s during game/stress sessions, every 10 s otherwise
+    ts REAL PRIMARY KEY, session INTEGER,
+    cpu_eff TEXT, cpu_clk TEXT,                  -- JSON [8]: per-core effective clock / reference clock (MHz)
+    cpu_core_w TEXT, thread_load TEXT,           -- JSON: per-core power (SMU, W) [8] / per-thread load % [16]
+    cpu_vcore REAL, cpu_vsoc REAL, cpu_vmisc REAL,   -- V from the board's Super I/O (not per core)
+    cpu_pkg_w REAL, tctl REAL, tccd REAL,        -- Package power (~PPT), Tctl/Tdie, CCD1 Tdie
+    vrm_temp REAL, vsoc_temp REAL, dimm_temp REAL, cpu_fan REAL,
+    gpu_clk REAL, gpu_mem_clk REAL, gpu_v REAL, gpu_w REAL, gpu_load REAL,
+    gpu_temp REAL, gpu_hot REAL, gpu_mem_temp REAL, gpu_fan REAL
+);
+CREATE TABLE IF NOT EXISTS oc_profiles (        -- UV/OC settings profiles (entered by the user, never applied by PerfMonitor)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, created_ts REAL,
+    status TEXT,                                 -- testing | stable | rejected
+    cpu TEXT,                                    -- JSON: co_per_core[8], pbo{ppt,tdc,edc,scalar,boost_override}, expo, soc_v
+    gpu TEXT,                                    -- JSON: voltage_offset_mv, power_limit_pct, max_clock_offset, vram_mhz, vram_fast_timing, fan_curve
+    notes TEXT
+);
+CREATE TABLE IF NOT EXISTS oc_profile_log (     -- profile activations: profile active from ts until the next row
+    ts REAL, profile_id INTEGER, source TEXT     -- manual | detected
+);
+CREATE TABLE IF NOT EXISTS oc_session_stats (   -- per-session UV/OC aggregates (kept forever, hw_detail is pruned)
+    session INTEGER PRIMARY KEY, profile_id INTEGER, kind TEXT, exe TEXT,
+    start_ts REAL, end_ts REAL, stats TEXT       -- JSON: avg/p95 clocks, voltages, power, temps, FPS/W, stretching per core
+);
+CREATE TABLE IF NOT EXISTS gpu_od_snapshots (   -- AMD ADL Overdrive8 current settings, stored when they change
+    ts REAL, settings TEXT                       -- JSON {"named": {...}, "raw": [...]}
+);
+CREATE TABLE IF NOT EXISTS experiments (        -- pm test: one setting changed, before/after verdict
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key TEXT, exe TEXT, start_ts REAL, end_ts REAL,
+    status TEXT,                                 -- open | done | cancelled
+    result TEXT,                                 -- JSON verdict stored at stop
+    notes TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_incidents_ts ON incidents(ts);
 CREATE INDEX IF NOT EXISTS ix_proc_events_ts ON proc_events(ts);
+CREATE INDEX IF NOT EXISTS ix_hw_detail_session ON hw_detail(session);
+CREATE INDEX IF NOT EXISTS ix_net_session ON net_samples(session);
 """
 
 
@@ -112,10 +165,11 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
 def migrate(con):
     con.executescript(SCHEMA)
     # migrate DBs created before these columns existed
-    add_columns(con, "sessions", {"context": "TEXT"})
+    add_columns(con, "sessions", {"context": "TEXT", "kind": "TEXT", "profile_id": "INTEGER"})
     add_columns(con, "procs", {"gpu_pct": "REAL", "vram_mb": "REAL"})
     add_columns(con, "events", {"data": "TEXT"})
-    add_columns(con, "samples", {"pagefile_pct": "REAL"})
+    add_columns(con, "samples", {"pagefile_pct": "REAL", "cpu_vcore": "REAL", "gpu_voltage": "REAL", "vrm_temp": "REAL",
+                                  "cpu_eff_max": "REAL"})
     add_columns(con, "frames", {"runtime": "TEXT", "sync_interval": "INTEGER", "tearing": "INTEGER", "dropped": "INTEGER",
                                 "click_lat": "REAL", "input_lat": "REAL", "frame_gen_pct": "REAL"})
 

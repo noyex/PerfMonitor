@@ -15,6 +15,9 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
 
 from perfmon import analyze as an  # noqa: E402
 from perfmon import bottleneck, config, db, present  # noqa: E402
+from perfmon import experiments as exps  # noqa: E402
+from perfmon import ocanalyze as oc  # noqa: E402
+from perfmon import ocassist  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -81,11 +84,23 @@ def cmd_status(con, a):
     if a.json:
         return dump(s)
     smp = s["sample"] or {}
+    extra = {}
+    try:
+        pid = oc.active_profile_id(con)
+        if pid is not None:
+            extra["profil OC"] = (oc.profile(con, pid) or {}).get("name")
+    except sqlite3.Error:
+        pass
+    try:
+        files = [Path(str(config.DB_PATH) + sfx) for sfx in ("", "-wal", "-shm")]
+        extra["rozmiar bazy [MB]"] = round(sum(f.stat().st_size for f in files if f.exists()) / 1048576, 1)
+    except OSError:
+        pass
     out(f"## Status kolektora: {'DZIALA' if s['collector_alive'] else 'NIE DZIALA'}")
     kv({"ostatnia próbka": an.fmt_ts(smp.get("ts")), "wiek próbki [s]": s["sample_age_s"],
         "admin": s["admin"], "kolektor start": an.fmt_ts(s["collector_started"]),
         "kolektor stop": an.fmt_ts(s["collector_stopped"]), "liczniki": s["counts"] and {
-            **s["counts"], "first_sample": an.fmt_ts(s["counts"]["first_sample"])}})
+            **s["counts"], "first_sample": an.fmt_ts(s["counts"]["first_sample"])}, **extra})
     if smp:
         keys = ["cpu_total", "cpu_temp", "cpu_clock_mhz", "gpu_load", "gpu_temp", "gpu_hotspot", "gpu_vram_mb",
                 "ram_pct", "disk_lat_ms", "ui_ms", "dwm_ms", "fg_exe"]
@@ -95,6 +110,32 @@ def cmd_status(con, a):
         out(f"### Trwa sesja gry: #{o['id']} {o['exe']} ({o['running_s'] // 60} min)")
     if not s["admin"]:
         out("_Uwaga: kolektor bez uprawnień admina - część czujników/PresentMon może być niedostępna._")
+
+
+def cmd_advise(con, a):
+    from perfmon import advisor
+    r = advisor.advise(con)
+    if a.json:
+        return dump(r)
+    b = r["bottleneck"]
+    out(f"## Co zmienić - {r['game'] or 'brak danych o grze'} ({r['generated']})")
+    if b["kind"]:
+        out(f"Wąskie gardło: {b['kind']} przez {b['share_pct']}% z {b['minutes']} min grania ({r['sessions']} ostatnich sesji).")
+    for i in r["items"]:
+        out(f"### {i['priority']}. {i['title']} [{i['kind']}]")
+        for k, label in (("why", "Dlaczego"), ("expected", "Oczekiwany efekt"), ("risk", "Ryzyko"), ("undo", "Cofnięcie"),
+                         ("how", "Jak")):
+            out(f"- {label}: {i[k]}")
+    if not r["items"]:
+        out("Brak rekomendacji - dane nie wskazują nic do zmiany.")
+    if r["not_worth"]:
+        out("### Nie warto")
+        for n in r["not_worth"]:
+            out(f"- {n['title']}: {n['why']}")
+    if r["unknown"]:
+        out("### Nieznane (sprawdź ręcznie)")
+        for u in r["unknown"]:
+            out(f"- {u['title']}: {u['check']}")
 
 
 def cmd_health(con, a):
@@ -163,6 +204,12 @@ def cmd_session(con, a):
     st = r["stutters"]
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
         "przyczyny": st["cause_counts"]}, "Stuttery")
+    if st.get("cause_ranking"):
+        out("Przyczyny względem zwykłej rozgrywki (potwierdzona = przy stutterach częściej niż normalnie):")
+        table([{"przyczyna": r["tag"], "przy stutterach %": r["stutter_pct"], "zwykle %": r["base_pct"],
+                "ocena": {"confirmed": "potwierdzona", "weak": "możliwa, mało danych", "ambient": "stała, bez związku",
+                          "noise": "szum"}[r["verdict"]]}
+               for r in st["cause_ranking"] if r["tag"] != "shader_or_unknown"][:8])
     if st["worst"]:
         table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])
                 + (f" (pm etw show {w['etw_capture']})" if w.get("etw_capture") else "")} for w in st["worst"]])
@@ -199,6 +246,8 @@ def cmd_session(con, a):
     if r.get("gpu_background"):
         out("### Procesy w tle na GPU")
         table(r["gpu_background"])
+    if r.get("net", {}).get("seconds"):
+        print_net(r["net"], "Sieć w trakcie sesji")
     if r["incidents"]:
         out("### Incydenty w trakcie sesji")
         table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
@@ -228,6 +277,55 @@ def cmd_mark(con, a):
     out(f"Zapisano znacznik na {time.strftime('%H:%M:%S', time.localtime(ts))}"
         + ("" if s["collector_alive"] else " (UWAGA: kolektor nie działa, znacznik zostanie dodany po jego starcie)"))
     out(f"Podgląd: pm at {time.strftime('%H:%M:%S', time.localtime(ts))} --window 30")
+
+
+def print_net(n, title="Sieć"):
+    """Compact network summary (shared by pm net / session / range)."""
+    out(f"### {title}")
+    if not n or not n.get("seconds"):
+        return out("_(brak danych sieciowych)_")
+    rows = []
+    for k, label in (("gw", "router"), ("isp", "operator"), ("inet", "internet"), ("game", "serwer gry")):
+        t = (n.get("targets") or {}).get(k) or {}
+        if t.get("probes"):
+            rows.append({"cel": label, "avg": t["avg"], "p50": t["p50"], "p95": t["p95"], "p99": t["p99"], "max": t["max"],
+                         "jitter": t["jitter"], "loss_%": t["loss_pct"], "próbki": t["probes"]})
+    table(rows)
+    d = n.get("dns") or {}
+    extra = {"DNS avg/p95 ms": f"{d['avg']}/{d['p95']}" if d.get("avg") is not None else None,
+             "błędy DNS": d.get("failures") or None, "brak łącza [s]": n.get("disconnected_s") or None,
+             "łącze [s]": n.get("link_s"), "błędy karty": n.get("nic_errors")}
+    kv(extra)
+    w = n.get("wifi")
+    if w:
+        kv({"sygnał min/śr %": f"{w['signal_min']}/{w['signal_avg']}", "RSSI dBm": f"{w['rssi_min']}..{w['rssi_max']}",
+            "SSID": w["ssids"], "BSSID": w["bssids"], "kanały": w["channels"],
+            "rozłączenia (nieoczekiwane)": f"{w['disconnects']} ({w['unexpected_disconnects']})" if w["disconnects"] else None},
+           "Wi-Fi")
+        if w["disconnect_events"]:
+            table([{"time": e["time"], "reason_code": e["reason_code"], "reason": e["reason"],
+                    "user": e["user_initiated"]} for e in w["disconnect_events"][:15]])
+    cor = n.get("correlation")
+    if cor and cor.get("stutters"):
+        out(f"- Stuttery blisko problemu sieci (+-{cor['window_s']:g} s): {cor['stutters_near_net_problem']}/{cor['stutters']} "
+            f"({cor['stutters_near_net_problem_pct']}%; losowo spodziewane ~{cor['chance_pct']}%)")
+    if n.get("incidents"):
+        out("#### Incydenty sieci")
+        table([{"time": i["time"], "kind": i["kind"], "where": (i["details"] or {}).get("where") if isinstance(i["details"], dict) else None,
+                "dur_s": round(i["end_ts"] - i["ts"]) if i["end_ts"] else None, "title": i["title"]} for i in n["incidents"]])
+    out("#### Werdykt")
+    for v in n.get("verdict") or []:
+        out(f"- {v}")
+
+
+def cmd_net(con, a):
+    t0 = an.parse_time(a.frm) if a.frm else an.parse_time(a.since)
+    t1 = an.parse_time(a.to)
+    n = an.net_summary(con, t0, t1)
+    if a.json:
+        return dump(n)
+    out(f"## Sieć {n['from']} -> {n['to']} ({n['seconds']} próbek)")
+    print_net(n, "Jakość połączenia")
 
 
 def cmd_incidents(con, a):
@@ -273,6 +371,8 @@ def cmd_range(con, a):
     table(r["top_procs"]["io"])
     out("### Sesje gier w zakresie")
     table(r["sessions"], ["id", "exe", "fps_avg", "fps_1low", "end_reason"])
+    if r.get("net", {}).get("seconds"):
+        print_net(r["net"])
 
 
 def cmd_at(con, a):
@@ -286,6 +386,15 @@ def cmd_at(con, a):
     table(r["samples"], ["time", "cpu_total", "cpu_core_max", "cpu_temp", "gpu_load", "gpu_temp", "gpu_hotspot",
                          "gpu_vram_mb", "ram_pct", "hard_faults_s", "disk_lat_ms", "dpc_pct", "ui_ms", "dwm_ms",
                          "fg_exe", "fg_hung"])
+    nt = r["net"]
+    if nt["samples"]:
+        out("### Sieć (ms; loss w %; link/Wi-Fi)")
+        table([{"time": x["time"], "gw": x["gw_ms"], "isp": x["isp_ms"], "inet": x["inet_ms"], "game": x["game_ms"],
+                "loss_inet": None if x["inet_loss"] is None else round(100 * x["inet_loss"]),
+                "loss_gw": None if x["gw_loss"] is None else round(100 * x["gw_loss"]),
+                "link": x["link"] or "BRAK", "wifi_%": x["wifi_signal"], "dns": x["dns_ms"]}
+               for x in nt["samples"] if abs(x["t_rel"]) <= 15 or x["inet_loss"] or x["gw_loss"] or x["link"] is None])
+        out("Werdykt: " + "; ".join(nt["summary"]["verdict"]))
     out("### Incydenty")
     table([{"time": i["time"], "kind": i["kind"], "title": i["title"]} for i in r["incidents"]])
     for i in r["incidents"]:
@@ -553,6 +662,243 @@ def cmd_freeze_check(con, a):
         table(r["recent_events"], ["time", "provider", "event_id", "level", "message"])
 
 
+# ---------------- UV/OC ----------------
+def _onoff(v):
+    return {"on": True, "off": False}.get(v.lower(), v)
+
+
+def _settings(a):
+    """CLI flags -> (cpu, gpu) dicts for ocanalyze.validate; only keys the user passed."""
+    if a.co is not None and a.co_all is not None:
+        raise ValueError("Podaj albo --co, albo --co-all")
+    cpu, pbo, gpu = {}, {}, {}
+    if a.co is not None:
+        try:
+            cpu["co_per_core"] = [int(x) for x in a.co.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError("--co: liczby całkowite oddzielone przecinkami, np. -10,-15,-10,-5,-10,-10,-15,-10")
+    if a.co_all is not None:
+        cpu["co_per_core"] = [a.co_all] * 8
+    for flag, key in (("ppt", "ppt"), ("tdc", "tdc"), ("edc", "edc"), ("scalar", "scalar"), ("boost", "boost_override")):
+        if getattr(a, flag) is not None:
+            pbo[key] = getattr(a, flag)
+    if pbo:
+        cpu["pbo"] = pbo
+    if a.expo is not None:
+        cpu["expo"] = _onoff(a.expo)
+    if a.soc_v is not None:
+        cpu["soc_v"] = a.soc_v
+    for flag, key in (("gpu_uv", "voltage_offset_mv"), ("gpu_pl", "power_limit_pct"), ("gpu_clk", "max_clock_offset"),
+                      ("vram", "vram_mhz"), ("fan", "fan_curve")):
+        if getattr(a, flag) is not None:
+            gpu[key] = getattr(a, flag)
+    if a.vram_fast is not None:
+        gpu["vram_fast_timing"] = _onoff(a.vram_fast)
+    return cpu or None, gpu or None
+
+
+def _delta(v):
+    return None if v is None else f"{v:+g}%"
+
+
+def _oc_next(r):
+    cur = r["current"]
+    out("## Następny krok UV/OC" + (f" - aktywny profil: {cur['profile']} ({cur['settings']})" if cur else ""))
+    if r["blocked"]:
+        out("**Strojenie poczeka.**" + (f" Odblokuje się {r['until']}." if r.get("until") else ""))
+        for b in r["blockers"]:
+            out(f"- {b['what']}: {b['detail']}" + (f" (do {b['until']})" if b.get("until") else ""))
+    for b in r.get("warnings") or []:
+        out(f"Uwaga: {b['what']}: {b['detail']} - zmiany ustawień poczekają do {b['until']}.")
+    s = r["step"]
+    if s:
+        out(f"### {s['title']}")
+        kv({"gdzie": s["where"], "wartość": s["value"], "komenda": s["command"], "po awarii": s.get("reject_command"),
+            "uwaga": s.get("note"), "co się nie zgadza": s.get("failed")})
+        for x in s.get("skipped") or []:
+            out(f"_{x}_")
+    t = r["test"]
+    if t:
+        out(f"### Test: {t['what']}")
+        for c in t["criteria"]:
+            out(f"- [{'x' if c['ok'] else ' '}] {c['check']}" + (f" ({c['value']})" if c.get("value") is not None else ""))
+    if r["next_if_ok"]:
+        out(f"Jeśli OK: {r['next_if_ok']}")
+    if r["rollback_if_bad"]:
+        out(f"Jeśli źle: {r['rollback_if_bad']}")
+    out("_PerfMonitor tylko doradza - niczego nie zmienia w BIOS ani Adrenalin i sam nie oznacza profilu jako stabilny._")
+
+
+def cmd_oc(con, a):
+    act = a.action
+    if act == "list":
+        ps = oc.profiles(con)
+        if a.json:
+            return dump(ps)
+        out("## Profile UV/OC")
+        table([{"id": p["id"], "name": p["name"], "status": p["status"], "active": "✓" if p["active"] else "",
+                "summary": oc.summarize_settings(p), "active_hours": p["active_hours"], "created": p["created"]}
+               for p in ps], maxw=160)
+    elif act == "show":
+        p = oc.profile(con, a.id)
+        if not p:
+            raise ValueError(f"Nie ma profilu #{a.id}")
+        p["periods"] = [{"from": an.fmt_ts(f), "to": an.fmt_ts(t)} for pid, f, t in oc.periods(con) if pid == p["id"]]
+        p["summary"] = oc.summarize_settings(p)
+        if a.json:
+            return dump(p)
+        out(f"## Profil #{p['id']} - {p['name']} ({p['status']})")
+        kv({"ustawienia": p["summary"], "utworzono": p["created"], "notatki": p["notes"],
+            "aktywny w": "; ".join(f"{x['from']} -> {x['to']}" for x in p["periods"]) or "nigdy"})
+        kv(p["cpu"], "CPU")
+        kv(p["gpu"], "GPU")
+    elif act in ("add", "edit"):
+        cpu, gpu = _settings(a)
+        since = an.parse_time(a.since) if act == "add" and a.since else None
+        if act == "add":
+            pid = oc.create_profile(con, a.name, cpu, gpu, a.notes, a.status or "testing")
+            if a.activate:
+                oc.activate(con, pid, ts=since)
+        else:
+            pid = a.id
+            oc.update_profile(con, pid, name=a.name, cpu=cpu, gpu=gpu, notes=a.notes, status=a.status)
+        p = oc.profile(con, pid)
+        if a.json:
+            return dump(p)
+        out(f"Profil #{pid} {'utworzony' if act == 'add' else 'zaktualizowany'}: **{p['name']}** ({p['status']})")
+        out(f"Ustawienia: {oc.summarize_settings(p)}")
+        if act == "add" and a.activate:
+            out(f"Aktywny od {an.fmt_ts(since or time.time())}.")
+    elif act == "activate":
+        ts = oc.activate(con, a.id, ts=an.parse_time(a.since) if a.since else None)
+        p = oc.profile(con, a.id)
+        if a.json:
+            return dump({"profile": p, "since": ts})
+        out(f"Aktywny profil: **{p['name']}** (#{p['id']}) od {an.fmt_ts(ts)}.")
+        out("Sesje rozpoczęte od tej chwili zostały ponownie przypisane do profilu." if a.since
+            else "Nowe sesje będą przypisywane do tego profilu.")
+    elif act == "compare":
+        r = oc.compare_profiles(con, a.exe, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Porównanie profili - {r['exe'] or 'brak gier'} (od {a.since})")
+        out(f"Punkt odniesienia: {r['baseline'] or '-'}")
+        rows = [{**x, "fps_avg_delta_pct": _delta(x.get("fps_avg_delta_pct")),
+                 "fps_per_w_delta_pct": _delta(x.get("fps_per_w_delta_pct"))} for x in r["rows"]]
+        table(rows, ["profile", "sessions", "minutes", "fps_avg", "fps_avg_delta_pct", "fps_1low", "fps_per_w",
+                     "fps_per_w_delta_pct", "power_w", "cpu_temp", "gpu_hotspot", "errors_per_h", "game_crashes"])
+        small = [x["profile"] for x in r["rows"] if x["small_sample"]]
+        if small:
+            out(f"_mała próba (<{oc.MIN_COMPARE_MIN} min): {', '.join(small)}_")
+    elif act == "stability":
+        r = oc.stability(con, a.profile)
+        if a.json:
+            return dump(r)
+        if "error" in r:
+            return out(r["error"])
+        p = r["profile"]
+        out(f"## Stabilność - {p['name']} (#{p['id']}, {p['status']}): {r['verdict']}")
+        kv({"ustawienia": r["settings"], "aktywny od": r["active_since"], "zebrane dane [h]": r["hours_collected"],
+            "błędy/h": r["errors_per_h"], "błędy": r["errors"], "resety przy niskim obciążeniu": r["low_load_resets"]})
+        table([{"check": c["check"], "ok": "✓" if c["ok"] else "✗", "value": c["value"]} for c in r["checks"]])
+        if r["resets"]:
+            out("### Resety")
+            table(r["resets"], ["time", "cpu_avg", "low_load"])
+        if r["missing"]:
+            out("Brakuje: " + "; ".join(r["missing"]))
+    elif act == "next":
+        r = ocassist.next_step(con)
+        if a.json:
+            return dump(r)
+        _oc_next(r)
+    elif act == "vf":
+        r = oc.vf_curve(con, a.profile, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Krzywa V/F (od {a.since}, {r['rows']} próbek)")
+        for key, title in (("gpu", "GPU: MHz -> V (obciążenie >= 90%)"), ("cpu_single", "CPU: jeden wątek"),
+                           ("cpu_all", "CPU: wszystkie rdzenie")):
+            out(f"### {title}")
+            table(r[key], ["mhz", "v", "n"])
+    elif act == "cores":
+        r = oc.per_core(con, a.profile, a.since)
+        if a.json:
+            return dump(r)
+        out(f"## Rdzenie CPU (od {a.since})")
+        table([{**c, "suspect": "✓" if c["suspect"] else ""} for c in r["cores"]],
+              ["core", "whea19", "whea18", "stretch_pct", "eff_loaded_avg", "eff_max", "loaded_min", "suspect"])
+        if r["note"]:
+            out(r["note"])
+        if r["whea_uncore"]:
+            kv({"WHEA poza rdzeniami": r["whea_uncore"]})
+
+
+def _print_test(r):
+    out(f"## Test #{r['id']}: {r['name']} ({r.get('exe')}, {r.get('status')})")
+    if r.get("metrics"):
+        table([{"metryka": m["label"], "przed": m["before"], "po": m["after"], "zmiana %": m["change_pct"],
+                "istotne": "tak" if m["significant"] else "nie"} for m in r["metrics"]],
+              ["metryka", "przed", "po", "zmiana %", "istotne"])
+    b, af = r.get("before") or {}, r.get("after") or {}
+    if b:
+        out(f"Przed: {b['sessions']} sesji, {b['minutes']} min gry. Po: {af['sessions']} sesji, {af['minutes']} min gry.")
+    out(f"**Werdykt: {r['verdict']}**" + (f" ({'; '.join(r['missing'])})" if r.get("missing") else ""))
+    for w in r.get("warnings") or []:
+        out(f"- Uwaga: {w}")
+
+
+def cmd_test(con, a):
+    act = a.action
+    if act == "start":
+        tid = exps.start(con, a.name, a.exe, a.key)
+        if a.json:
+            return dump({"id": tid})
+        out(f"Rozpoczęto test #{tid}: **{a.name}**. Zmień JEDNO ustawienie i graj dalej, potem `pm test show` / `pm test stop`.")
+    elif act in ("stop", "show"):
+        r = exps.stop(con, a.id) if act == "stop" else exps.show(con, a.id)
+        if a.json:
+            return dump(r)
+        _print_test(r if r.get("name") else dict(r, name="?"))
+    elif act == "cancel":
+        tid = exps.cancel(con, a.id)
+        out(json.dumps({"cancelled": tid}) if a.json else f"Anulowano test #{tid}.")
+    else:
+        rows = exps.list_all(con)
+        if a.json:
+            return dump(rows)
+        out("## Testy zmian")
+        table(rows, ["id", "time", "name", "exe", "status", "verdict"])
+
+
+def cmd_stress(con, a):
+    act = a.action
+    if act in ("start", "idle"):
+        name = a.name or "idle soak"
+        sid = oc.stress_start(con, name, "manual" if act == "start" else "idle_soak")
+        if a.json:
+            return dump({"session": sid, "name": name})
+        out(f"Rozpoczęto test #{sid}: **{name}**.")
+        out("Zostaw PC w spoczynku na 1-2 h, potem uruchom `pm stress stop`." if act == "idle"
+            else "Po zakończeniu testu uruchom `pm stress stop`.")
+    elif act == "stop":
+        ids = oc.stress_stop(con)
+        if a.json:
+            return dump({"ended": ids})
+        out(f"Zakończono: {', '.join(f'#{i}' for i in ids)}." if ids else "Brak trwających testów.")
+        if ids:
+            out("Wynik: pm stress list")
+    elif act == "list":
+        rows = oc.stress_runs(con, a.limit)
+        if a.json:
+            return dump(rows)
+        out("## Testy obciążeniowe i bezczynność")
+        for r in rows:
+            r["test"] = r["test"] or r["exe"]
+            r["errors"] = sum((r["errors"] or {}).values()) if r["errors"] is not None else None
+        table(rows, ["id", "time", "test", "kind", "minutes", "end_reason", "errors", "tctl_max", "gpu_hot_max",
+                     "cpu_w_avg", "gpu_w_avg", "stretch_max_pct"])
+
+
 def build():
     p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
@@ -565,6 +911,7 @@ def build():
         return s
     add("status", cmd_status)
     add("mark", cmd_mark, help="mark a lag/problem right now").add_argument("text", nargs="*")
+    add("advise", cmd_advise, help="ranked concrete changes backed by your own data")
     add("health", cmd_health).add_argument("--days", type=float, default=14)
     add("sessions", cmd_sessions).add_argument("--limit", type=int, default=20)
     add("session", cmd_session).add_argument("id", type=int)
@@ -579,6 +926,10 @@ def build():
     s = add("range", cmd_range)
     s.add_argument("frm", metavar="FROM")
     s.add_argument("to", metavar="TO", nargs="?", default="now")
+    s = add("net", cmd_net, help="network quality summary (ping, loss, Wi-Fi, incidents)")
+    s.add_argument("frm", metavar="FROM", nargs="?", help="range start (default: --since)")
+    s.add_argument("to", metavar="TO", nargs="?", default="now")
+    s.add_argument("--since", default="24h")
     s = add("at", cmd_at)
     s.add_argument("time")
     s.add_argument("--window", type=float, default=30)
@@ -609,7 +960,103 @@ def build():
     s.add_argument("--limit", type=int, default=30)
     add("dumps", cmd_dumps, help="WER minidumps of crashing apps (HKLM, via the collector)").add_argument(
         "action", choices=["status", "enable", "disable"])
+
+    s = add("oc", cmd_oc, help="UV/OC profiles: list|show|add|edit|activate|compare|stability|vf|cores")
+    ocp = s.add_subparsers(dest="action", required=True)
+
+    def oc_action(name, writes=False):
+        x = ocp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+
+    def settings_flags(x):
+        x.add_argument("--co", help="Curve Optimizer per core, e.g. -10,-15,-10,-5,-10,-10,-15,-10")
+        x.add_argument("--co-all", type=int, help="Curve Optimizer for all 8 cores")
+        for f in ("ppt", "tdc", "edc", "scalar"):
+            x.add_argument(f"--{f}", type=int)
+        x.add_argument("--boost", type=int, help="boost override [MHz]")
+        x.add_argument("--expo", help="on|off|text, e.g. '6000 CL30'")
+        x.add_argument("--soc-v", type=float, help="VSoC [V]")
+        x.add_argument("--gpu-uv", type=int, help="GPU voltage offset [mV]")
+        x.add_argument("--gpu-pl", type=int, help="GPU power limit [%%]")
+        x.add_argument("--gpu-clk", type=int, help="GPU max clock offset [MHz]")
+        x.add_argument("--vram", type=int, help="VRAM [MHz]")
+        x.add_argument("--vram-fast", help="on|off")
+        x.add_argument("--fan", help="fan curve description")
+        x.add_argument("--notes")
+        x.add_argument("--status", choices=oc.STATUSES)
+
+    oc_action("list")
+    oc_action("show").add_argument("id", type=int)
+    x = oc_action("add", True)
+    x.add_argument("name")
+    settings_flags(x)
+    x.add_argument("--activate", action="store_true")
+    x.add_argument("--since", help="back-date the activation (e.g. 90d, 2026-01-01)")
+    x = oc_action("edit", True)
+    x.add_argument("id", type=int)
+    x.add_argument("--name")
+    settings_flags(x)
+    x = oc_action("activate", True)
+    x.add_argument("id", type=int)
+    x.add_argument("--since", help="back-date the activation (re-tags sessions since then)")
+    x = oc_action("compare")
+    x.add_argument("--exe")
+    x.add_argument("--since", default="180d")
+    oc_action("stability").add_argument("--profile", type=int)
+    oc_action("next")
+    for n in ("vf", "cores"):
+        x = oc_action(n)
+        x.add_argument("--profile", type=int)
+        x.add_argument("--since", default="30d")
+
+    s = add("stress", cmd_stress, help="manual stress tests / idle soak: start|idle|stop|list")
+    stp = s.add_subparsers(dest="action", required=True)
+
+    def st_action(name, writes=False):
+        x = stp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+    st_action("start", True).add_argument("name")
+    st_action("idle", True).add_argument("name", nargs="?")
+    st_action("stop", True)
+    st_action("list").add_argument("--limit", type=int, default=30)
+
+    s = add("test", cmd_test, help="one-setting test with before/after verdict: start|stop|cancel|list|show")
+    tp = s.add_subparsers(dest="action", required=True)
+
+    def t_action(name, writes=False):
+        x = tp.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+    x = t_action("start", True)
+    x.add_argument("name")
+    x.add_argument("--exe")
+    x.add_argument("--key")
+    for n in ("stop", "cancel"):
+        t_action(n, True).add_argument("id", nargs="?", type=int)
+    t_action("list")
+    t_action("show").add_argument("id", nargs="?", type=int)
     return p
+
+
+NEG_VALUE_FLAGS = {"--co", "--co-all", "--gpu-uv", "--gpu-pl", "--gpu-clk", "--soc-v"}
+
+
+def _glue_negatives(argv):
+    """argparse takes '-10' / '-10,-15' after a flag for an option: rewrite to --flag=-10."""
+    res, i = [], 0
+    while i < len(argv):
+        if argv[i] in NEG_VALUE_FLAGS and i + 1 < len(argv) and argv[i + 1].startswith("-"):
+            res.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            res.append(argv[i])
+            i += 1
+    return res
 
 
 def main(argv=None):
@@ -618,14 +1065,14 @@ def main(argv=None):
             st.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-    a = build().parse_args(argv)
+    a = build().parse_args(_glue_negatives(sys.argv[1:] if argv is None else list(argv)))
     if not hasattr(a, "json"):
         a.json = False
     import os
     if os.environ.get("PERFMON_DB"):  # testing: point at another database file
         config.DB_PATH = Path(os.environ["PERFMON_DB"])
     try:
-        con = db.connect(readonly=True)
+        con = db.connect(readonly=not getattr(a, "writes", False))
     except sqlite3.Error as e:
         sys.exit(f"Nie mogę otworzyć bazy {config.DB_PATH}: {e}")
     try:
