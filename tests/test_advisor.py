@@ -187,6 +187,52 @@ class AdvisorTest(unittest.TestCase):
         self.assertIn("wifi_driver", [u["key"] for u in r["unknown"]])
         self.assertNotIn("wifi_driver", keys(advisor.build(data(wifi=dict(w, n=5)))))
 
+    def test_overlay_needs_two_sessions_and_a_readable_scan(self):
+        def with_mods(*mods):
+            reps = []
+            for i, m in enumerate(mods):
+                r = report(i)
+                r["config"] = {"modules": m}
+                reps.append(r)
+            return data(reports=reps)
+        ok = {"status": "ok", "flagged": [{"name": "Discord", "category": "overlay"},
+                                          {"name": "EasyAntiCheat", "category": "anticheat"}]}
+        r = advisor.build(with_mods(ok, ok, {"status": "ok", "flagged": []}))
+        self.assertIn("overlay:Discord", keys(r))
+        self.assertNotIn("overlay:EasyAntiCheat", keys(r))   # anti-cheat is not something to switch off
+        self.assertNotIn("overlay:Discord", keys(advisor.build(with_mods(ok, {"status": "unknown"}, {"status": "unknown"}))))
+
+    def test_frame_gen_on_a_low_base_frame_rate(self):
+        def with_fg(avg, pct):
+            reps = [report(i) for i in range(3)]
+            for r in reps:
+                r["fps_timeline"] = {"avg": avg, "frame_gen_pct": pct}
+            return data(reports=reps)
+        it = next(i for i in advisor.build(with_fg(48, 45))["items"] if i["key"] == "frame_gen_base")
+        self.assertIn("48 własnych klatek", it["why"])
+        self.assertNotIn("frame_gen_base", keys(advisor.build(with_fg(125, 43))))   # this PC's CoD: enough base FPS
+        self.assertNotIn("frame_gen_base", keys(advisor.build(with_fg(48, 0))))
+
+    def test_crash_dump_only_with_resets_and_a_problem(self):
+        resets = [{"bugcheck_code": 0, "time": "2026-11-10 01:00:00"}]
+        d = data(health={"days": 14, "unclean_shutdowns": resets, "recurring_crashes": []})
+        d["info"]["crash_dump"] = {"mode": "none", "problems": ["zapis zrzutów wyłączony (CrashDumpEnabled=0)"]}
+        it = next(i for i in advisor.build(d)["items"] if i["key"] == "crash_dump")
+        self.assertIn("CrashDumpEnabled=0", it["why"])
+        d["info"]["crash_dump"] = {"mode": "small", "problems": []}
+        self.assertNotIn("crash_dump", keys(advisor.build(d)))
+        d = data()
+        d["info"]["crash_dump"] = {"mode": "none", "problems": ["x"]}
+        self.assertNotIn("crash_dump", keys(advisor.build(d)))   # nothing crashed: nothing to explain
+
+    def test_power_plan_names_its_details(self):
+        d = data()
+        d["info"].update(power_plan_guid="381b4222-f694-41f0-9685-ff5bb260df2e",
+                         power={"name": "Zrównoważony", "cpu_min_pct": 5, "core_parking_min_pct": 100, "pcie_aspm": "moderate"})
+        it = next(i for i in advisor.build(d)["items"] if i["key"] == "power_plan")
+        self.assertIn("min. stan procesora 5%", it["why"])
+        self.assertIn("umiarkowane oszczędzanie", it["why"])
+
     def test_does_not_mutate_input(self):
         d = data()
         before = copy.deepcopy(d)

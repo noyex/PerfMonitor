@@ -24,7 +24,11 @@ UNCLEAN_MIN = 2               # hard resets in MAIN_GAME_DAYS that make finding 
 WIFI_WARN_MIN = 20            # Wi-Fi driver warnings in MAIN_GAME_DAYS
 WIFI_LINK_PCT = 50            # share of network seconds on Wi-Fi for the driver to matter
 WIFI_PROBLEMS_MIN = 3         # network incidents located at home (Wi-Fi / router) that the warnings could explain
+OVERLAY_MIN_SESSIONS = 2      # sessions in which an overlay / capture hook / injector was loaded into the game
+FRAME_GEN_ON_PCT = 5          # % generated frames: the session was played with frame generation
+FRAME_GEN_BASE_FPS = 60       # application FPS below which AMD advises against frame generation (latency, artifacts)
 BALANCED_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"
+ASPM_PL = {"off": "wyłączone", "moderate": "umiarkowane oszczędzanie", "maximum": "maksymalne oszczędzanie"}
 GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 # Wi-Fi driver event providers: Intel (Netwtw14, Netwbw02...), Realtek, MediaTek, Qualcomm
 WIFI_PROVIDERS = ("Netwtw%", "Netwbw%", "Netwsw%", "rtwlan%", "RtlWlan%", "mtkwl%", "Qcamain%", "athw%")
@@ -201,6 +205,32 @@ def _plural(n, one, few, many):
 def _plan_guid(info):
     g = info.get("power_plan_guid") or (GUID_RE.search(info.get("power_plan") or "") or [None])[0]
     return g.lower() if g else None
+
+
+def _overlays(reports):
+    """name -> (category, sessions) of hooks seen in the game process (game_modules scans, status ok only)."""
+    seen = {}
+    for r in reports:
+        m = (r.get("config") or {}).get("modules") or {}
+        if m.get("status") != "ok":
+            continue
+        for f in m.get("flagged") or []:
+            if f.get("category") in ("overlay", "capture", "injector"):
+                cat, n = seen.get(f["name"], (f["category"], 0))
+                seen[f["name"]] = (cat, n + 1)
+    return seen
+
+
+def _frame_gen(reports):
+    """(application FPS, minutes) over recent sessions played with frame generation, or None."""
+    fps_w = mins = 0.0
+    for r in reports:
+        ft = r.get("fps_timeline") or {}
+        if (ft.get("frame_gen_pct") or 0) < FRAME_GEN_ON_PCT or not ft.get("avg"):
+            continue
+        m = _minutes(r) or (r.get("duration_s") or 0) / 60
+        fps_w, mins = fps_w + ft["avg"] * m, mins + m
+    return (fps_w / mins, mins) if mins else None
 
 
 def _avg(vals):
@@ -468,10 +498,16 @@ def build(d):
             not_worth.append({"key": "power_plan", "title": "Plan zasilania Wysoka wydajność",
                               "why": f"Test #{tested['id']} ({tested['time']}): {tested['verdict']}."})
         else:
+            pw = info.get("power") or {}
+            det = [f"min. stan procesora {pw['cpu_min_pct']}%" if pw.get("cpu_min_pct") is not None else None,
+                   f"parkowanie rdzeni: min. {pw['core_parking_min_pct']}% rdzeni" if pw.get("core_parking_min_pct") is not None else None,
+                   f"PCIe Link State Power Management: {ASPM_PL.get(pw['pcie_aspm'], pw['pcie_aspm'])}" if pw.get("pcie_aspm") is not None else None]
+            det = [x for x in det if x]
             items.append(_item(
                 "power_plan", "Przetestuj plan zasilania Wysoka wydajność",
-                "Aktywny jest plan Zrównoważony. Na tym procesorze różnica bywa żadna albo niewielka (szybsze wybudzanie "
-                "rdzeni), więc to test, nie pewny zysk.", "do sprawdzenia testem przed/po; zwykle mała różnica",
+                "Aktywny jest plan Zrównoważony" + (f" ({', '.join(det)})" if det else "") + ". Na tym procesorze różnica "
+                "bywa żadna albo niewielka (szybsze wybudzanie rdzeni), więc to test, nie pewny zysk.",
+                "do sprawdzenia testem przed/po; zwykle mała różnica",
                 "wyższy pobór prądu w spoczynku", "wróć do planu Zrównoważony",
                 "Panel sterowania > Opcje zasilania > Wysoka wydajność, potem `pm test start \"Plan Wysoka wydajność\" "
                 "--key power_plan`, zagraj kilka zwykłych sesji i `pm test stop`.", "fps", score=12))
@@ -502,6 +538,47 @@ def build(d):
             not_worth.append({"key": "wifi_driver", "title": "Sterownik Wi-Fi",
                               "why": f"{name}, ale pomiary sieci nie pokazują problemów po stronie domu (ping i utrata "
                                      "pakietów do routera w normie)."})
+
+    # [overlays] hooks loaded into the game process (only with game_modules on: the scan reads the game's module list)
+    for name, (cat, k) in sorted(_overlays(reports).items(), key=lambda kv: -kv[1][1]):
+        if k < min(OVERLAY_MIN_SESSIONS, n):
+            continue
+        what = {"overlay": "nakładka", "capture": "przechwytywanie obrazu", "injector": "wstrzyknięta biblioteka"}[cat]
+        items.append(_item(
+            f"overlay:{name}", f"Wyłącz {name} w grze",
+            f"{name} ({what}) był załadowany do procesu gry w {k} z {n} ostatnich sesji. Każdy taki hook dokłada pracę do "
+            "każdej klatki i bywa źródłem stutterów oraz crashy sterownika.",
+            "mniej opóźnień i stutterów, jeśli ta nakładka je powoduje; do sprawdzenia testem przed/po",
+            "brak nakładki w grze", "włącz nakładkę z powrotem",
+            f"Wyłącz nakładkę {name} w jej ustawieniach (dla tej gry albo globalnie), potem `pm test start \"Bez {name}\" "
+            f"--key overlay:{name}` i kilka zwykłych sesji.", "latency", score=22 + 3 * k))
+
+    # [frame_gen_base] frame generation on top of a low application frame rate
+    fg = _frame_gen(reports)
+    if fg and fg[0] < FRAME_GEN_BASE_FPS:
+        items.append(_item(
+            "frame_gen_base", "Obniż ustawienia albo wyłącz generowanie klatek",
+            f"W sesjach z generowaniem klatek gra renderuje średnio {fg[0]:.0f} własnych klatek/s ({fg[1]:.0f} min). "
+            f"Poniżej {FRAME_GEN_BASE_FPS} FPS generator dodaje odczuwalne opóźnienie i artefakty, a licznik w overlayu "
+            "pokazuje liczbę z generowanymi klatkami.",
+            "mniejsze opóźnienie wejścia i mniej artefaktów", "niższy licznik FPS w overlayu albo niższa jakość",
+            "włącz generowanie klatek z powrotem",
+            "Gra > Grafika: obniż preset albo włącz upscaler (FSR Jakość) tak, by bez generatora było co najmniej "
+            f"{FRAME_GEN_BASE_FPS} FPS; albo wyłącz generowanie klatek (FSR Frame Generation / AFMF w Adrenalinie).",
+            "latency", score=30))
+
+    # [crash_dump] dumps cannot be written while the PC crashes: nothing will explain the next blue screen
+    cd = info.get("crash_dump") or {}
+    if cd.get("problems") and (unclean or any(c.get("kind") == "bsod" for c in health.get("recurring_crashes") or [])):
+        items.append(_item(
+            "crash_dump", "Napraw zapis zrzutów pamięci",
+            "Windows nie zapisze zrzutu przy blue screenie: " + "; ".join(cd["problems"]) + ". Przy resetach bez blue "
+            "screena (BugcheckCode=0) zrzutu i tak nie ma, ale następny blue screen zostałby bez przyczyny.",
+            "kod błędu i sterownik winowajcy przy następnym blue screenie", "zajmuje miejsce na dysku systemowym",
+            "przywróć poprzednie ustawienia zrzutu",
+            "Zaawansowane ustawienia systemu > Uruchamianie i odzyskiwanie > Ustawienia: Zapisywanie informacji o "
+            "debugowaniu: Automatyczny zrzut pamięci; plik stronicowania na C: zarządzany przez system.",
+            "stability", TIER_STABILITY, 70))
 
     # [game_dvr]
     if info.get("game_dvr") == 1:
