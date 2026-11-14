@@ -156,22 +156,57 @@ class BoxTest(unittest.TestCase):
         self.assertTrue(self.box.want)
 
 
+def touch(path, kb, mtime=None):
+    with open(path, "wb") as f:
+        f.write(b"x" * (kb * 1024))
+    if mtime:
+        os.utime(path, (mtime, mtime))
+
+
 class RetentionTest(unittest.TestCase):
-    def test_age_and_size_limits(self):
-        con = sqlite3.connect(":memory:")
-        db.migrate(con)
-        with tempfile.TemporaryDirectory() as td:
-            now = 10_000_000.0
-            for i, (age_days, mb) in enumerate(((20, 10), (5, 1500), (1, 1000))):
-                p = os.path.join(td, f"{i}.etl")
-                open(p, "wb").close()
-                con.execute("INSERT INTO etw_captures(ts, trigger, path, size_mb, status) VALUES (?,?,?,?,?)",
-                            (now - age_days * 86400, "user_mark", p, mb, "captured"))
-            n = etwbox.retention(con, {"retention_days": 14, "max_gb": 2}, now)
-            self.assertEqual(n, 2)                                   # too old, then oldest over 2 GB
-            left = [r[0] for r in con.execute("SELECT path FROM etw_captures ORDER BY ts")]
-            self.assertEqual([p is None for p in left], [True, True, False])
-            self.assertEqual(sorted(os.listdir(td)), ["2.etl"])
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        db.migrate(self.con)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.dir = td.name
+        self.now = time.time()
+
+    def capture(self, name, age_days, kb, status="captured"):
+        p = os.path.join(self.dir, name)
+        touch(p, kb)
+        return self.con.execute("INSERT INTO etw_captures(ts, trigger, path, size_mb, status, summary) "
+                                "VALUES (?,?,?,?,?,?)",
+                                (self.now - age_days * 86400, "user_mark", p, 0, status, "{}")).lastrowid
+
+    def test_age_and_size_limits_count_the_real_files(self):
+        old = self.capture("0.etl", 20, 10, "analyzed")
+        mid = self.capture("1.etl", 5, 1500)
+        new = self.capture("2.etl", 1, 1000, "analyzed")
+        # 2.5 MB on disk against 2 MB (size_mb in the rows says 0): too old, then the analysed one goes before the
+        # older unanalysed one
+        n = etwbox.retention(self.con, {"retention_days": 14, "max_gb": 2 / 1024}, self.now, self.dir)
+        self.assertEqual(n, 2)
+        left = dict(self.con.execute("SELECT id, path FROM etw_captures"))
+        self.assertEqual([left[old] is None, left[mid] is None, left[new] is None], [True, False, True])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["1.etl"])
+
+    def test_intermediate_and_orphan_files(self):
+        self.capture("a.etl", 1, 1, "analyzed")
+        touch(os.path.join(self.dir, "a.csv"), 3000)                        # crashed analysis: always removed
+        touch(os.path.join(self.dir, "lost.etl"), 1, self.now - 2 * 3600)   # no row: orphan
+        touch(os.path.join(self.dir, "fresh.etl"), 1)                       # no row yet: wpr -stop still writing
+        touch(os.path.join(self.dir, "perfmon.wprp"), 1, self.now - 30 * 86400)
+        n = etwbox.retention(self.con, {"retention_days": 14, "max_gb": 2}, self.now, self.dir)
+        self.assertEqual(n, 2)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["a.etl", "fresh.etl", "perfmon.wprp"])
+
+    def test_unanalysed_capture_without_file_fails_with_reason(self):
+        cid = self.capture("gone.etl", 20, 1)
+        etwbox.retention(self.con, {"retention_days": 14, "max_gb": 2}, self.now, self.dir)
+        status, summ = self.con.execute("SELECT status, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
+        self.assertEqual(status, "failed")
+        self.assertIn("retencja", json.loads(summ)["error"])
 
     def test_settings_merge(self):
         s = etwbox.settings({"etw": {"mode": "always", "triggers": {"dpc_pct": 0}}})

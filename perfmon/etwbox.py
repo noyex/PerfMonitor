@@ -35,6 +35,7 @@ RETRY_S = 600              # after a failed wpr -start (no admin, another kernel
 BURST_WINDOW_S = 10
 DPC_TRIGGER_S = 2
 MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
+ORPHAN_S = 3600           # a trace file no row points at yet may still be written by wpr -stop
 
 
 def settings(cfg):
@@ -219,27 +220,77 @@ class EtwBox:
             self._start()
 
 
-def retention(con, s, now=None):
-    """Delete trace files older than retention_days, then the oldest until the total is under max_gb.
-    The rows (and their analysis) stay; path becomes NULL. Returns the number of deleted files."""
+def retention(con, s, now=None, folder=None):
+    """Keep the whole traces folder under max_gb, not just the files etw_captures points at:
+    - intermediate .csv files (left by a crashed or old-style analysis) are always deleted,
+    - files no row references (orphans) once they are ORPHAN_S old (younger ones may still be written by wpr -stop),
+    - .etl older than retention_days, then the oldest until the folder fits max_gb; analysed captures go before
+      unanalysed ones, their summary already holds what the trace was kept for.
+    The rows stay with path NULL; a capture deleted before it was analysed is marked failed with the reason.
+    Returns the number of deleted files."""
     now = now or time.time()
-    rows = con.execute("SELECT id, ts, path, size_mb FROM etw_captures WHERE path IS NOT NULL ORDER BY ts").fetchall()
-    total = sum((r[3] or 0) for r in rows)
+    folder = Path(folder or TRACES)
+    if not folder.is_dir():
+        return 0
+    rows = con.execute("SELECT id, ts, path, status FROM etw_captures WHERE path IS NOT NULL").fetchall()
+    known = {os.path.normcase(os.path.abspath(r[2])): r for r in rows}
+    deleted, total = 0, 0
+    for p in folder.iterdir():
+        key = os.path.normcase(os.path.abspath(p))
+        if p.name == "perfmon.wprp" or key in known:
+            continue
+        try:
+            st = p.stat()
+            if p.suffix.lower() == ".csv" or now - st.st_mtime > ORPHAN_S:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+                deleted += 1
+                log.info("ETW: removed intermediate/orphan %s (%.0f MB)", p.name, st.st_size / 2**20)
+            elif p.is_file():
+                total += st.st_size
+        except OSError as e:
+            log.warning("trace %s: %s", p, e)
+    files = []
+    for key, (cid, ts, path, status) in known.items():
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None                       # deleted by hand: only the row is fixed below
+        files.append((status == "captured", ts, cid, path, size))
+        total += size or 0
     gone = []
-    for cid, ts, path, size in rows:
-        if now - ts > s["retention_days"] * 86400 or total > s["max_gb"] * 1024:
-            try:
+    for _, ts, cid, path, size in sorted(files, key=lambda f: (now - f[1] <= s["retention_days"] * 86400, f[0], f[1])):
+        if size is not None and now - ts <= s["retention_days"] * 86400 and total <= s["max_gb"] * 2**30:
+            continue
+        try:
+            if size is not None:
                 os.remove(path)
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                log.warning("trace %s: %s", path, e)
-                continue
-            total -= size or 0
-            gone.append(cid)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("trace %s: %s", path, e)
+            continue
+        total -= size or 0
+        deleted += size is not None
+        gone.append(cid)
     for cid in gone:
         con.execute("UPDATE etw_captures SET path=NULL WHERE id=?", (cid,))
-    return len(gone)
+    # never analysed and now without a file: nothing will ever pick them up again
+    for cid, summ in con.execute("SELECT id, summary FROM etw_captures WHERE status='captured' AND path IS NULL"):
+        _fail(con, cid, _loads(summ), "Plik zrzutu usunięty (retencja) przed analizą")
+    return deleted
+
+
+def _loads(s):
+    try:
+        return json.loads(s) if s else {}
+    except ValueError:
+        return {}
+
+
+def _fail(con, cid, summ, error):
+    summ["error"] = str(error)[:400]
+    con.execute("UPDATE etw_captures SET status='failed', summary=? WHERE id=?",
+                (json.dumps(summ, ensure_ascii=False), cid))
 
 
 # --------------------------------------------------------------------------
