@@ -13,6 +13,7 @@ VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of V
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
 BG_GPU_PCT = 15               # background process GPU load counted as a stutter cause
 SHADER_GROWTH_BYTES = 256 * 1024   # shader cache growth around a stutter = it compiled shaders
+DUMP_STOP_S = 20              # wpr -stop time when a capture did not record it (4-17 s seen with a 256 MB buffer)
 
 
 def _i(v):
@@ -41,6 +42,12 @@ class StutterExt:
         self.resets = [r[0] for r in con.execute("SELECT ts FROM incidents WHERE kind IN ('nvme_reset','disk_retry') "
                                                  "AND ts BETWEEN ? AND ? ORDER BY ts", (start - 15, end + 15))]
         self.disk_temp = disktemp.DiskTemp(con, row["path"] if "path" in row.keys() else None, start, end)
+        # ETW dumps: wpr -stop flushes the buffer to disk and merges it, which stutters the game itself
+        self.dumps = []
+        for ts, summ in con.execute("SELECT ts, summary FROM etw_captures WHERE ts BETWEEN ? AND ? ORDER BY ts",
+                                    (start - 60, end)):
+            stop_s = (an._json(summ) or {}).get("stop_s") or DUMP_STOP_S
+            self.dumps.append((ts, ts + stop_s + etwbox.DUMP_SETTLE_S))
 
     def _win(self, ts_list, items, a, b):
         return items[bisect.bisect_left(ts_list, a):bisect.bisect_right(ts_list, b)]
@@ -73,6 +80,8 @@ class StutterExt:
         """Add the extra causes to the list from analyze._causes_for_stutter (before its unknown fallback)."""
         if self._win(self.resets, self.resets, ts - 15, ts + 15):
             causes.insert(0, "disk_reset")
+        if any(a < ts <= b for a, b in self.dumps):   # after the trigger: the burst that caused the dump is the game's
+            causes.insert(0, "etw_dump")
         if any((s.get("pagefile_pct") or 0) > 60 and (s.get("hard_faults_s") or 0) > 200 for s in win):
             causes.append("pagefile")
         if self.disk_temp.hot(ts):
@@ -202,6 +211,10 @@ def findings(rep, row):
         add("warning", f"{cc['pagefile']} stutterów przy intensywnym czytaniu z pliku wymiany",
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
+    if cc.get("etw_dump", 0) >= 3:
+        add("info", f"{cc['etw_dump']} stutterów w trakcie zapisu nagrania ETW przez PerfMonitor",
+            "Zapis czarnej skrzynki ETW (wpr -stop) obciąża dysk i CPU, więc przycina grę. To koszt pomiaru, nie "
+            "problem gry ani komputera; seria stutterów zapisuje najwyżej jedno nagranie na etw.burst_cooldown_s.")
     sh = rep.get("shader") or {}
     change = {"driver": "sterownika GPU", "game_update": "aktualizacji gry"}.get(sh.get("first_session_after_change"))
     n_sh = cc.get("shader_compile", 0)

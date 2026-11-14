@@ -148,9 +148,11 @@ class ParseTest(unittest.TestCase):
 class BoxTest(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.flags = {}
 
-        def fake_wpr(*args, timeout=0):
+        def fake_wpr(*args, timeout=0, flags=0):
             self.calls.append(args[0])
+            self.flags[args[0]] = flags
             if args[0] == "-stop":
                 with open(args[1], "wb") as f:
                     f.write(b"x" * 1024)
@@ -190,11 +192,40 @@ class BoxTest(unittest.TestCase):
         self.assertFalse(self.box.active)
         self.assertEqual(self.calls, ["-cancel", "-start", "-stop", "-start", "-cancel"])
 
+    def test_dump_runs_below_normal_and_settles(self):
+        self.box.active = True
+        self.box.want = True
+        self.assertTrue(self.box.trigger("user_mark", now=1000.0))
+        self.assertEqual(self.box.quiet_until, float("inf"))         # queued: its stutters are no burst yet
+        self.drain()
+        self.assertEqual(self.calls[-2:], ["-stop", "-start"])
+        self.assertEqual(self.flags["-stop"], etwbox.BELOW_NORMAL_PRIORITY_CLASS)
+        self.assertLess(self.box.quiet_until, time.time() + etwbox.DUMP_SETTLE_S + 1)
+
+    def test_burst_cooldown_and_dump_stutters(self):
+        self.box.active = True
+        p = mock.patch.object(self.box.q, "put")                     # no worker: the dump stays "running"
+        p.start()
+        self.addCleanup(p.stop)
+        for i in range(5):
+            self.box.on_stutter(100.0 + i, 1)
+        self.assertEqual(self.box.last_burst, self.box.last_dump)
+        for i in range(10):                                          # the dump's own stutters
+            self.assertFalse(self.box.on_stutter(110.0 + i, 1))
+        self.assertEqual(self.box.stutters, [])
+        self.box.quiet_until = 0.0
+        later = self.box.last_dump + etwbox.COOLDOWN_S + 1
+        self.assertFalse(self.box.trigger("stutter_burst", now=later))   # burst cooldown, not the 120 s one
+        self.assertTrue(self.box.trigger("dwm_stall", now=later))        # other triggers keep the short one
+        self.assertTrue(self.box.trigger("stutter_burst", now=self.box.last_burst + self.box.s["burst_cooldown_s"]))
+
     def test_burst_and_dpc_triggers(self):
         self.box.active = True
         for i in range(4):
             self.assertFalse(self.box.on_stutter(100.0 + i, 1))
         self.assertTrue(self.box.on_stutter(104.0, 1))
+        self.drain()
+        self.box.active = True                                       # not restarted: the box was never wanted
         self.box.last_dump = 0
         self.assertFalse(self.box.on_sample(200.0, 9.0, 1))
         self.assertFalse(self.box.on_sample(201.0, 3.0, 1))          # dropped below: timer resets
@@ -271,6 +302,20 @@ class RetentionTest(unittest.TestCase):
         status, summ = self.con.execute("SELECT status, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
         self.assertEqual(status, "failed")
         self.assertIn("retencja", json.loads(summ)["error"])
+
+    def test_stutters_during_a_dump_are_tagged(self):
+        from perfmon import diagreport
+        self.con.row_factory = sqlite3.Row
+        self.con.executemany("INSERT INTO etw_captures(ts, trigger, session, status, summary) VALUES (?,?,?,?,?)",
+                             [(1000.0, "stutter_burst", 1, "analyzed", json.dumps({"stop_s": 8.0})),
+                              (2000.0, "user_mark", 1, "failed", "{}")])
+        ext = diagreport.StutterExt(self.con, {"exe": "game.exe", "id": 1, "path": None}, 900, 3000)
+        tags = lambda ts: ext.refine(ts, [], [])
+        self.assertNotIn("etw_dump", tags(1000.0))                   # the burst that triggered it is the game's
+        self.assertIn("etw_dump", tags(1005.0))
+        self.assertIn("etw_dump", tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S))
+        self.assertNotIn("etw_dump", tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S + 1))
+        self.assertIn("etw_dump", tags(2015.0))                      # no stop_s recorded: the default length
 
     def test_settings_merge(self):
         s = etwbox.settings({"etw": {"mode": "always", "triggers": {"dpc_pct": 0}}})

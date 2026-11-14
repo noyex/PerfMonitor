@@ -41,8 +41,9 @@ DEFAULTS = {
     "game_modules": False,
     "game_modules_settle_s": 120,
     "game_modules_poll_s": 600,
-    # ETW black box (perfmon/etwbox.py): kernel trace in memory, dumped on these triggers; mode game|always|off
-    "etw": {"mode": "game", "buffer_mb": 256, "dump_last_s": 60,
+    # ETW black box (perfmon/etwbox.py): kernel trace in memory, dumped on these triggers; mode game|always|off.
+    # A dump (wpr -stop) stutters the game itself, so stutter bursts dump at most once per burst_cooldown_s
+    "etw": {"mode": "game", "buffer_mb": 256, "dump_last_s": 60, "burst_cooldown_s": 1800,
             "triggers": {"dwm_stall": True, "ui_freeze": True, "user_mark": True, "stutter_burst": 5, "dpc_pct": 8},
             "analyze": True, "analyze_during_game": False, "retention_days": 14, "max_gb": 2,
             "analyze_idle_s": 300},   # older unanalysed captures (backlog) only after this long without user input

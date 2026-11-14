@@ -30,6 +30,7 @@ log = logging.getLogger("perfmon.etwbox")
 
 CREATE_NO_WINDOW = 0x08000000
 IDLE_PRIORITY_CLASS = 0x00000040
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 INSTANCE = "PerfMonBox"
 PROFILE = Path(__file__).parent / "etw" / "perfmon.wprp"
 TRACES = config.DATA_DIR / "traces"
@@ -38,6 +39,7 @@ COOLDOWN_S = 120
 ANALYZE_DELAY_S = 30       # let the disk settle after writing the .etl
 RETRY_S = 600              # after a failed wpr -start (no admin, another kernel logger, ...)
 BURST_WINDOW_S = 10
+DUMP_SETTLE_S = 10        # after wpr -stop: stutters until then are the dump's own (disk flush, restart)
 DPC_TRIGGER_S = 2
 MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
 ORPHAN_S = 3600           # a trace file no row points at yet may still be written by wpr -stop
@@ -52,14 +54,14 @@ def settings(cfg):
     return s
 
 
-def _run(args, timeout=180):
+def _run(args, timeout=180, flags=0):
     r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
-                       creationflags=CREATE_NO_WINDOW)
+                       creationflags=CREATE_NO_WINDOW | flags)
     return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
 
 
-def wpr(*args, timeout=180):
-    return _run(["wpr", *args, "-instancename", INSTANCE], timeout)   # -instancename must be the last parameter
+def wpr(*args, timeout=180, flags=0):
+    return _run(["wpr", *args, "-instancename", INSTANCE], timeout, flags)   # -instancename must be the last parameter
 
 
 def profile_copy(buffer_mb):
@@ -109,6 +111,8 @@ class EtwBox:
         self.pending = False        # a sync is queued
         self.failed_until = 0.0
         self.last_dump = 0.0
+        self.last_burst = 0.0
+        self.quiet_until = 0.0      # a dump is queued or running, then DUMP_SETTLE_S: its own stutters are no burst
         self.stutters = []          # recent stutter ts for the burst trigger
         self.dpc_since = None
         self.warned = False
@@ -136,14 +140,19 @@ class EtwBox:
         now = now or time.time()
         if not self.s["triggers"].get(name) or not self.active or now - self.last_dump < COOLDOWN_S:
             return False
+        if name == "stutter_burst":
+            if now - self.last_burst < self.s["burst_cooldown_s"]:
+                return False
+            self.last_burst = now
         self.last_dump = now
+        self.quiet_until = float("inf")
         log.info("ETW capture trigger %s", name)
         self.q.put(("dump", name, session, now))
         return True
 
     def on_stutter(self, ts, session):
         n = self.s["triggers"].get("stutter_burst")
-        if not n:
+        if not n or ts < self.quiet_until:
             return False
         self.stutters = [t for t in self.stutters if ts - t <= BURST_WINDOW_S] + [ts]
         if len(self.stutters) >= int(n):
@@ -186,7 +195,10 @@ class EtwBox:
                         self.active = False
                         log.info("ETW black box stopped")
                 elif cmd[0] == "dump":
-                    self._dump(*cmd[1:])
+                    try:
+                        self._dump(*cmd[1:])
+                    finally:
+                        self.quiet_until = time.time() + DUMP_SETTLE_S
             except Exception:
                 log.exception("etwbox %s", cmd[0])
             finally:
@@ -212,7 +224,8 @@ class EtwBox:
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
         t0 = time.time()
         try:
-            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+            # below normal: the merge and rundown compete with the game for CPU
+            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300, flags=BELOW_NORMAL_PRIORITY_CLASS)
         except (OSError, subprocess.TimeoutExpired) as e:   # still recorded as a failed capture, with the reason
             rc, out = -1, f"{type(e).__name__}: {e}"
         self.active = False
