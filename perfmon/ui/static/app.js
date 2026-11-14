@@ -47,8 +47,34 @@ const status = async () => {
   }
 };
 
+// A newer release shows one button in the dock; the installer it runs (UAC) closes and restarts the app.
+const update = async () => {
+  const btn = document.getElementById("update");
+  let s;
+  try {
+    s = await api("update");
+  } catch {
+    return;
+  }
+  btn.hidden = !s.available;
+  if (!s.available) return;
+  btn.disabled = s.state === "downloading" || s.state === "installing";
+  btn.textContent = s.state === "downloading" ? `Pobieranie ${fmt(s.progress * 100)}%`
+    : s.state === "installing" ? "Instalowanie…" : `Aktualizuj do ${s.available}`;
+  if (s.state === "error" && update.shown !== s.error) toast((update.shown = s.error));
+  if (btn.disabled) setTimeout(update, 1000);
+};
+document.getElementById("update").addEventListener("click", async () => {
+  const r = await fetch("/api/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (!r.ok) toast((await r.json()).error || r.statusText);
+  update.shown = null;
+  update();
+});
+
 window.addEventListener("hashchange", route);
 // uPlot paints its axes on a canvas, which does not repaint when a web font arrives late.
 Promise.all(["400 13px Nohemi", "500 13px Nohemi"].map((f) => document.fonts.load(f))).catch(() => {}).then(route);
 status();
 setInterval(status, 5000);
+update();
+setInterval(update, 6 * 3600 * 1000);

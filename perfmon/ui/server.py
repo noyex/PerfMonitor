@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression
+from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression, updater
 
 STATIC = Path(__file__).parent / "static"
 
@@ -158,7 +158,8 @@ def test_action(con, body):
     raise ValueError("nieznana akcja")
 
 
-POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action}   # the only write endpoints
+POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action,   # the only write endpoints
+         "/api/update": lambda con, body: updater.start_install()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -228,10 +229,12 @@ class Handler(BaseHTTPRequestHandler):
             if not _local_host(self.headers.get("Host", "")):   # DNS rebinding: only 127.0.0.1 / localhost
                 return self._send(403, b'{"error":"forbidden"}', "application/json")
             name = u.path[5:]
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if name == "update":   # GitHub, not the database: works before the first sample too
+                return self._send(200, json.dumps(updater.status(q.get("force") == "1")).encode(), "application/json")
             fn = ROUTES.get(name)
             if not fn:
                 return self._send(404, b'{"error":"not found"}', "application/json")
-            q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if not config.DB_PATH.exists():
                 return self._send(503, b'{"error":"no data yet"}', "application/json")
             con, ver = POOL.get()
