@@ -188,6 +188,12 @@ def cmd_session(con, a):
     out(f"## Sesja #{s['id']} - {s['exe']}  ({r['start']} -> {r['end']}, {r['duration_s'] // 60} min, koniec: {s['end_reason']})")
     kv({"fps_avg": s["fps_avg"], "fps_1low": s["fps_1low"], "fps_01low": s["fps_01low"], "ft_p99_ms": s["ft_p99"],
         "ft_max_ms": s["ft_max"], "sterownik": s.get("gpu_driver"), "wersja gry": s.get("game_version")}, "Podsumowanie")
+    if s.get("frame_gen_pct"):   # the fps_* above count generated frames too
+        kv({"generowane klatki %": s["frame_gen_pct"], "FPS gry (bez generowanych)": s.get("app_fps_avg"),
+            "1% low gry": s.get("app_fps_1low"), "0.1% low gry": s.get("app_fps_01low")}, "Generowanie klatek")
+    if r.get("pacing"):
+        kv({"błąd animacji ms": r["pacing"].get("anim_err_ms"), "rozrzut czasu wyświetlania ms":
+            r["pacing"].get("disp_jitter_ms"), "rozrzut %": r["pacing"].get("disp_jitter_pct")}, "Równość klatek")
     if r["bound_pct"]:
         kv({"GPU-bound %": r["bound_pct"].get("GPU"), "CPU-bound %": r["bound_pct"].get("CPU"),
             "limit %": r["bound_pct"].get("limit")}, "Wąskie gardło")
@@ -203,7 +209,7 @@ def cmd_session(con, a):
             f"pierwsza sesja po zmianie: {sh.get('first_session_after_change') or '-'}")
     st = r["stutters"]
     kv({"liczba": st["count"], "na minutę": st["per_min"], "najgorszy ms": st["worst_ft_ms"],
-        "przyczyny": st["cause_counts"]}, "Stuttery")
+        "przyczyny": st["cause_counts"], "strona (CPU/GPU/prezentacja)": st.get("sides") or None}, "Stuttery")
     if st.get("cause_ranking"):
         out("Przyczyny względem zwykłej rozgrywki (potwierdzona = przy stutterach częściej niż normalnie):")
         table([{"przyczyna": r["tag"], "przy stutterach %": r["stutter_pct"], "zwykle %": r["base_pct"],
@@ -211,8 +217,10 @@ def cmd_session(con, a):
                           "noise": "szum"}[r["verdict"]]}
                for r in st["cause_ranking"] if r["tag"] != "shader_or_unknown"][:8])
     if st["worst"]:
-        table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "causes": ", ".join(w["causes"])
-                + (f" (pm etw show {w['etw_capture']})" if w.get("etw_capture") else "")} for w in st["worst"]])
+        table([{"time": w["time"], "ft_ms": w["ft_ms"], "median_ms": w["median_ms"], "side": w.get("side"),
+                "cpu_ms": w.get("cpu_busy"), "gpu_ms": w.get("gpu_busy"),
+                "causes": ", ".join(w["causes"]) + (f" (pm etw show {w['etw_capture']})" if w.get("etw_capture") else "")}
+               for w in st["worst"]])
     if r.get("crash"):
         c = r["crash"]
         it = c.get("interpretation") or {}
@@ -511,8 +519,11 @@ def cmd_compare(con, a):
         r["versions"] = ", ".join(r["game_versions"])
         r["bottleneck"] = ", ".join(f"{k} {v}%" for k, v in r["bottleneck"].items())
     table(rows, ["exe", "group", "period", "sessions", "minutes", "fps_avg", "fps_avg_delta_pct", "fps_1low",
-                 "fps_1low_delta_pct", "stutters_per_min", "stutters_per_min_delta_pct", "gpu_bound_pct",
-                 "cpu_bound_pct", "limit_pct", "bottleneck", "drivers", "versions"])
+                 "fps_1low_delta_pct", "fps_displayed_avg", "frame_gen_pct", "anim_err_ms", "stutters_per_min",
+                 "stutters_per_min_delta_pct", "gpu_bound_pct", "cpu_bound_pct", "limit_pct", "bottleneck", "drivers",
+                 "versions"])
+    if any(r.get("frame_gen_pct") for r in rows):
+        out("fps_avg / fps_1low liczą tylko klatki gry; fps_displayed_avg z klatkami generowanymi (frame_gen_pct).")
     small = sorted({r["exe"] for r in rows if r.get("small_sample")})
     if small:
         out(f"UWAGA (small_sample): za mało danych dla {', '.join(small)} - grupa ma < {an.SMALL_SAMPLE_MIN} min "

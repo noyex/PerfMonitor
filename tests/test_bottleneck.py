@@ -131,3 +131,46 @@ class AfterOnlyTest(BeforeAfterTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameGenerationTest(unittest.TestCase):
+    """Sessions with frame generation are judged and compared on application frames; old rows still work."""
+
+    def add_fg(self, con, sid, start, minutes=5):
+        add_session(con, sid, start, minutes=minutes, fps=200.0)
+        con.execute("UPDATE frames SET app_frames=100, app_fps=100, app_ft_p99=12, frame_gen_pct=50, anim_err=0.4, "
+                    "disp_ft_sd=0.5 WHERE session=?", (sid,))
+
+    def test_bottleneck_uses_application_frametime(self):
+        con = new_db()
+        add_session(con, 1, 1000.0, minutes=5, bound=None, gpu_load=60.0, fps=200.0)
+        # 2x frame generation: cpu_busy 3 ms of a 10 ms application frame, not of the 5 ms presented one
+        con.execute("UPDATE frames SET app_frames=100, app_fps=100, cpu_busy=4.5, frame_gen_pct=50")
+        self.assertEqual(bottleneck.compute(con, 1, 1000.0, 1300.0)["metrics"]["cpu_bound_pct"], 0.0)
+        con.execute("UPDATE frames SET app_frames=NULL, app_fps=NULL, frame_gen_pct=NULL")   # recorded before
+        self.assertEqual(bottleneck.compute(con, 1, 1000.0, 1300.0)["metrics"]["cpu_bound_pct"], 100.0)
+
+    def test_compare_and_report(self):
+        con = new_db()
+        add_session(con, 1, 1000.0, minutes=5, fps=120.0)                  # old session, no frame generation
+        self.add_fg(con, 2, 5000.0)
+        con.executemany("INSERT INTO stutters(ts, session, ft_ms, median_ms, side, cpu_busy, gpu_busy, generated) "
+                        "VALUES (?,2,50,10,?,?,?,1)", [(5000 + 60 + 20 * i, "cpu", 40.0, 8.0) for i in range(10)])
+        con.execute("INSERT INTO stutters(ts, session, ft_ms, median_ms) VALUES (1100, 1, 60, 8)")   # old row
+        rows = {r["group"]: r for r in an.compare(con, group_by="session")}
+        self.assertEqual(rows["#2"]["fps_avg"], 100.0)
+        self.assertEqual(rows["#2"]["fps_displayed_avg"], 200.0)
+        self.assertEqual(rows["#2"]["frame_gen_pct"], 50.0)
+        self.assertEqual(rows["#1"]["fps_avg"], 120.0)
+        self.assertIsNone(rows["#1"]["frame_gen_pct"])
+        rep = an.session_report(con, 2)
+        st = rep["stutters"]
+        self.assertEqual(st["sides"], {"cpu": 10})
+        self.assertEqual({r["tag"]: r["verdict"] for r in st["side_ranking"]}, {"cpu": "confirmed"})
+        self.assertEqual(st["worst"][0]["side"], "cpu")
+        self.assertEqual(rep["fps_timeline"]["frame_gen_pct"], 50.0)
+        self.assertEqual(rep["pacing"]["anim_err_ms"], 0.4)
+        self.assertTrue(any("CPU" in f["title"] for f in rep["findings"]))
+        old = an.session_report(con, 1)
+        self.assertEqual(old["stutters"]["sides"], {})
+        self.assertIsNone(old["pacing"])
