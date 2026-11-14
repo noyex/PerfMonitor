@@ -5,7 +5,7 @@ Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
 
 from . import analyze as an
-from . import bottleneck, config, crashinfo, diskinfo, disktemp, etwbox, memleak, present, procwatch
+from . import bottleneck, config, crashinfo, diskinfo, disktemp, etwbox, memleak, present, procwatch, resetforensics
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
 VRAM_SHARED_JUMP_MB = 200     # ...or it grows this much within 10 s
@@ -240,6 +240,7 @@ def health_findings(con, rep):
     r = con.execute("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
     for w in diskinfo.health_warnings(an._json(r[0]) if r else {}):
         f.append({"severity": "warning", "title": "Zdrowie dysku", "detail": w})
+    f += resetforensics.findings(rep.get("unclean_shutdowns"))
     if bk.get("disk_health"):
         f.append({"severity": "serious", "title": f"{bk['disk_health']}x pogorszenie zdrowia dysku",
                   "detail": "Przybyło błędów nieskorygowanych lub zużycie nośnika przekroczyło 90% - kopia zapasowa, "

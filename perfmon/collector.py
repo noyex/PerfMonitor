@@ -16,7 +16,7 @@ from pathlib import Path
 import psutil
 
 from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memleak, ocanalyze, ocmon,
-               presentmon, procwatch, shadercache, sysinfo)
+               presentmon, procwatch, resetforensics, shadercache, sysinfo)
 from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
@@ -725,6 +725,12 @@ class Collector:
                         det = {"event_id": ev["event_id"], "provider": ev["provider"], "message": ev["message"][:1500]}
                         if c[0] in ("whea_corrected", "whea_fatal"):
                             det["whea"] = ocmon.parse_whea(ev["message"], self.cfg["apic_ids_per_core"])
+                        if c[0] == "unclean_shutdown":   # stored now: hw_detail behind it is pruned after 30 days
+                            try:
+                                with self.lock:
+                                    det["forensics"] = resetforensics.build(self.con, ev["ts"])
+                            except Exception:
+                                log.exception("reset forensics")
                         iid = self.incident(c[0], c[1], c[2], det, ts=ev["ts"])
                         if c[0] == "bsod" and os.path.exists(crashinfo.CDB):
                             threading.Thread(target=self._bsod_cause, args=(iid, ev["ts"]), daemon=True).start()

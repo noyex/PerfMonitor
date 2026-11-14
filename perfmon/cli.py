@@ -155,6 +155,13 @@ def cmd_health(con, a):
     table([{"time": u["time"], "bugcheck": u.get("bugcheck_code"), "sleep_in_progress": u.get("sleep_in_progress"),
             "power_btn": u.get("power_button_ts"), "notes": "; ".join(u.get("interpretation", [])) or u.get("source"),
             "last_sample": (u.get("last_sample_before") or {}).get("time")} for u in h["unclean_shutdowns"]], maxw=200)
+    fx = [u for u in h["unclean_shutdowns"] if u.get("forensics")]
+    if fx:
+        out("### Ostatnia minuta przed resetem")
+        table([{"time": u["time"], "last_sample": f["last_sample"], "exe": f.get("exe"), "down_s": f.get("down_s"),
+                "frozen_s": f.get("frozen_s_before"), "gpu_w_10s": f["power"].get("gpu_last10_max_w"),
+                "rails": ", ".join(f"{r['label']} {r['min']:.2f}" for r in f["rails"].values()),
+                "notes": " ".join(f["notes"])} for u in fx for f in [u["forensics"]]], maxw=400)
     out("### Powtarzające się crashe / zawieszenia aplikacji")
     table(h["recurring_crashes"], ["app", "kind", "n", "first", "last", "module", "code", "modules", "verdict"], maxw=160)
     out("### Freezy zarejestrowane przez kolektor")
