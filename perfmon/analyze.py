@@ -232,9 +232,10 @@ def overview(con, recent=5):
         live = None
     cur = live or next((r for r in rows if not r["running"] and r.get("frames")), None)
     if live:
-        f = _one(con, "SELECT AVG(CASE WHEN ts>? THEN fps END) AS fps, MAX(ft_max) AS ft_max FROM frames WHERE session=?",
-                 (now - _OVERVIEW_LIVE_S, live["id"]))
-        live["fps_live"], live["ft_max"] = _r(f["fps"]), _r(f["ft_max"])
+        f = _one(con, f"SELECT AVG(CASE WHEN ts>? THEN fps END) AS fps, AVG(CASE WHEN ts>? THEN {framestats.APP_FPS} END) "
+                      "AS app, MAX(ft_max) AS ft_max FROM frames WHERE session=?",
+                 (now - _OVERVIEW_LIVE_S, now - _OVERVIEW_LIVE_S, live["id"]))
+        live["fps_live"], live["app_fps_live"], live["ft_max"] = _r(f["fps"]), _r(f["app"]), _r(f["ft_max"])
     # sessions without frames that ended normally are launchers / short starts, not games played
     played = [r for r in rows if not r["running"] and r is not cur
               and (r.get("frames") or r["end_reason"] != "exit")][:recent]
@@ -299,6 +300,10 @@ def _flatten_session(r, stutters=None, ends=None):
     for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error",
               "app_fps_avg", "app_fps_1low", "app_fps_01low", "frame_gen_pct"):   # app_*: frame generation left out
         d[k] = summ.get(k)
+    fg = (summ.get("present") or {}).get("frame_gen_pct")
+    if d["app_fps_avg"] is None and fg and d["fps_avg"]:
+        # recorded before app_* existed: the native share of all frames is exact for the average, the lows stay unknown
+        d["frame_gen_pct"], d["app_fps_avg"] = fg, round(d["fps_avg"] * (1 - fg / 100), 1)
     ctx = _ctx(r)
     d["context"] = ctx or None
     d["gpu_driver"] = _driver(ctx)
@@ -1387,6 +1392,9 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
         secs = sum(s["_secs"] for s in ss)
         nf = sum(s["fps_avg"] * s["_secs"] for s in ss if s["fps_avg"] and s["_secs"])
         fps = nf / secs if secs else None
+        # displayed FPS weighted by time like fps_avg: a per-session mean lets a short 700 FPS menu run outweigh hours
+        dw = [(s["fps_displayed_avg"], s["_secs"]) for s in ss if s.get("fps_displayed_avg") and s["_secs"]]
+        disp = sum(v * w for v, w in dw) / sum(w for _, w in dw) if dw else None
         lw = [(s["fps_1low"], s["minutes"] or 0) for s in ss if s["fps_1low"]]
         low1 = sum(v * w for v, w in lw) / sum(w for _, w in lw) if lw and sum(w for _, w in lw) else None
 
@@ -1399,7 +1407,7 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
             "exe": e, "group": key, "from": min(s["start_ts"] for s in ss),
             "to": max((s["end_ts"] or s["start_ts"]) for s in ss),
             "sessions": len(ss), "minutes": _r(mins), "fps_avg": _r(fps), "fps_1low": _r(low1),
-            "fps_displayed_avg": mavg("fps_displayed_avg"), "frame_gen_pct": mavg("frame_gen_pct"),
+            "fps_displayed_avg": _r(disp), "frame_gen_pct": mavg("frame_gen_pct"),
             "anim_err_ms": mavg("anim_err_ms"), "disp_jitter_pct": mavg("disp_jitter_pct"),
             "stutters_per_min": _r(sum(s["stutters"] for s in ss) / mins, 2) if mins > 0.5 else None,
             "gpu_bound_pct": _r(100 * sum(s["_g"] for s in ss) / nb) if nb else None,
