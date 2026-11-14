@@ -19,6 +19,16 @@ GPU_BOUND_MIN_PCT = 60        # GPU-bound share of gameplay for the upscaler adv
 BG_CPU_NOT_WORTH_PCT = 5      # all background apps together below this: autostart cleanup is pointless
 GPU_BOUND_NO_CPU_PCT = 90     # above this faster CPU/RAM cannot help
 BAR_OFF_MB = 256              # biggest GPU memory BAR at or below this = Resizable BAR inactive
+COMMIT_EPISODES_MIN = 2       # commit_full episodes in MAIN_GAME_DAYS before the pagefile volume's free space matters
+UNCLEAN_MIN = 2               # hard resets in MAIN_GAME_DAYS that make finding their cause the first item
+WIFI_WARN_MIN = 20            # Wi-Fi driver warnings in MAIN_GAME_DAYS
+WIFI_LINK_PCT = 50            # share of network seconds on Wi-Fi for the driver to matter
+WIFI_PROBLEMS_MIN = 3         # network incidents located at home (Wi-Fi / router) that the warnings could explain
+BALANCED_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"
+GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+# Wi-Fi driver event providers: Intel (Netwtw14, Netwbw02...), Realtek, MediaTek, Qualcomm
+WIFI_PROVIDERS = ("Netwtw%", "Netwbw%", "Netwsw%", "rtwlan%", "RtlWlan%", "mtkwl%", "Qcamain%", "athw%")
+NET_HOME_KINDS = ("net_down", "net_link_down", "packet_loss", "latency_spike", "wifi_weak")
 
 TIER_STABILITY, TIER_NORMAL, TIER_LAST = 0, 1, 2
 GAME_ALIAS = re.compile(r"^(sp|mp|zm)\d*-", re.I)    # sp26-cod.exe and cod.exe are one game
@@ -74,6 +84,24 @@ def _bg_cpu(con, sessions, game_exes):
     return (sum(totals) / n if totals else None), top
 
 
+def _wifi(con, t0):
+    """Wi-Fi driver warnings since t0 and what the network data says about the link (net_s 0 = no network data)."""
+    like = " OR ".join("provider LIKE ?" for _ in WIFI_PROVIDERS)
+    ev = con.execute(f"SELECT provider, event_id, COUNT(*), MAX(message) FROM events WHERE ts>=? AND level<=3 AND ({like}) "
+                     "GROUP BY provider, event_id ORDER BY COUNT(*) DESC LIMIT 1", (t0, *WIFI_PROVIDERS)).fetchone()
+    if not ev:
+        return None
+    links = Counter()
+    for link, n in con.execute("SELECT link, COUNT(*) FROM net_samples WHERE ts>=? GROUP BY link", (t0,)):
+        links[link] += n
+    home = Counter(i["kind"] for i in an.incidents_between(con, t0, time.time(), kinds=NET_HOME_KINDS, limit=100000,
+                                                           group=True)
+                   if i["kind"] == "net_link_down" or (isinstance(i["details"], dict) and i["details"].get("where") == "home"))
+    net_s = sum(links.values())
+    return {"provider": ev[0], "event_id": ev[1], "n": ev[2], "adapter": (ev[3] or "").split("|")[-1].strip() or None,
+            "net_s": net_s, "wifi_pct": round(100 * links["wifi"] / net_s) if net_s else None, "home": dict(home)}
+
+
 def gather(con):
     row = con.execute("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
     info = an._json(row[0]) if row else None
@@ -90,7 +118,8 @@ def gather(con):
         played[s["exe"]] += s["gp"].get("seconds") or 0
     return {"now": time.time(), "info": info or {}, "has_info": bool(info), "game": sessions[0]["exe"] if sessions else None,
             "test_exe": played.most_common(1)[0][0] if played else None,
-            "reports": reports, "health": an.health_overview(con, MAIN_GAME_DAYS), "bg_cpu": cpu, "bg_cpu_top": top}
+            "reports": reports, "health": an.health_overview(con, MAIN_GAME_DAYS), "bg_cpu": cpu, "bg_cpu_top": top,
+            "wifi": _wifi(con, time.time() - MAIN_GAME_DAYS * 86400), "tests": experiments.by_key(con)}
 
 
 # ---------------------------------------------------------------- helpers over the sessions
@@ -150,6 +179,29 @@ def _composed_pct(reports):
         if sh:
             vals.append(sh.get("composed", 0.0))
     return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _pagefile(info):
+    """{letter, free_gb, ram_gb} when the pagefile is auto-managed on a volume with less free space than RAM."""
+    if info.get("pagefile_auto") is not True or not info.get("pagefile"):
+        return None
+    m = re.match(r"\s*([A-Za-z]):", str(info["pagefile"][0]))
+    vol = next((v for v in info.get("volumes") or [] if m and v.get("letter", "").upper() == m.group(1).upper()), None)
+    ram = info.get("ram_total_gb")
+    if not vol or vol.get("free_gb") is None or not ram or vol["free_gb"] >= ram:
+        return None
+    return {"letter": vol["letter"], "free_gb": vol["free_gb"], "ram_gb": ram}
+
+
+def _plural(n, one, few, many):
+    if n == 1:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
+def _plan_guid(info):
+    g = info.get("power_plan_guid") or (GUID_RE.search(info.get("power_plan") or "") or [None])[0]
+    return g.lower() if g else None
 
 
 def _avg(vals):
@@ -255,8 +307,23 @@ def build(d):
     bn = _bottleneck(reports)
     items, not_worth, unknown = [], [], []
 
-    # [fast_startup] hard resets that happened during shutdown/sleep while Fast Startup is on
+    # [unclean_shutdowns] repeated hard resets: finding their cause comes before any tuning
     unclean = health.get("unclean_shutdowns") or []
+    if len(unclean) >= UNCLEAN_MIN:
+        no_bsod = sum(1 for u in unclean if u.get("bugcheck_code") == 0)
+        what = _plural(len(unclean), "nieoczekiwane wyłączenie", "nieoczekiwane wyłączenia", "nieoczekiwanych wyłączeń")
+        items.append(_item(
+            "unclean_shutdowns", "Znajdź przyczynę twardych resetów",
+            f"{len(unclean)} {what} w ostatnich {health.get('days', 14):g} dniach"
+            + (f", {no_bsod} bez blue screena (BugcheckCode=0)" if no_bsod else "")
+            + f"; ostatnie {unclean[-1].get('time') or '?'}. Dopóki komputer się resetuje, pomiary wydajności są mniej warte.",
+            "stabilny komputer i wiarygodne pomiary, jeśli znajdziesz przyczynę", "brak (to diagnoza, nie zmiana ustawień)",
+            "nic do cofania",
+            "Uruchom `pm health`: przy każdym resecie jest kod błędu, stan tuż przed (temperatury, obciążenie) i wnioski. "
+            "Najpierw cofnij ostatnie zmiany UV/OC/EXPO (`pm oc stability`), potem sterowniki i BIOS.",
+            "stability", TIER_STABILITY, 150 + len(unclean)))
+
+    # [fast_startup] hard resets that happened during shutdown/sleep while Fast Startup is on
     during = [u for u in unclean if u.get("during_shutdown")]
     if info.get("fast_startup") == 1 and during:
         items.append(_item(
@@ -357,6 +424,27 @@ def build(d):
                     it["_tier"] = TIER_STABILITY
                 items.append(it)
 
+    # [pagefile_space] auto-managed pagefile on a nearly full volume while commit hits the limit
+    commits = (health.get("incidents_by_kind") or {}).get("commit_full") or 0
+    pf = _pagefile(info)
+    if pf and commits >= COMMIT_EPISODES_MIN and not any(i["key"].startswith("ram") for i in items):
+        # another volume only when every disk is an SSD: a pagefile on a hard drive would make it worse
+        ssd_only = bool(info.get("disks")) and all(x.get("media") == "SSD" for x in info["disks"])
+        other = max((v for v in info.get("volumes") or [] if v.get("letter") != pf["letter"]),
+                    key=lambda v: v.get("free_gb") or 0, default=None) if ssd_only else None
+        items.append(_item(
+            "pagefile_space", f"Zwolnij miejsce na {pf['letter']}: albo ustaw stały plik stronicowania",
+            f"Pamięć zadeklarowana (commit) dochodziła do limitu w {commits} epizodach w ostatnich "
+            f"{health.get('days', 14):g} dniach, a plik stronicowania jest zarządzany automatycznie na {pf['letter']}:, "
+            f"gdzie zostało {pf['free_gb']:g} GB wolnego (mniej niż {pf['ram_gb']:g} GB RAM), więc nie ma gdzie urosnąć.",
+            "mniej zacięć i crashy przy braku pamięci, jeśli to limit commit je powoduje", "zajmuje miejsce na dysku",
+            "wróć do automatycznego rozmiaru pliku stronicowania",
+            f"Zwolnij co najmniej {max(8, round(pf['ram_gb'] - pf['free_gb'])):g} GB na {pf['letter']}: (Ustawienia > System > "
+            "Magazyn > Pliki tymczasowe) albo ustaw plik stronicowania ręcznie: Zaawansowane ustawienia systemu > Wydajność > "
+            "Zaawansowane > Pamięć wirtualna > Zmień: odznacz automatyczne, rozmiar niestandardowy 16384-32768 MB"
+            + (f" na {other['letter']}: ({other['free_gb']:g} GB wolne)" if other else "") + ".",
+            "stability", TIER_STABILITY, 80 + commits))
+
     # [upscaler] GPU-bound: the fastest FPS gain
     gb = bn["gpu_bound_pct"]
     if gb is not None and gb >= GPU_BOUND_MIN_PCT:
@@ -370,6 +458,48 @@ def build(d):
     if gb is not None and gb >= GPU_BOUND_NO_CPU_PCT:
         not_worth.append({"key": "cpu_ram", "title": "Szybsza pamięć, OC procesora, wymiana CPU",
                           "why": f"Gra jest GPU-bound przez {gb:.0f}% czasu; CPU i RAM nie ograniczają FPS."})
+
+    # [power_plan] Balanced: a cheap test, not a promised gain (Zen 4 boosts the same on Balanced most of the time)
+    tested = (d.get("tests") or {}).get("power_plan") or {}
+    if _plan_guid(info) == BALANCED_GUID:
+        if tested.get("status") == "done" and tested.get("verdict") in ("bez zmian", "pogorszyło"):
+            not_worth.append({"key": "power_plan", "title": "Plan zasilania Wysoka wydajność",
+                              "why": f"Test #{tested['id']} ({tested['time']}): {tested['verdict']}."})
+        else:
+            items.append(_item(
+                "power_plan", "Przetestuj plan zasilania Wysoka wydajność",
+                "Aktywny jest plan Zrównoważony. Na tym procesorze różnica bywa żadna albo niewielka (szybsze wybudzanie "
+                "rdzeni), więc to test, nie pewny zysk.", "do sprawdzenia testem przed/po; zwykle mała różnica",
+                "wyższy pobór prądu w spoczynku", "wróć do planu Zrównoważony",
+                "Panel sterowania > Opcje zasilania > Wysoka wydajność, potem `pm test start \"Plan Wysoka wydajność\" "
+                "--key power_plan`, zagraj kilka zwykłych sesji i `pm test stop`.", "fps", score=12))
+
+    # [wifi_driver] driver warnings matter only when the PC plays over Wi-Fi and the network data shows home problems
+    w = d.get("wifi")
+    if w and w["n"] >= WIFI_WARN_MIN:
+        name = f"{w['provider']} (zdarzenie {w['event_id']}, {w['n']}x" + (f", {w['adapter']}" if w["adapter"] else "") + ")"
+        probs = sum(w["home"].values())
+        if not w["net_s"]:
+            unknown.append({"key": "wifi_driver", "title": f"Ostrzeżenia sterownika Wi-Fi: {name}",
+                            "check": "Brak pomiarów sieci: uruchom kolektor z monitorem sieci, potem `pm net`."})
+        elif w["wifi_pct"] < WIFI_LINK_PCT:
+            not_worth.append({"key": "wifi_driver", "title": "Sterownik Wi-Fi",
+                              "why": f"{name}, ale {100 - w['wifi_pct']}% czasu połączenie idzie kablem."})
+        elif probs >= WIFI_PROBLEMS_MIN:
+            items.append(_item(
+                "wifi_driver", "Zaktualizuj sterownik Wi-Fi albo podłącz kabel",
+                f"Sterownik Wi-Fi zgłosił ostrzeżenia {name} w ostatnich {MAIN_GAME_DAYS} dniach; komputer jest na Wi-Fi "
+                f"przez {w['wifi_pct']}% czasu, a problemy sieci po stronie domu: "
+                + ", ".join(f"{k} {v}x" for k, v in sorted(w["home"].items(), key=lambda kv: -kv[1])) + ".",
+                "stabilniejszy ping i mniej utraty pakietów, jeśli to karta Wi-Fi je powoduje", "brak",
+                "przywróć poprzedni sterownik (Menedżer urządzeń > Wycofaj sterownik)",
+                "Zainstaluj najnowszy sterownik karty (dla Intel: Intel Driver & Support Assistant); w Menedżerze urządzeń > "
+                "karta sieciowa > Zarządzanie energią odznacz wyłączanie urządzenia; najlepiej graj po kablu Ethernet.",
+                "latency", score=20 + min(30, 3 * probs)))
+        else:
+            not_worth.append({"key": "wifi_driver", "title": "Sterownik Wi-Fi",
+                              "why": f"{name}, ale pomiary sieci nie pokazują problemów po stronie domu (ping i utrata "
+                                     "pakietów do routera w normie)."})
 
     # [game_dvr]
     if info.get("game_dvr") == 1:
@@ -429,8 +559,9 @@ def build(d):
 
 
 def advise(con):
-    rep = build(gather(con))
-    tests = experiments.by_key(con)
+    d = gather(con)
+    rep = build(d)
+    tests = d["tests"]
     for i in rep["items"]:
         i["test"] = tests.get(i["key"])
     return rep
