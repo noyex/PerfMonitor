@@ -63,8 +63,9 @@ Name: "{autoprograms}\PerfMonitor"; Filename: "{app}\PerfMonitor.exe"
 Name: "{autodesktop}\PerfMonitor"; Filename: "{app}\PerfMonitor.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "winget.exe"; Parameters: "install --exact --id LibreHardwareMonitor.LibreHardwareMonitor --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden skipifdoesntexist
-Filename: "winget.exe"; Parameters: "install --exact --id Intel.PresentMon.Console --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden skipifdoesntexist
+; through cmd: winget is an App Execution Alias found on PATH only (a missing winget just fails this step)
+Filename: "{cmd}"; Parameters: "/c winget install --exact --id LibreHardwareMonitor.LibreHardwareMonitor --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden
+Filename: "{cmd}"; Parameters: "/c winget install --exact --id Intel.PresentMon.Console --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\collector-task.ps1"" -AppDir ""{app}"""; StatusMsg: "{cm:Collector}"; Flags: runhidden
 ; after an update (silent) the UI comes back on its own; after a wizard install it is a checkbox
 Filename: "{app}\PerfMonitor.exe"; Description: "{cm:Launch}"; Flags: nowait postinstall runasoriginaluser skipifsilent

@@ -3,6 +3,7 @@
 The release (packaging, .github/workflows/release.yml) carries PerfMonitor-Setup-<version>.exe and SHA256SUMS.txt.
 The installer runs silently and elevated (one UAC prompt); it stops the collector and the UI, replaces the program
 folder and starts both again. A source checkout is updated with git, so it never offers an update."""
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -21,6 +22,8 @@ log = logging.getLogger(__name__)
 REPO = "noyex/PerfMonitor"
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 CHECK_EVERY_S = 6 * 3600
+RETRY_S = 600   # after a failed check (offline at logon): sooner than CHECK_EVERY_S
+INSTALL_WAIT_S = 180   # the installer closes this process; still alive after this = it was cancelled or failed
 SETUP_RE = re.compile(r"^PerfMonitor-Setup-[\d.]+\.exe$")
 INSTALLER_ARGS = "/SILENT /SUPPRESSMSGBOXES /NORESTART"
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "PerfMonitor-update"
@@ -48,7 +51,8 @@ def latest_release(force=False):
     """The newest published release ({"version", "setup", "sums"} asset URLs), cached for CHECK_EVERY_S.
     None when GitHub cannot be reached or the release has no installer."""
     with _lock:
-        if not force and time.time() - _cache["ts"] < CHECK_EVERY_S:
+        ttl = CHECK_EVERY_S if _cache["release"] else RETRY_S
+        if not force and time.time() - _cache["ts"] < ttl:
             return _cache["release"]
     rel = None
     try:
@@ -91,26 +95,45 @@ def _expected_sha(sums_url, name):
 
 
 def download(rel, dest_dir=DOWNLOAD_DIR):
-    """Downloads the installer to dest_dir and checks its SHA-256; returns its path."""
+    """Downloads the installer to dest_dir; returns its path and the SHA-256 it must have (see open_verified)."""
     expected = _expected_sha(rel["sums"], rel["setup_name"])
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / rel["setup_name"]
     part = path.with_suffix(".part")
-    h = hashlib.sha256()
     with _get(rel["setup"], timeout=60) as r, open(part, "wb") as f:
         total = int(r.headers.get("Content-Length") or rel.get("size") or 0)
         done = 0
         while chunk := r.read(1 << 16):
             f.write(chunk)
-            h.update(chunk)
             done += len(chunk)
             if total:
                 _set(progress=min(done / total, 1.0))
-    if h.hexdigest() != expected:
-        part.unlink(missing_ok=True)
-        raise ValueError("suma kontrolna pobranego instalatora się nie zgadza")
     part.replace(path)
-    return path
+    return path, expected
+
+
+@contextlib.contextmanager
+def open_verified(path, expected):
+    """Holds the installer open so that nothing can modify or replace it (shared for reading only) and checks its
+    SHA-256 through that handle: what runs elevated inside the block is exactly what was verified."""
+    import win32file
+    handle = win32file.CreateFile(str(path), win32file.GENERIC_READ, win32file.FILE_SHARE_READ, None,
+                                  win32file.OPEN_EXISTING, 0, None)
+    try:
+        h = hashlib.sha256()
+        while True:
+            _, chunk = win32file.ReadFile(handle, 1 << 16)
+            if not chunk:
+                break
+            h.update(chunk)
+        ok = h.hexdigest() == expected
+        if ok:
+            yield
+    finally:
+        handle.Close()
+    if not ok:
+        path.unlink(missing_ok=True)
+        raise ValueError("suma kontrolna pobranego instalatora się nie zgadza")
 
 
 def run_installer(path):
@@ -125,9 +148,12 @@ def _install():
         rel = latest_release(force=True)
         if not rel or parse_version(rel["version"]) <= parse_version(__version__):
             raise ValueError("brak nowszej wersji")
-        path = download(rel)
-        _set(state="installing", progress=1.0)
-        run_installer(path)   # the installer closes this process and starts the new version
+        path, expected = download(rel)
+        with open_verified(path, expected):
+            _set(state="installing", progress=1.0)
+            run_installer(path)   # the installer closes this process and starts the new version
+            time.sleep(INSTALL_WAIT_S)
+        _set(state="idle", progress=0.0)   # still here: the installer was cancelled (or failed)
     except Exception as e:
         log.warning("update failed: %s", e)
         _set(state="error", error=str(e))

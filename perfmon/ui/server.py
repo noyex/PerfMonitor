@@ -160,6 +160,7 @@ def test_action(con, body):
 
 POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action,   # the only write endpoints
          "/api/update": lambda con, body: updater.start_install()}
+NO_DB = {"/api/update"}   # POSTs that never touch the database (work before the first sample, never wait on a lock)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -211,11 +212,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("oczekiwano obiektu JSON")
-            con = db.connect()
-            try:
-                res = handler(con, body)
-            finally:
-                con.close()
+            if u.path in NO_DB:
+                res = handler(None, body)
+            else:
+                con = db.connect()
+                try:
+                    res = handler(con, body)
+                finally:
+                    con.close()
             return self._send(200, json.dumps(res).encode(), "application/json")
         except ValueError as e:
             return self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"),

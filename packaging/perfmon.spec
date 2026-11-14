@@ -1,7 +1,8 @@
 # PyInstaller spec: one folder with two executables sharing the runtime.
 #   PerfMonitor.exe  windowed: the UI, and the collector (`PerfMonitor.exe -m perfmon.collector`, see launcher.py)
 #   pm.exe           console: the CLI
-# Build: pyinstaller packaging/perfmon.spec --noconfirm   (from the repository root)
+# Build (from the repository root): python packaging/version_info.py   (writes build/version.txt)
+#                                   pyinstaller packaging/perfmon.spec --noconfirm
 from pathlib import Path
 
 ROOT = Path(SPECPATH).parent

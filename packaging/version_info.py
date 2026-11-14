@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from perfmon import __version__  # noqa: E402
 
-nums = tuple(int(x) for x in __version__.split(".")) + (0,)
+nums = (tuple(int(x) for x in __version__.split(".")) + (0, 0, 0, 0))[:4]   # x.y.z -> (x, y, z, 0)
 out = ROOT / "build" / "version.txt"
 out.parent.mkdir(exist_ok=True)
 out.write_text(f"""VSVersionInfo(

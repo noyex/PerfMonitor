@@ -64,14 +64,27 @@ class UpdaterTest(unittest.TestCase):
         sums = f"{digest}  PerfMonitor-Setup-9.0.0.exe\n".encode()
         tmp = Path(tempfile.mkdtemp())
         with mock.patch.object(updater, "_get", side_effect=[_Resp(sums), _Resp(body)]):
-            return updater.download(rel, tmp), tmp
+            return updater.download(rel, tmp)
 
-    def test_download_checks_sha256(self):
+    def test_download_and_verify_sha256(self):
         body = b"installer"
-        path, _ = self._download(body, hashlib.sha256(body).hexdigest())
+        path, expected = self._download(body, hashlib.sha256(body).hexdigest())
         self.assertEqual(path.read_bytes(), body)
-        with self.assertRaises(ValueError):
-            self._download(body, "0" * 64)
+        with updater.open_verified(path, expected):
+            with self.assertRaises(PermissionError):   # locked against changes while it runs
+                path.write_bytes(b"evil")
+        path, expected = self._download(body, "0" * 64)
+        with self.assertRaises(ValueError), updater.open_verified(path, expected):
+            self.fail("ran an installer whose checksum does not match")
+        self.assertFalse(path.exists())
+
+    def test_failed_check_is_retried_sooner(self):
+        now = updater.time.time()
+        with mock.patch.object(updater, "_get", side_effect=OSError("offline")) as get:
+            updater.latest_release(force=True)
+            with mock.patch.object(updater.time, "time", return_value=now + updater.RETRY_S + 1):
+                updater.latest_release()
+        self.assertEqual(get.call_count, 2)
 
     def test_install_refused_in_source_checkout(self):
         with mock.patch.object(updater.config, "FROZEN", False):

@@ -77,4 +77,4 @@ Promise.all(["400 13px Nohemi", "500 13px Nohemi"].map((f) => document.fonts.loa
 status();
 setInterval(status, 5000);
 update();
-setInterval(update, 6 * 3600 * 1000);
+setInterval(update, 3600 * 1000);   // the server caches the GitHub answer
