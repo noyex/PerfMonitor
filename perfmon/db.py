@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS experiments (        -- pm test: one setting changed,
     result TEXT,                                 -- JSON verdict stored at stop
     notes TEXT
 );
+CREATE TABLE IF NOT EXISTS report_cache (      -- session_report of finished sessions (perfmon/reportcache.py)
+    session INTEGER PRIMARY KEY, ts REAL,        -- ts = session end (retention)
+    key TEXT,                                    -- code version + fingerprint of the session's data
+    report BLOB                                  -- zlib-compressed JSON
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);

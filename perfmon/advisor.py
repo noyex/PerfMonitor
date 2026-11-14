@@ -8,7 +8,7 @@ import time
 from collections import Counter, defaultdict
 
 from . import analyze as an
-from . import config, experiments, present
+from . import experiments, present
 
 MAIN_GAME_DAYS = 14
 RECENT_SESSIONS = 6
@@ -28,7 +28,6 @@ OWN_PROCS = {"python.exe", "pythonw.exe", "powershell.exe", "presentmon.exe", "d
              "audiodg.exe", "lsass.exe", "services.exe", "winlogon.exe", "wmiprvse.exe", "msmpeng.exe", "sihost.exe",
              "taskhostw.exe", "ctfmon.exe", "searchhost.exe", "runtimebroker.exe", "fontdrvhost.exe", "gamingservices.exe",
              "amdrsserv.exe", "explorer.exe", "conhost.exe", "wudfhost.exe", "dllhost.exe", "smss.exe"}
-_REPORTS = {}
 GIGABYTE_RE = re.compile(r"easytune|aorus|^gcc|gigabyte", re.I)
 
 
@@ -75,23 +74,13 @@ def _bg_cpu(con, sessions, game_exes):
     return (sum(totals) / n if totals else None), top
 
 
-def _report(con, s):
-    """Finished sessions never change: the page must not rebuild six full reports on every click."""
-    key = (str(config.DB_PATH), s["id"], s["end_ts"], s["summary"])
-    if key not in _REPORTS:
-        if len(_REPORTS) > 2 * RECENT_SESSIONS:
-            _REPORTS.clear()
-        _REPORTS[key] = an.session_report(con, s["id"])
-    return _REPORTS[key]
-
-
 def gather(con):
     row = con.execute("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
     info = an._json(row[0]) if row else None
     key, sessions = _main_game(con)
     reports = []
     for s in reversed(sessions):
-        rep = _report(con, s)
+        rep = an.session_report(con, s["id"])   # finished sessions come from the report cache
         if "error" not in rep:
             reports.append(rep)
     exes = {s["exe"] for s in sessions}

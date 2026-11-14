@@ -775,7 +775,8 @@ class Collector:
         if now - self.last_retention > 3600:
             self.last_retention = now
             cutoff = now - self.cfg["retention_days"] * 86400
-            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples"):
+            for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples",
+                      "report_cache"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
             with self.lock:
                 etwbox.retention(self.con, self.etw.s, now)

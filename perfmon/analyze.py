@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, episodes, gameplay, marks, stuttercause
+from . import bottleneck, crashinfo, diagreport, episodes, gameplay, marks, reportcache, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -333,6 +333,7 @@ def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=
     return causes
 
 
+@reportcache.cached   # finished sessions: built once, stored in perf.db
 def session_report(con, session_id):
     row = _one(con, "SELECT * FROM sessions WHERE id=?", (int(session_id),))
     if not row:
