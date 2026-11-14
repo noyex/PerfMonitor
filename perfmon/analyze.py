@@ -1442,6 +1442,9 @@ def series(con, t0, t1, cols, max_points=1500):
 
 
 def frame_series(con, t0, t1, session=None, max_points=1500):
+    if t0 is None:   # no range given: the whole session, otherwise the last hour
+        row = con.execute("SELECT MIN(ts) FROM frames WHERE session=?", (int(session),)).fetchone() if session is not None else None
+        t0 = row[0] if row and row[0] is not None else float(t1) - 3600
     t0, t1 = float(t0), float(t1)
     step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
     sel = ",".join(f"{expr} AS {name}" for name, expr in FRAME_AGG.items())

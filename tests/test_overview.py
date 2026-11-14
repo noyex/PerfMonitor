@@ -178,5 +178,16 @@ class OverviewTest(unittest.TestCase):
         self.assertIsNone(an.overview(con)["temps"])
 
 
+class FrameSeriesTest(unittest.TestCase):
+    def test_missing_from_uses_the_session_or_the_last_hour(self):
+        con = new_db()
+        now = time.time()
+        add_open_session(con, 2, now - 7200)   # 120 frames in its first two minutes, two hours ago
+        whole = an.frame_series(con, None, now, session=2, max_points=100)
+        self.assertEqual(sum(1 for v in whole["fps"] if v is not None), len(whole["ts"]))
+        self.assertGreater(len(whole["ts"]), 0)
+        self.assertEqual(an.frame_series(con, None, now)["ts"], [])   # last hour: nothing
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,12 @@ def _f(q, k, default=None):
         return analyze.parse_time(v)
 
 
+def _span(q):
+    """(from, to) of a chart route; a missing "from" means the last hour rather than a TypeError."""
+    t1 = _f(q, "to", time.time())
+    return _f(q, "from", t1 - 3600), t1
+
+
 def _since(q, default="14d"):
     return analyze.parse_time(q.get("since") or default)
 
@@ -29,10 +35,10 @@ def _since(q, default="14d"):
 ROUTES = {
     "latest": lambda con, q: analyze.latest(con),
     "overview": lambda con, q: analyze.overview(con),
-    "series": lambda con, q: analyze.series(con, _f(q, "from"), _f(q, "to", time.time()),
+    "series": lambda con, q: analyze.series(con, *_span(q),
                                             [c for c in q.get("cols", "").split(",") if c],
                                             int(q.get("points", 1500))),
-    "net_series": lambda con, q: analyze.net_series(con, _f(q, "from"), _f(q, "to", time.time()), int(q.get("points", 1500))),
+    "net_series": lambda con, q: analyze.net_series(con, *_span(q), int(q.get("points", 1500))),
     "frames": lambda con, q: analyze.frame_series(con, _f(q, "from"), _f(q, "to", time.time()),
                                                   int(q["session"]) if q.get("session") else None,
                                                   int(q.get("points", 1500))),
@@ -41,7 +47,7 @@ ROUTES = {
     "game_proc": lambda con, q: diagreport.game_series(con, int(q["session"]), int(q.get("points", 1500))),
     "games": lambda con, q: analyze.game_list(con),
     "session": lambda con, q: analyze.session_report(con, int(q["id"])),
-    "range": lambda con, q: analyze.range_report(con, _f(q, "from"), _f(q, "to", time.time())),
+    "range": lambda con, q: analyze.range_report(con, *_span(q)),
     "moment": lambda con, q: analyze.moment(con, _f(q, "ts"), int(q.get("window", 30))),
     "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
     "advise": lambda con, q: advisor.advise(con),
