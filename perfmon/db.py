@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS frames (             -- frame aggregate every 1 s fro
     PRIMARY KEY (session, ts)
 );
 CREATE TABLE IF NOT EXISTS stutters (           -- individual frame stutters
-    ts REAL, session INTEGER, ft_ms REAL, median_ms REAL, causes TEXT
+    ts REAL, session INTEGER, ft_ms REAL, median_ms REAL,   -- application frametime / recent median
+    causes TEXT                                  -- never written: causes are judged per report against a baseline
 );
 CREATE TABLE IF NOT EXISTS procs (              -- top processes every ~5 s
     ts REAL, kind TEXT, name TEXT, pid INTEGER,  -- kind: cpu | mem | io | gpu
@@ -172,6 +173,11 @@ def migrate(con):
                                   "cpu_eff_max": "REAL"})
     add_columns(con, "frames", {"runtime": "TEXT", "sync_interval": "INTEGER", "tearing": "INTEGER", "dropped": "INTEGER",
                                 "click_lat": "REAL", "input_lat": "REAL", "frame_gen_pct": "REAL"})
+    # application frames (frame generation excluded) and frame-level timing, perfmon/framestats.py
+    add_columns(con, "frames", {"app_frames": "INTEGER", "app_fps": "REAL", "app_ft_p99": "REAL", "cpu_wait": "REAL",
+                                "gpu_wait": "REAL", "anim_err": "REAL", "disp_ft_sd": "REAL", "flip_delay": "REAL"})
+    add_columns(con, "stutters", {"cpu_busy": "REAL", "cpu_wait": "REAL", "gpu_busy": "REAL", "gpu_wait": "REAL",
+                                  "generated": "INTEGER", "anim_err": "REAL", "side": "TEXT"})
 
 
 def _columns(con, table, schema="main"):

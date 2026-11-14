@@ -11,6 +11,8 @@ import time
 from array import array
 from collections import Counter, deque
 
+from . import framestats
+
 log = logging.getLogger("perfmon.presentmon")
 
 CREATE_NO_WINDOW = 0x08000000
@@ -110,10 +112,6 @@ class FrameCapture:
         self.session_name = f"PerfMon_{os.getpid()}_{session_id}"
         self.on_second = on_second
         self.on_stutter = on_stutter
-        self.all_ft = array("f")       # all session frametimes (for 1% / 0.1% low)
-        self.recent = deque(maxlen=120)
-        self.bucket = []
-        self.bucket_sec = None
         self.offset = None             # wall_clock - PresentMon relative time
         self.time_unit = None
         self.prev_t = None
@@ -122,15 +120,28 @@ class FrameCapture:
         self.stopped = False
         self.track_frame_type = True
         self.fields = None
-        # whole-capture present stats for summary()["present"] (frame counts and sums)
-        self.p_modes, self.p_runtime, self.p_sync = Counter(), Counter(), Counter()
-        self.p = Counter()
-        self.p_lock = threading.Lock()
         self.proc = None
+        self._init_stats()
         if not self._spawn():
             return
         self.thread = threading.Thread(target=self._run, daemon=True, name=f"pm-{game_exe}")
         self.thread.start()
+
+    def _init_stats(self):
+        self.all_ft = array("f")       # all presented frametimes (displayed FPS, 1% / 0.1% low)
+        self.all_app_ft = array("f")   # application frametimes: generated frames folded into the native one
+        self.recent = deque(maxlen=120)   # recent application frametimes (stutter median)
+        self.bucket = []
+        self.bucket_sec = None
+        self._reset_app()
+        # whole-capture present stats for summary()["present"] / ["pacing"] (frame counts and sums)
+        self.p_modes, self.p_runtime, self.p_sync = Counter(), Counter(), Counter()
+        self.p = Counter()
+        self.p_lock = threading.Lock()
+
+    def _reset_app(self):
+        self.acc = self.acc_max = 0.0  # present intervals since the last application frame / longest of them
+        self.acc_max_gen = None        # whether that longest interval ended on a generated frame
 
     def _args(self):
         if self.names:
@@ -168,7 +179,9 @@ class FrameCapture:
             pass
 
     def _row_time(self, row, ft):
-        t = _f(row, "CPUStartTime", "TimeInSeconds", "CPUStartQPCTime")
+        # 2.x TimeInMs = Present() start, written for every row. Not CPUStartTimeInMs: that is the app's frame start,
+        # which generated frames do not have. Without a match every row took its arrival time (batches of rows).
+        t = _f(row, "CPUStartTime", "TimeInSeconds", "TimeInMs", "CPUStartQPCTime")
         if t is None:
             return time.time()
         if self.time_unit is None and self.prev_t is not None and ft:
@@ -194,6 +207,7 @@ class FrameCapture:
                 self.retarget_pending = False
                 self._flush()
                 self.offset = self.prev_t = self.time_unit = None   # PresentMon time restarts with the new trace
+                self._reset_app()
                 log.info("PresentMon retarget -> %s", self.names)
                 if self._spawn():
                     continue
@@ -228,8 +242,11 @@ class FrameCapture:
                 ts = self._row_time(row, ft)
                 frame = self._frame(row, ft)
                 self.all_ft.append(ft)
-                self._stutter_check(ts, ft)
-                self.recent.append(ft)
+                self._app_frame(frame)
+                if frame["app_ft"] is not None:
+                    self.all_app_ft.append(frame["app_ft"])
+                    self._stutter_check(ts, frame)
+                    self.recent.append(frame["app_ft"])
                 sec = int(ts)
                 if self.bucket_sec is None:
                     self.bucket_sec = sec
@@ -241,18 +258,35 @@ class FrameCapture:
             log.warning("PresentMon read: %s", e)
 
     def _frame(self, row, ft):
-        """Per-frame fields; a column this PresentMon version does not write stays None."""
+        """Per-frame fields; a column this PresentMon version does not write stays None.
+
+        Column names: 2.0 beta (CPUBusy, DisplayedTime...), 2.x console (MsCPUBusy, MsUntilDisplayed...), 1.x
+        (MsGPUActive, Dropped). 2.x writes the CPU columns of generated frames as 0 instead of NA, so CPU/GPU timing
+        is read from application frames only."""
         f = self.fields
+        ftype = row.get("FrameType") if "FrameType" in f else None
+        gen = ftype is not None and ftype not in NATIVE_FRAME_TYPES
         displayed = None
-        if "DisplayedTime" in f:   # v2: NA / 0 = the frame never reached the screen
+        if "DisplayedTime" in f:       # 2.0 beta: NA / 0 = the frame never reached the screen
             displayed = (_f(row, "DisplayedTime") or 0) > 0
-        elif "Dropped" in f:       # v1
+        elif "MsUntilDisplayed" in f:  # 2.x writes NA when the frame's display time is 0 = it was never shown
+            displayed = (_f(row, "MsUntilDisplayed") or 0) > 0
+        elif "Dropped" in f:           # 1.x
             displayed = _f(row, "Dropped") != 1
         sync, tear = _f(row, "SyncInterval"), _f(row, "AllowsTearing")
+        app = (lambda *n: None) if gen else (lambda *n: _f(row, *n))
+        ae = _f(row, "AnimationError", "MsAnimationError")
         return dict(
-            ft=ft,
-            cpu=_f(row, "CPUBusy", "MsCPUBusy"),
-            gpu=_f(row, "GPUBusy", "MsGPUActive", "GPUTime"),
+            ft=ft, gen=gen,
+            cpu=app("CPUBusy", "MsCPUBusy"),
+            cpu_wait=app("CPUWait", "MsCPUWait"),
+            # MsGPUTime is busy + wait; 1.x MsGPUActive / GPUTime are busy time
+            gpu=app("GPUBusy", "MsGPUBusy", "MsGPUActive", "GPUTime"),
+            gpu_wait=app("GPUWait", "MsGPUWait"),
+            anim_err=abs(ae) if ae is not None else None,
+            # 2.0 beta DisplayedTime = how long this frame stayed on screen, 2.x MsBetweenDisplayChange the same
+            disp_ft=_f(row, "DisplayedTime", "MsBetweenDisplayChange") if displayed else None,
+            flip_delay=_f(row, "FlipDelay", "MsFlipDelay"),
             disp=_f(row, "DisplayLatency", "MsUntilDisplayed"),
             mode=row.get("PresentMode") or "",
             runtime=_s(row, "PresentRuntime", "Runtime"),
@@ -261,15 +295,39 @@ class FrameCapture:
             displayed=displayed,
             click=_f(row, "ClickToPhotonLatency", "MsClickToPhotonLatency"),
             input=_f(row, "AllInputToPhotonLatency", "MsAllInputToPhotonLatency"),
-            ftype=row.get("FrameType") if "FrameType" in f else None,
+            ftype=ftype,
         )
 
-    def _stutter_check(self, ts, ft):
+    def _app_frame(self, frame):
+        """Fold generated frames into the next application frame: frame["app_ft"] = time since the previous
+        application frame's Present(), None on a generated frame.
+
+        MsBetweenPresents of a generated row is its own present-to-present interval (in the live DB the row
+        intervals of frame-generation seconds add up to wall time, as without it), so the sum of the intervals since
+        the last native row is the application frametime, whichever order the driver presents the generated and the
+        real frame in. MsBetweenAppStart is not used: 2.x writes it as 0 on generated rows and 1.x lacks it.
+        Without frame type data every frame is an application frame."""
+        self.acc += frame["ft"]
+        if frame["ft"] > self.acc_max:
+            self.acc_max, self.acc_max_gen = frame["ft"], frame["gen"] if frame["ftype"] is not None else None
+        if frame["gen"]:
+            frame["app_ft"] = frame["gap_gen"] = None
+            return
+        frame["app_ft"], frame["gap_gen"] = self.acc, self.acc_max_gen
+        self._reset_app()
+
+    def _stutter_check(self, ts, frame):
+        """Stutters on application frames: generated frames shown inside a hitch must not split it in two."""
         if len(self.recent) < 30:
             return
+        ft = frame["app_ft"]
         med = statistics.median(self.recent)
         if ft > 25 and ft > 2.5 * med and ft - med > 12:
-            self.on_stutter(dict(ts=ts, session=self.session_id, ft_ms=ft, median_ms=med))
+            ctx = dict(cpu_busy=frame["cpu"], cpu_wait=frame["cpu_wait"], gpu_busy=frame["gpu"],
+                       gpu_wait=frame["gpu_wait"], anim_err=frame["anim_err"],
+                       generated=None if frame["gap_gen"] is None else int(frame["gap_gen"]))
+            self.on_stutter(dict(ts=ts, session=self.session_id, ft_ms=ft, median_ms=med,
+                                 side=framestats.stutter_side(ft, frame["cpu"], frame["gpu"]), **ctx))
 
     def _flush(self):
         b = self.bucket
@@ -278,18 +336,20 @@ class FrameCapture:
             return
         fts = sorted(f["ft"] for f in b)
         total = sum(fts)
-        avg = lambda k: (sum(f[k] for f in b if f[k] is not None) / max(1, sum(1 for f in b if f[k] is not None))) if any(f[k] is not None for f in b) else None
+        avg = lambda k: _avg(f[k] for f in b)
         ft_avg = total / len(fts)
+        app = sorted(f["app_ft"] for f in b if f["app_ft"] is not None)
+        app_total = sum(app)
         cpu, gpu = avg("cpu"), avg("gpu")
-        bound = None
-        if gpu is not None and cpu is not None and ft_avg > 0:
-            if gpu >= 0.85 * ft_avg:
-                bound = "GPU"
-            elif cpu >= 0.85 * ft_avg:
-                bound = "CPU"
-            else:
-                bound = "limit"  # neither CPU nor GPU is busy the full time: FPS limit / vsync / waiting
+        # busy times belong to application frames, so they are judged against the application frametime
+        # (with 2x frame generation the displayed one is half of it)
+        bound = framestats.bound(app_total / len(app) if app else None, cpu, gpu)
+        disp_ft = [f["disp_ft"] for f in b if f["disp_ft"] is not None]
+        disp_sd = statistics.pstdev(disp_ft) if len(disp_ft) >= 2 else None
+        anim = [f["anim_err"] for f in b if f["anim_err"] is not None]
         disp = [f["displayed"] for f in b if f["displayed"] is not None]
+        if disp and not any(disp):
+            disp = []   # frames but not one shown in a whole second = no display tracking, not 100% dropped
         typed = [f["ftype"] for f in b if f["ftype"] is not None]
         gen = sum(1 for t in typed if t not in NATIVE_FRAME_TYPES)
         clicks = [f["click"] for f in b if f["click"] is not None]
@@ -305,6 +365,9 @@ class FrameCapture:
             tearing=_mode(tear), dropped=sum(1 for d in disp if not d) if disp else None,
             click_lat=_avg(clicks), input_lat=_avg(inputs),
             frame_gen_pct=100.0 * gen / len(typed) if typed else None,
+            app_frames=len(app), app_fps=1000.0 * len(app) / app_total if app_total else None,
+            app_ft_p99=percentile(app, 0.99), cpu_wait=avg("cpu_wait"), gpu_wait=avg("gpu_wait"),
+            anim_err=_avg(anim), disp_ft_sd=disp_sd, flip_delay=avg("flip_delay"),
         ))
         with self.p_lock:   # summary() reads these from the collector thread
             self.p_modes.update(f["mode"] for f in b if f["mode"])
@@ -313,8 +376,12 @@ class FrameCapture:
             for k, v in (("tear_n", len(tear)), ("tearing", sum(tear)), ("disp_n", len(disp)),
                          ("dropped", sum(1 for d in disp if not d)), ("typed", len(typed)), ("gen", gen),
                          ("click_n", len(clicks)), ("click", sum(clicks)), ("input_n", len(inputs)),
-                         ("input", sum(inputs))):
+                         ("input", sum(inputs)), ("anim_n", len(anim)), ("anim", sum(anim))):
                 self.p[k] += v
+            if disp_sd is not None:   # frame-weighted per-second jitter of the displayed frametime
+                self.p["jit_n"] += len(disp_ft)
+                self.p["jit"] += disp_sd * len(disp_ft)
+                self.p["jit_ft"] += sum(disp_ft)
 
     def present_summary(self):
         """How the game presented over the whole capture (frame-weighted)."""
@@ -337,13 +404,27 @@ class FrameCapture:
         }
 
     def summary(self) -> dict:
+        """fps_* = presented frames as overlays count them, app_fps_* = application frames only. They differ only
+        with frame generation, where app_fps_* is what to judge (gameplay, compare and stutters use it)."""
         fts = sorted(self.all_ft)
         if not fts:
             return {"frames": 0, "error": self.error}
         n = len(fts)
         total = sum(fts)
         p99, p999 = percentile(fts, 0.99), percentile(fts, 0.999)
+        app = sorted(self.all_app_ft)
+        a99, a999 = percentile(app, 0.99), percentile(app, 0.999)
+        present = self.present_summary()
+        with self.p_lock:
+            p = dict(self.p)
         return {
+            "app_frames": len(app),
+            "app_fps_avg": round(1000 * len(app) / sum(app), 1) if app else None,
+            "app_fps_1low": round(1000 / a99, 1) if a99 else None,
+            "app_fps_01low": round(1000 / a999, 1) if a999 else None,
+            "frame_gen_pct": (present or {}).get("frame_gen_pct"),
+            "pacing": framestats.pacing(p.get("anim", 0), p.get("anim_n", 0), p.get("jit", 0), p.get("jit_ft", 0),
+                                        p.get("jit_n", 0)),
             "frames": n,
             "fps_avg": round(1000 * n / total, 1),
             "fps_1low": round(1000 / p99, 1) if p99 else None,

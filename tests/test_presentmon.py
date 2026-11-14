@@ -1,11 +1,8 @@
 import io
 import time
 import sqlite3
-import threading
 import unittest
 from unittest import mock
-from collections import Counter, deque
-from array import array
 
 from perfmon import db, present
 from perfmon import presentmon as pmn
@@ -19,6 +16,27 @@ def v2_row(t_ms, ft, mode="Hardware: Independent Flip", ftype="Application", dis
            tearing=1, sync=0):
     return (f"game.exe,1,0x1,DXGI,{sync},512,{tearing},{mode},{ftype},{t_ms},{ft},{ft * 0.6},0.1,1,{ft * 0.9},"
             f"{ft * 0.9},0,12,{displayed},0,0,{click},NA")
+
+
+# exactly what the installed PresentMon 2.6 writes (data/collector.log)
+PM26_HEADER = ("Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,"
+               "PresentMode,FrameType,TimeInMs,MsBetweenSimulationStart,MsBetweenPresents,MsBetweenDisplayChange,"
+               "MsInPresentAPI,MsRenderPresentLatency,MsUntilDisplayed,CPUStartTimeInMs,MsBetweenAppStart,MsCPUBusy,"
+               "MsCPUWait,MsGPULatency,MsGPUTime,MsGPUBusy,MsGPUWait,MsAnimationError,AnimationTime,MsFlipDelay,"
+               "MsAllInputToPhotonLatency,MsClickToPhotonLatency")
+
+
+def pm26_row(t_ms, ft, cpu, gpu, ftype="Application", until="8.5", disp_ft=None, anim="-0.5"):
+    """One 2.6 row; generated frames get 0 CPU/GPU timing, as PresentMon 2.x writes them."""
+    gen = ftype not in ("Application", "NotSet")
+    c, g = (0, 0) if gen else (cpu, gpu)
+    disp = "NA" if until == "NA" else (disp_ft if disp_ft is not None else ft)
+    return (f"cod.exe,1,0x1,DXGI,0,512,1,Hardware: Independent Flip,{ftype},{t_ms},{ft},{ft},{disp},0.2,9,"
+            f"{until},{t_ms - c},{0 if gen else ft},{c},{max(0, ft - c)},1,{g + 0.5},{g},0.5,{anim},{t_ms},0.1,NA,NA")
+
+
+def pm26_csv(rows):
+    return FakeProc(PM26_HEADER + "\n" + "\n".join(rows) + "\n")
 
 
 class FakeProc:
@@ -42,10 +60,9 @@ def capture():
     c = object.__new__(pmn.FrameCapture)
     c.session_id, c.seconds, c.stutters = 1, [], []
     c.on_second, c.on_stutter = c.seconds.append, c.stutters.append
-    c.all_ft, c.recent, c.bucket, c.bucket_sec = array("f"), deque(maxlen=120), [], None
+    c._init_stats()
     c.offset = c.time_unit = c.prev_t = c.error = c.fields = None
     c.lines, c.stopped, c.track_frame_type = 0, False, True
-    c.p_modes, c.p_runtime, c.p_sync, c.p, c.p_lock = Counter(), Counter(), Counter(), Counter(), threading.Lock()
     c.started = 0
     c.retarget_pending, c.session_name = False, "PerfMon_1_1"
     c.game_exe, c.pid, c.names = "cod.exe", 1, []
@@ -152,6 +169,91 @@ class PresentMonParseTest(unittest.TestCase):
         c.proc = FakeProc("", rc=1)
         c.stopped = True
         c._run()
+
+
+class PresentMon26Test(unittest.TestCase):
+    """Replays rows in the installed PresentMon 2.6 format through the parser and the per-second aggregation."""
+
+    def run_rows(self, rows):
+        c = capture()
+        c.offset = 1000.0   # anchored: a replay arrives at once, live rows arrive as they happen
+        c._read(pm26_csv(rows))
+        c._flush()
+        return c
+
+    def test_native_gpu_bound_seconds(self):
+        rows = [pm26_row(i * 10.0, 10.0, cpu=6.0, gpu=9.5) for i in range(250)]   # 2.5 s at 100 fps
+        rows[3] = pm26_row(30.0, 10.0, cpu=6.0, gpu=9.5, until="NA")             # never shown
+        c = self.run_rows(rows)
+        self.assertEqual([s["frames"] for s in c.seconds], [100, 100, 50])   # TimeInMs places rows, not arrival
+        sec = c.seconds[0]
+        self.assertEqual(sec["bound"], "GPU")
+        self.assertAlmostEqual(sec["gpu_busy"], 9.5)
+        self.assertAlmostEqual(sec["cpu_busy"], 6.0)
+        self.assertAlmostEqual(sec["cpu_wait"], 4.0)
+        self.assertAlmostEqual(sec["gpu_wait"], 0.5)
+        self.assertEqual(sec["dropped"], 1)
+        self.assertEqual(sec["app_frames"], 100)
+        self.assertAlmostEqual(sec["app_fps"], sec["fps"])
+        self.assertAlmostEqual(sec["anim_err"], 0.5)
+        self.assertAlmostEqual(sec["disp_ft_sd"], 0.0)
+        self.assertAlmostEqual(sec["flip_delay"], 0.1)
+        summ = c.summary()
+        self.assertEqual(summ["app_fps_avg"], summ["fps_avg"])
+        self.assertIsNone(summ["frame_gen_pct"] or None)
+        self.assertEqual(summ["pacing"]["anim_err_ms"], 0.5)
+        self.assertEqual(c.stutters, [])
+
+    def test_frame_generation_counts_application_frames(self):
+        # AFMF 2x: 200 presented frames/s, 100 rendered by the game; CPU and GPU busy 6 ms of a 10 ms app frame
+        rows = [pm26_row(i * 5.0, 5.0, cpu=6.0, gpu=6.0, ftype="Application" if i % 2 else "AMD_AFMF")
+                for i in range(400)]
+        c = self.run_rows(rows)
+        sec = c.seconds[0]
+        self.assertAlmostEqual(sec["fps"], 200.0)
+        self.assertAlmostEqual(sec["app_fps"], 100.0)
+        self.assertEqual(sec["app_frames"], 100)
+        self.assertAlmostEqual(sec["frame_gen_pct"], 50.0)
+        self.assertAlmostEqual(sec["cpu_busy"], 6.0)    # the generated rows' zeros are not averaged in
+        self.assertEqual(sec["bound"], "limit")         # 6 of 10 ms; against the 5 ms displayed frame it read GPU
+        summ = c.summary()
+        self.assertEqual(summ["fps_avg"], 200.0)
+        self.assertEqual(summ["app_fps_avg"], 100.0)
+        self.assertEqual(summ["frame_gen_pct"], 50.0)
+
+    def test_stutter_on_application_frame_with_context(self):
+        rows, t = [], 0.0
+        for i in range(200):
+            gen = i % 2 == 1
+            ft = 5.0
+            if i == 151:          # the game is 40 ms late: the generated frame waits for it
+                ft = 45.0
+            t += ft
+            rows.append(pm26_row(t, ft, cpu=38.0 if i == 152 else 4.0, gpu=4.0,
+                                 ftype="AMD_AFMF" if gen else "Application"))
+        c = self.run_rows(rows)
+        self.assertEqual(len(c.stutters), 1)
+        st = c.stutters[0]
+        self.assertAlmostEqual(st["ft_ms"], 50.0)        # 45 ms gap + 5 ms: one application frame
+        self.assertAlmostEqual(st["median_ms"], 10.0)
+        self.assertEqual(st["generated"], 1)
+        self.assertEqual(st["side"], "cpu")
+        self.assertAlmostEqual(st["cpu_busy"], 38.0)
+        self.assertAlmostEqual(st["anim_err"], 0.5)
+
+    def test_presentation_side_stutter(self):
+        rows, t = [], 0.0
+        for i in range(100):
+            ft = 60.0 if i == 80 else 10.0
+            t += ft
+            rows.append(pm26_row(t, ft, cpu=5.0, gpu=5.0))
+        c = self.run_rows(rows)
+        self.assertEqual([s["side"] for s in c.stutters], ["present"])
+        self.assertEqual(c.stutters[0]["generated"], 0)
+
+    def test_no_display_tracking_is_not_all_dropped(self):
+        c = self.run_rows([pm26_row(i * 10.0, 10.0, cpu=5, gpu=5, until="NA") for i in range(50)])
+        self.assertIsNone(c.seconds[0]["dropped"])
 
 
 class PresentAnalysisTest(unittest.TestCase):

@@ -571,8 +571,9 @@ class Collector:
                   [r[c] for c in cols])
 
     def on_stutter(self, s):
-        self.exec("INSERT INTO stutters(ts, session, ft_ms, median_ms) VALUES (?,?,?,?)",
-                  (s["ts"], s["session"], s["ft_ms"], s["median_ms"]))
+        cols = [c for c in ("ts", "session", "ft_ms", "median_ms", "cpu_busy", "cpu_wait", "gpu_busy", "gpu_wait",
+                            "generated", "anim_err", "side") if c in s]
+        self.exec(f"INSERT INTO stutters({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", [s[c] for c in cols])
         self.etw.on_stutter(s["ts"], s["session"])
 
     def save_summary(self, g, final=False):
