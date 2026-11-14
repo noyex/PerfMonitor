@@ -255,7 +255,41 @@ def cmd_session(con, a):
         out("### Zdarzenia Windows w trakcie sesji")
         table(r["events"], ["time", "provider", "event_id", "level", "message"])
     print_marks(r.get("marks"))
+    print_config(r.get("config"))
     findings(r["findings"])
+
+
+def print_config(c):
+    """Settings in effect for the session and what changed vs the previous session of the game."""
+    if not c:
+        return
+    out("### Ustawienia w tej sesji")
+    gs = c.get("game_settings")
+    if gs:
+        out("Gra: " + ", ".join(f"{k}={cell(v)}" for k, v in gs.items() if v is not None))
+    elif c.get("game_settings_error"):
+        out(f"Gra: {c['game_settings_error']}")
+    amd = c.get("amd") or {}
+    if amd and "error" not in amd:
+        fs = ", ".join(f"{f['name']} {'wł.' if f.get('gaming') else 'wył.'}" for f in amd.get("freesync") or [])
+        out("Adrenalin (globalnie): " + ", ".join(f"{k}={cell(amd.get(k))}" for k in
+            ("anti_lag", "chill", "boost", "afmf", "rsr", "frtc", "vsync")) + (f"; FreeSync {fs}" if fs else ""))
+    for m in ((c.get("modules") or {}).get("procs") or {}).items():
+        name, scan = m
+        if scan.get("status") == "ok":
+            out(f"Moduły {name}: {scan['count']} DLL; oznaczone: " + (", ".join(f["name"] for f in scan["flagged"]) or "brak"))
+        else:
+            out(f"Moduły {name}: nieznane ({scan.get('reason')})")
+    ch = c.get("changes") or {}
+    texts = (ch.get("context") or []) + (ch.get("game") or []) + (ch.get("system") or [])
+    if ch.get("game_raw_changed") and not ch.get("game"):
+        texts.append(f"plik ustawień gry: {ch['game_raw_changed']} zmienionych kluczy")
+    if c.get("previous_session"):
+        out(f"Zmiany od sesji #{c['previous_session']}: " + ("; ".join(texts) if texts else "brak wykrytych"))
+    for e in c.get("mid_session") or []:
+        out(f"- {an.fmt_ts(e['ts'])} zmiana ustawień gry: " + ("; ".join(e.get("changes") or []) or f"{e.get('raw_changed')} kluczy"))
+    for e in c.get("modules_changes") or []:
+        out(f"- {an.fmt_ts(e['ts'])} moduły: " + "; ".join(e["changes"]))
 
 
 def print_marks(ms):
@@ -513,6 +547,11 @@ def cmd_compare(con, a):
     table(rows, ["exe", "group", "period", "sessions", "minutes", "fps_avg", "fps_avg_delta_pct", "fps_1low",
                  "fps_1low_delta_pct", "stutters_per_min", "stutters_per_min_delta_pct", "gpu_bound_pct",
                  "cpu_bound_pct", "limit_pct", "bottleneck", "drivers", "versions"])
+    for r in rows:
+        if r.get("changes"):
+            out(f"- {r['exe']} {r['group']}: zmiany względem poprzedniej grupy: " + "; ".join(r["changes"]))
+        if r.get("settings_mixed"):
+            out(f"- {r['exe']} {r['group']}: grupa łączy sesje z różnymi ustawieniami gry")
     small = sorted({r["exe"] for r in rows if r.get("small_sample")})
     if small:
         out(f"UWAGA (small_sample): za mało danych dla {', '.join(small)} - grupa ma < {an.SMALL_SAMPLE_MIN} min "
