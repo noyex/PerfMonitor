@@ -34,7 +34,12 @@ Pages.games = (() => {
     const on = (v) => (v === true ? "wł." : v === false || v === "off" ? "wył." : v);
     return GS.filter(([k]) => g[k] != null && g[k] !== "").map(([k, l]) => (l ? `${l} ${on(g[k])}` : on(g[k]))).join(" · ") || null;
   };
-  const overlays = (m) => (m && m.status === "ok" && (m.flagged || []).length ? m.flagged.map((x) => x.name).join(", ") : null);
+  // summary.modules = {ts, procs: {exe: scan}}; only readable scans count (a protected game is "unknown", not "none")
+  const overlays = (m) => {
+    const names = Object.values((m && m.procs) || {}).filter((x) => x && x.status === "ok")
+      .flatMap((x) => (x.flagged || []).filter((f) => f.category !== "anticheat").map((f) => f.name));
+    return names.length ? [...new Set(names)].join(", ") : null;
+  };
 
   const tile = (label, value, unit, meta) =>
     h("div", { class: "tile" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value, unit ? h("small", {}, unit) : null), h("div", { class: "meta" }, meta || ""));

@@ -59,6 +59,13 @@ class GroupTest(unittest.TestCase):
         g = episodes.group(rows)
         self.assertEqual([(x["id"], x["count"], x["ts"], x["end_ts"]) for x in g], [(1, 3, 0, 80), (4, 1, 1000, 1001)])
 
+    def test_latest_row_decides_whether_the_episode_is_open(self):
+        dead = dict(row(1, 0), end_ts=None)   # left open by a collector that died
+        g = episodes.group([dead, row(2, 5, end=9)])
+        self.assertEqual((g[0]["count"], g[0]["end_ts"]), (2, 9))
+        g = episodes.group([row(1, 0, end=1), dict(row(2, 5), end_ts=None)])
+        self.assertIsNone(g[0]["end_ts"])
+
     def test_other_kinds_pass_through(self):
         rows = [row(1, 0, kind="app_crash"), row(2, 1, kind="app_crash")]
         self.assertEqual([x["count"] for x in episodes.group(rows)], [1, 1])

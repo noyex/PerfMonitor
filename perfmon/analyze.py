@@ -1160,9 +1160,6 @@ def health_overview(con, days=14):
         c["app"] = c["title"].split(":", 1)[-1].strip()
     crashinfo.annotate_recurring(con, crashes, t0)
     cfg = incidents_between(con, t0, time.time(), kinds="config_change")
-    for c in cfg:
-        d = c.get("details")
-        c["changed"] = list(d.keys()) if isinstance(d, dict) else None
     freezes = [e for e in eps if e["kind"] in ("ui_freeze", "dwm_stall", "app_not_responding")]
     cov = _one(con, "SELECT MIN(ts) AS first, MAX(ts) AS last, COUNT(*) AS n FROM samples")
     rep = {
@@ -1328,10 +1325,11 @@ def _session_metrics(con, exe=None, since=None):
             "usable": gp.get("usable", True) if gp else True,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            # rows recorded before the PresentMon 2.x columns were parsed have no `bound`: shares from summary.bottleneck
-            "_g": (x["g"] or 0 if x else 0) or (bn.get("gpu_bound_pct") or 0) * minutes,
-            "_c": (x["c"] or 0 if x else 0) or (bn.get("cpu_bound_pct") or 0) * minutes,
-            "_l": (x["l"] or 0 if x else 0) or (bn.get("limit_pct") or 0) * minutes,
+            # bound seconds; a session whose rows carry no `bound` (recorded before the PresentMon 2.x columns were
+            # parsed) gets them from summary.bottleneck's shares, in seconds too, so sessions add up in one unit
+            **({"_g": x["g"] or 0, "_c": x["c"] or 0, "_l": x["l"] or 0} if x and (x["g"] or x["c"] or x["l"]) else
+               {"_g": (bn.get("gpu_bound_pct") or 0) * minutes * 0.6, "_c": (bn.get("cpu_bound_pct") or 0) * minutes * 0.6,
+                "_l": (bn.get("limit_pct") or 0) * minutes * 0.6}),
             "_n": x["n"] if x else 0,
             "_secs": x["secs"] if x else 0, **ext.get(r["id"], {}),
         })

@@ -383,7 +383,7 @@ class Collector:
         self._ongoing("ui_freeze", r["ui_ms"] >= FREEZE_MS, "critical",
                       "Pulpit (explorer) przestał odpowiadać", r, ctx)
         # a stall nobody sees (display asleep while the user is away) is not a freeze: see perfmon/episodes.py
-        stall = r["dwm_ms"] >= FREEZE_MS and dwm_visible(r["user_idle_s"], r["game_session"])
+        stall = r["dwm_ms"] >= FREEZE_MS and dwm_visible(r["user_idle_s"], bool(self.games))   # stress/idle soak: not a game
         self._ongoing("dwm_stall", stall, "critical",
                       "Kompozytor okien (DWM) się zaciął – obraz zamrożony", r, ctx)
         self._ongoing("app_not_responding", bool(r["fg_hung"]), "serious",
@@ -649,7 +649,8 @@ class Collector:
                 if b:
                     summ["bottleneck"] = {"kind": b["kind"], "why": b["why"], **b["metrics"]}
                     summ["vram_shared_max_mb"] = b["metrics"]["vram_shared_max_mb"]
-                    summ["gameplay"] = gameplay.stats(self.con, g["session"], g["start"], now) or {}
+                    with self.lock:   # the PresentMon threads write through the same connection
+                        summ["gameplay"] = gameplay.stats(self.con, g["session"], g["start"], now) or {}
             except Exception:
                 log.exception("bottleneck for session %s", g["session"])
         self.merge_summary(g["session"], summ)   # keep keys added elsewhere (crash, ...)

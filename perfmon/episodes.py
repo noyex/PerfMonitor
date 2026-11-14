@@ -147,8 +147,9 @@ def group(rows, con=None):
         prev = out[open_[r["kind"]]] if g is not None and r["kind"] in open_ else None
         if prev is not None and r["ts"] - (prev["end_ts"] or prev["ts"]) <= g:
             prev["count"] += n
-            if prev["end_ts"] is not None:
-                prev["end_ts"] = max(prev["end_ts"], r["end_ts"]) if r["end_ts"] is not None else None
+            # the episode ends with its latest row: an earlier row left open by a collector that died does not keep
+            # it open, an open latest row does
+            prev["end_ts"] = None if r["end_ts"] is None else max(prev["end_ts"] or r["end_ts"], r["end_ts"])
             if _SEV.get(r["severity"], 0) > _SEV.get(prev["severity"], 0):
                 prev["severity"] = r["severity"]
             _merge_worst(prev, r["kind"], d)

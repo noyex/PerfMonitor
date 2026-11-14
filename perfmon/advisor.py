@@ -212,9 +212,10 @@ def _overlays(reports):
     seen = {}
     for r in reports:
         m = (r.get("config") or {}).get("modules") or {}
-        if m.get("status") != "ok":
-            continue
-        for f in m.get("flagged") or []:
+        # summary.modules = {ts, procs: {exe: scan}}: the game and its child processes, each scanned on its own
+        flagged = {f["name"]: f for scan in (m.get("procs") or {}).values() if (scan or {}).get("status") == "ok"
+                   for f in scan.get("flagged") or []}
+        for f in flagged.values():
             if f.get("category") in ("overlay", "capture", "injector"):
                 cat, n = seen.get(f["name"], (f["category"], 0))
                 seen[f["name"]] = (cat, n + 1)
@@ -226,10 +227,12 @@ def _frame_gen(reports):
     fps_w = mins = 0.0
     for r in reports:
         ft = r.get("fps_timeline") or {}
-        if (ft.get("frame_gen_pct") or 0) < FRAME_GEN_ON_PCT or not ft.get("avg"):
+        gp = (r.get("summary") or {}).get("gameplay") or {}
+        fps = gp.get("fps_avg") or ft.get("avg")   # gameplay only: menus at hundreds of FPS would hide a low base
+        if (gp.get("frame_gen_pct") or ft.get("frame_gen_pct") or 0) < FRAME_GEN_ON_PCT or not fps:
             continue
         m = _minutes(r) or (r.get("duration_s") or 0) / 60
-        fps_w, mins = fps_w + ft["avg"] * m, mins + m
+        fps_w, mins = fps_w + fps * m, mins + m
     return (fps_w / mins, mins) if mins else None
 
 
@@ -569,7 +572,7 @@ def build(d):
 
     # [crash_dump] dumps cannot be written while the PC crashes: nothing will explain the next blue screen
     cd = info.get("crash_dump") or {}
-    if cd.get("problems") and (unclean or any(c.get("kind") == "bsod" for c in health.get("recurring_crashes") or [])):
+    if cd.get("problems") and (unclean or (health.get("incidents_by_kind") or {}).get("bsod")):
         items.append(_item(
             "crash_dump", "Napraw zapis zrzutów pamięci",
             "Windows nie zapisze zrzutu przy blue screenie: " + "; ".join(cd["problems"]) + ". Przy resetach bez blue "

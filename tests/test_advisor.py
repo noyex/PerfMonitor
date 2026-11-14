@@ -192,7 +192,7 @@ class AdvisorTest(unittest.TestCase):
             reps = []
             for i, m in enumerate(mods):
                 r = report(i)
-                r["config"] = {"modules": m}
+                r["config"] = {"modules": {"ts": 1.0, "procs": {"cod.exe": m}}}
                 reps.append(r)
             return data(reports=reps)
         ok = {"status": "ok", "flagged": [{"name": "Discord", "category": "overlay"},
