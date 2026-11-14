@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +16,19 @@ BOOT_QPC = 3_000_000_000_000           # QPC ticks at trace start (10 MHz)
 
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "etw_disk_rundown.csv")
+# Stands in for tracerpt: opens the output like it does (an empty probe, the dump, a reopen after writing)
+FAKE_TRACERPT = r"""
+import sys
+out = sys.argv[sys.argv.index("-o") + 1]
+mode = open(sys.argv[2]).read()
+if mode == "fail":
+    sys.stdout.buffer.write("Dane wejściowe\nPliki:\n  x.etl\n0.00%50.00%\nBłąd: Odmowa dostępu.\n".encode("oem"))
+    sys.exit(0x80070005)
+open(out, "r+b").close()
+with open(out, "r+b") as f:
+    f.write(open(sys.argv[1], "rb").read())
+open(out, "r+b").close()
+"""
 
 
 def ev(name, typ, opcode, clock, *data, pid="0x00000004", tid="0x00000010"):
@@ -110,6 +124,13 @@ class ParseTest(unittest.TestCase):
         # 3 storport DPCs of 8.2/17.8/12.9 us, offset = the shortest DPC seen (0.9 us)
         self.assertEqual(dpc["storport.sys"], {"driver": "storport.sys", "count": 3, "sum_us": 36, "max_us": 17,
                                                "max_at_s": 0.16})
+
+    def test_tool_error(self):
+        out = "\r\nDane wejściowe\r\n----------------\r\nPliki:\r\n     D:\\x\\a.etl\r\n\n0.00%10.67%21.33%"
+        self.assertEqual(etwbox.tool_error("tracerpt", 1073807364, out),
+                         "tracerpt 0x40010004 (proces przerwany (zabity)): Dane wejściowe Pliki:")
+        self.assertEqual(etwbox.tool_error("wpr -stop", -2147024891, "Access is denied."),
+                         "wpr -stop 0x80070005 (odmowa dostępu): Access is denied.")
 
     def test_headline_long_dpc(self):
         sev, title = etwbox.headline({"dpc_top": [{"driver": "amdkmdag.sys", "count": 9, "sum_us": 9000, "max_us": 6200}]})
@@ -241,6 +262,88 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(s["buffer_mb"], 256)
         self.assertEqual(s["triggers"]["dpc_pct"], 0)
         self.assertTrue(s["triggers"]["user_mark"])
+
+
+class StreamTest(unittest.TestCase):
+    """tracerpt_lines against a stand-in that opens the named pipe the way tracerpt does."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.dir = td.name
+        script = os.path.join(td.name, "fake_tracerpt.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(FAKE_TRACERPT)
+        p = mock.patch.object(etwbox, "TRACERPT", [sys.executable, script, FIXTURE])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def etl(self, mode):
+        path = os.path.join(self.dir, f"{mode}.etl")
+        with open(path, "w") as f:
+            f.write(mode)
+        return path
+
+    def test_streams_the_csv_without_a_file(self):
+        st = {}
+        s = etwbox.parse_rows(etwbox.tracerpt_lines(self.etl("ok"), timeout=60, stats=st), 60)
+        self.assertEqual(st, {"bytes": os.path.getsize(FIXTURE), "rc": 0})
+        self.assertEqual({r["process"] for r in s["disk_top"]}, {"System", "MsMpEng.exe", "cod.exe"})
+        self.assertEqual(sorted(os.listdir(self.dir)), ["fake_tracerpt.py", "ok.etl"])
+
+    def test_failure_carries_the_reason(self):
+        with self.assertRaises(RuntimeError) as e:
+            list(etwbox.tracerpt_lines(self.etl("fail"), timeout=60))
+        self.assertIn("0x80070005 (odmowa dostępu)", str(e.exception))
+        self.assertIn("Odmowa dostępu.", str(e.exception))
+
+
+class AnalyzeTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        db.migrate(self.con)
+        self.now = time.time()
+
+    def add(self, age_s, status="captured", path="x.etl", summary=None):
+        return self.con.execute("INSERT INTO etw_captures(ts, trigger, path, status, summary) VALUES (?,?,?,?,?)",
+                                (self.now - age_s, "stutter_burst", path, status,
+                                 json.dumps(summary or {}))).lastrowid
+
+    def summary(self, cid):
+        status, summ = self.con.execute("SELECT status, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
+        return status, json.loads(summ)
+
+    def test_reanalysis_replaces_the_incident(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "a.etl")
+            open(p, "wb").close()
+            cid = self.add(100, path=p)
+
+            def lines(path, stats=None, **k):
+                stats.update(bytes=1, rc=0)
+                with open(FIXTURE, encoding="utf-8") as f:
+                    yield from f
+            with mock.patch.object(etwbox, "tracerpt_lines", lines):
+                etwbox.analyze(self.con, cid)
+                s = etwbox.analyze(self.con, cid)
+        self.assertEqual(self.summary(cid)[0], "analyzed")
+        rows = self.con.execute("SELECT details FROM incidents WHERE kind='etw_capture'").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0][0])["disk_top"][0]["process"], "System")
+
+    def test_analysis_failure_is_stored(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "a.etl")
+            open(p, "wb").close()
+            cid = self.add(100, path=p, summary={"stop_s": 1.0})
+
+            def boom(*a, **k):
+                raise RuntimeError("tracerpt 0x40010004 (proces przerwany (zabity))")
+                yield
+            with mock.patch.object(etwbox, "tracerpt_lines", boom), self.assertRaises(RuntimeError):
+                etwbox.analyze(self.con, cid)
+        self.assertEqual(self.summary(cid), ("failed", {"stop_s": 1.0,
+                                                        "error": "tracerpt 0x40010004 (proces przerwany (zabity))"}))
 
 
 if __name__ == "__main__":

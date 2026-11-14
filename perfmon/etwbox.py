@@ -2,13 +2,15 @@
 WPR and written to data/traces when something goes wrong (user mark, frozen desktop/DWM, DPC storm, stutter burst).
 
 The capture is analysed later in a separate low-priority process (`python -m perfmon.etwbox analyze ID`, also
-`pm etw analyze ID`): tracerpt converts the .etl to CSV (no xperf/WPA without the ADK) and the last `dump_last_s`
-seconds are aggregated into the top DPC/ISR drivers and disk I/O per process and file. Needs admin (the collector has it)."""
+`pm etw analyze ID`): tracerpt converts the .etl to CSV (no xperf/WPA without the ADK), streamed through a named pipe
+instead of a multi-GB file, and the last `dump_last_s` seconds are aggregated into the top DPC/ISR drivers and disk I/O
+per process and file. Needs admin (the collector has it)."""
 import bisect
 import csv
 import ctypes
 import json
 import logging
+import msvcrt
 import os
 import queue
 import re
@@ -207,12 +209,15 @@ class EtwBox:
         TRACES.mkdir(parents=True, exist_ok=True)
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
         t0 = time.time()
-        rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+        try:
+            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:   # still recorded as a failed capture, with the reason
+            rc, out = -1, f"{type(e).__name__}: {e}"
         self.active = False
         ok = rc == 0 and path.exists()
         summary = {"stop_s": round(time.time() - t0, 1)}
         if not ok:
-            summary["error"] = out[-300:]
+            summary["error"] = tool_error("wpr -stop", rc, out) if rc else f"wpr -stop: brak pliku {path.name}"
         self.on_capture({"ts": ts, "trigger": trigger, "session": session, "path": str(path) if ok else None,
                          "size_mb": round(path.stat().st_size / 2**20, 1) if ok else None,
                          "status": "captured" if ok else "failed", "summary": summary})
@@ -295,7 +300,7 @@ def _fail(con, cid, summ, error):
 
 
 # --------------------------------------------------------------------------
-# analysis: tracerpt CSV -> top DPC/ISR drivers and disk I/O
+# analysis: tracerpt CSV (streamed through a named pipe) -> top DPC/ISR drivers and disk I/O
 # --------------------------------------------------------------------------
 # tracerpt CSV: 19 header columns then the event's user data in MOF order.
 C_NAME, C_TYPE, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 6, 9, 10, 16, 19
@@ -307,6 +312,9 @@ FILE_NAME_OPS = {"0", "32", "35", "36"}                  # FileIo Name/FileCreat
 DISK_OPS = {"10": "read", "11": "write"}
 TOP = 10
 FT_UNIX = 11644473600                                    # seconds from 1601 (FILETIME) to 1970
+# tracerpt exit codes seen in failed analyses
+TOOL_RC = {0x40010004: "proces przerwany (zabity)", 0x80070005: "odmowa dostępu", 0x80070070: "brak miejsca na dysku",
+           0x800700E7: "potok zajęty", 0x80070020: "plik używany przez inny proces", 0x80070002: "brak pliku"}
 
 
 def _int(v):
@@ -516,6 +524,122 @@ def dos_devices():
     return out
 
 
+def tool_error(tool, rc, out):
+    """A short, diagnosable reason: the exit code (hex, with a known meaning) and the last real output line
+    (tracerpt prints its input file list and a progress bar before the error)."""
+    rc &= 0xFFFFFFFF
+    lines = [ln.strip() for ln in re.sub(r"\d+\.\d+%", "\n", out or "").splitlines()]
+    lines = [ln for ln in lines if ln and not set(ln) <= set("-") and not ln.lower().endswith(".etl")]
+    hint = TOOL_RC.get(rc)
+    return f"{tool} 0x{rc:08X}" + (f" ({hint})" if hint else "") + (f": {' '.join(lines[-2:])[:200]}" if lines else "")
+
+
+PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED_INSTANCES, ERROR_PIPE_CONNECTED = 3, 255, 535
+INVALID_HANDLE = ctypes.c_void_p(-1).value
+TRACERPT = ["tracerpt"]
+
+
+def tracerpt_lines(etl, timeout=1800, stats=None):
+    """Yield the CSV lines of `tracerpt etl` streamed through a named pipe: no multi-GB intermediate file (a 256 MB
+    trace used to become a 2.6 GB CSV on the same disk). tracerpt opens its output several times (an empty probe,
+    the dump, a reopen after writing; a failed open = exit code 1 or 0x800700E7), so every connection gets its own
+    reader thread and two instances always listen. Raises RuntimeError when tracerpt fails.
+    stats (dict) receives bytes and the exit code."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateNamedPipeW.restype = k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateNamedPipeW.argtypes = [ctypes.c_wchar_p] + [ctypes.c_uint32] * 6 + [ctypes.c_void_p]
+    k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    k32.ConnectNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    name = rf"\\.\pipe\perfmon_etw_{os.getpid()}_{threading.get_ident()}_{time.monotonic_ns()}"
+    chunks = queue.Queue(maxsize=32)       # bounded: a slow parser throttles tracerpt instead of filling memory
+    lock, active = threading.Lock(), [0]   # instances not finished yet (listening or being read)
+    done, closed, out = threading.Event(), threading.Event(), [b""]
+
+    def put(item):
+        while not closed.is_set():
+            try:
+                return chunks.put(item, timeout=0.5)
+            except queue.Full:
+                pass
+
+    def listen():
+        h = k32.CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX, 0, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 20, 0, None)
+        if h in (None, INVALID_HANDLE):
+            raise OSError(ctypes.get_last_error(), "CreateNamedPipe")
+        with lock:
+            active[0] += 1
+        threading.Thread(target=serve, args=(h,), daemon=True, name="tracerpt-pipe").start()
+
+    def serve(h):
+        try:
+            if not k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+                k32.CloseHandle(h)
+                return
+            if not done.is_set():
+                listen()
+            with open(msvcrt.open_osfhandle(h, os.O_RDONLY), "rb", buffering=0) as f:
+                while b := f.read(1 << 20):
+                    put(b)
+        except OSError as e:
+            log.warning("tracerpt pipe: %s", e)
+        finally:
+            with lock:
+                active[0] -= 1
+            put(None)                       # wakes the consumer to check whether everything is finished
+
+    def watch():
+        try:
+            out[0] = proc.communicate(timeout=timeout)[0] or b""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out[0] = proc.communicate()[0] or b""
+        done.set()
+        for _ in range(600):                 # end the waits of instances nobody will open now (30 s at most)
+            if not active[0]:
+                break
+            c = k32.CreateFileW(name, 0x40000000, 0, None, 3, 0, None)
+            if c not in (None, INVALID_HANDLE):
+                k32.CloseHandle(c)
+            time.sleep(0.05)
+        put(None)
+
+    listen()
+    listen()
+    proc = subprocess.Popen(TRACERPT + [str(etl), "-o", name, "-of", "CSV", "-y"], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
+    w = threading.Thread(target=watch, daemon=True, name="tracerpt")
+    w.start()
+    n, rest = 0, b""
+    try:
+        while True:
+            b = chunks.get()
+            if b is None:
+                if done.is_set() and not active[0] and chunks.empty():
+                    break
+                continue
+            n += len(b)
+            lines = (rest + b).split(b"\n")
+            rest = lines.pop()
+            for ln in lines:
+                yield ln.decode("utf-8", "replace") + "\n"
+        if rest:
+            yield rest.decode("utf-8", "replace")
+    finally:
+        closed.set()
+        if proc.poll() is None:
+            proc.kill()
+        w.join(timeout=30)
+    rc = proc.returncode
+    if stats is not None:
+        stats.update(bytes=n, rc=rc)
+    if rc != 0 or not n:
+        raise RuntimeError(tool_error("tracerpt", rc if rc is not None else -1,
+                                      out[0].decode("oem", "replace") or "brak danych"))
+
+
 def headline(summary):
     """(severity, title) of the etw_capture incident."""
     d = (summary.get("dpc_top") or []) + (summary.get("isr_top") or [])
@@ -542,8 +666,9 @@ def fix_old_headlines(con):
                         (f"ETW: pominięty błędny pomiar {m[1]}", iid))
 
 
-def analyze(con, cid, keep_csv=False):
-    """tracerpt + parse_csv for capture `cid`; stores the summary and an etw_capture incident. Returns the summary."""
+def analyze(con, cid):
+    """tracerpt (streamed) + parse_rows for capture `cid`; stores the summary and an etw_capture incident.
+    Failures are stored as status failed + summary.error. Returns the summary."""
     r = con.execute("SELECT ts, trigger, path, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
     if not r:
         raise ValueError(f"Brak zrzutu ETW {cid}")
@@ -551,32 +676,25 @@ def analyze(con, cid, keep_csv=False):
     if not path or not os.path.exists(path):
         raise ValueError(f"Plik zrzutu {cid} nie istnieje (retencja?)")
     s = settings(config.load())
-    out = os.path.splitext(path)[0] + ".csv"
     t0 = time.time()
+    st = {}
     try:
-        tr = subprocess.run(["tracerpt", path, "-o", out, "-of", "CSV", "-y"], capture_output=True, text=True,
-                            errors="replace", timeout=1800, creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
-        if tr.returncode != 0 or not os.path.exists(out):
-            raise RuntimeError(f"tracerpt {tr.returncode}: {(tr.stdout + tr.stderr).strip()[-300:]}")
-        t_conv = time.time() - t0
-        csv_mb = os.path.getsize(out) / 2**20
         try:
             devices = dos_devices()
         except (OSError, AttributeError):
             devices = {}
-        summ = parse_csv(out, s["dump_last_s"], ts, devices)
+        summ = parse_rows(tracerpt_lines(path, stats=st), s["dump_last_s"], ts, devices)
     except Exception as e:
-        old.update(error=str(e)[:300])
-        con.execute("UPDATE etw_captures SET status='failed', summary=? WHERE id=?", (json.dumps(old), cid))
+        _fail(con, cid, old, e if isinstance(e, RuntimeError) else f"analiza: {type(e).__name__}: {e}")
         con.commit()
         raise
-    finally:
-        if not keep_csv and os.path.exists(out):
-            os.remove(out)
-    summ.update(old, convert_s=round(t_conv, 1), analysis_s=round(time.time() - t0, 1), csv_mb=round(csv_mb, 1))
+    summ.update(old, analysis_s=round(time.time() - t0, 1), csv_mb=round(st.get("bytes", 0) / 2**20, 1))
     summ.pop("error", None)
-    con.execute("UPDATE etw_captures SET status='analyzed', summary=? WHERE id=?", (json.dumps(summ), cid))
+    con.execute("UPDATE etw_captures SET status='analyzed', summary=? WHERE id=?",
+                (json.dumps(summ, ensure_ascii=False), cid))
     sev, title = headline(summ)
+    # a re-analysis (pm etw analyze) replaces the capture's incident instead of adding a second one
+    con.execute("DELETE FROM incidents WHERE kind='etw_capture' AND json_extract(details, '$.capture')=?", (cid,))
     con.execute("INSERT INTO incidents(ts, end_ts, kind, severity, title, details) VALUES (?,?,?,?,?,?)",
                 (ts, None, "etw_capture", sev, f"{title} ({trigger})",
                  json.dumps({"capture": cid, "trigger": trigger, "dpc_top": summ["dpc_top"][:3],
@@ -616,7 +734,8 @@ if __name__ == "__main__":
         c = db.connect()
         try:
             res = analyze(c, int(sys.argv[2]))
-            log.info("ETW capture %s analysed in %s s (%s MB CSV)", sys.argv[2], res["analysis_s"], res["csv_mb"])
+            log.info("ETW capture %s analysed in %s s (%s MB CSV streamed)", sys.argv[2], res["analysis_s"],
+                     res["csv_mb"])
         except Exception:
             log.exception("ETW capture %s analysis", sys.argv[2])
             sys.exit(1)

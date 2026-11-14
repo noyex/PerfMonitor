@@ -600,7 +600,7 @@ def cmd_etw(con, a):
             summ = etwbox.analyze(rw, a.id)
         finally:
             rw.close()
-        out(f"Zrzut {a.id}: analiza {summ['analysis_s']} s (tracerpt {summ['convert_s']} s, CSV {summ['csv_mb']} MB)")
+        out(f"Zrzut {a.id}: analiza {summ['analysis_s']} s (CSV {summ['csv_mb']} MB strumieniem, bez pliku na dysku)")
         a.action = "show"
     if a.action == "show":
         r = an._one(con, "SELECT * FROM etw_captures WHERE id=?", (a.id,))
