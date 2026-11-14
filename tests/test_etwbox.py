@@ -298,7 +298,7 @@ class StreamTest(unittest.TestCase):
         self.assertIn("Odmowa dostępu.", str(e.exception))
 
 
-class AnalyzeTest(unittest.TestCase):
+class BacklogTest(unittest.TestCase):
     def setUp(self):
         self.con = sqlite3.connect(":memory:")
         db.migrate(self.con)
@@ -312,6 +312,21 @@ class AnalyzeTest(unittest.TestCase):
     def summary(self, cid):
         status, summ = self.con.execute("SELECT status, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
         return status, json.loads(summ)
+
+    def test_newest_settled_first_and_attempt_limit(self):
+        self.add(5000)
+        older = self.add(3000)
+        self.add(4000, "analyzed")
+        self.add(2000, path=None)
+        self.add(5)                                                      # still settling
+        dead = self.add(1000, summary={"attempts": etwbox.MAX_ATTEMPTS})
+        self.assertEqual(etwbox.next_to_analyze(self.con, self.now), older)
+        status, summ = self.summary(dead)
+        self.assertEqual(status, "failed")
+        self.assertIn("przerwana 3 razy", summ["error"])
+        self.con.execute("UPDATE etw_captures SET summary=? WHERE id=?", (json.dumps({"attempts": 2}), older))
+        etwbox.undo_attempt(self.con, older)
+        self.assertEqual(self.summary(older)[1]["attempts"], 1)
 
     def test_reanalysis_replaces_the_incident(self):
         with tempfile.TemporaryDirectory() as td:
@@ -327,6 +342,7 @@ class AnalyzeTest(unittest.TestCase):
                 etwbox.analyze(self.con, cid)
                 s = etwbox.analyze(self.con, cid)
         self.assertEqual(self.summary(cid)[0], "analyzed")
+        self.assertEqual(s["attempts"], 2)
         rows = self.con.execute("SELECT details FROM incidents WHERE kind='etw_capture'").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0][0])["disk_top"][0]["process"], "System")
@@ -342,7 +358,7 @@ class AnalyzeTest(unittest.TestCase):
                 yield
             with mock.patch.object(etwbox, "tracerpt_lines", boom), self.assertRaises(RuntimeError):
                 etwbox.analyze(self.con, cid)
-        self.assertEqual(self.summary(cid), ("failed", {"stop_s": 1.0,
+        self.assertEqual(self.summary(cid), ("failed", {"stop_s": 1.0, "attempts": 1,
                                                         "error": "tracerpt 0x40010004 (proces przerwany (zabity))"}))
 
 

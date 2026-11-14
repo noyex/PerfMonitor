@@ -312,6 +312,7 @@ FILE_NAME_OPS = {"0", "32", "35", "36"}                  # FileIo Name/FileCreat
 DISK_OPS = {"10": "read", "11": "write"}
 TOP = 10
 FT_UNIX = 11644473600                                    # seconds from 1601 (FILETIME) to 1970
+MAX_ATTEMPTS = 3                                         # analysis runs that died (killed, crash) before giving up
 # tracerpt exit codes seen in failed analyses
 TOOL_RC = {0x40010004: "proces przerwany (zabity)", 0x80070005: "odmowa dostępu", 0x80070070: "brak miejsca na dysku",
            0x800700E7: "potok zajęty", 0x80070020: "plik używany przez inny proces", 0x80070002: "brak pliku"}
@@ -675,6 +676,10 @@ def analyze(con, cid):
     ts, trigger, path, old = r[0], r[1], r[2], _loads(r[3])
     if not path or not os.path.exists(path):
         raise ValueError(f"Plik zrzutu {cid} nie istnieje (retencja?)")
+    # counted before the run: one that dies (killed, out of memory) is retried at most MAX_ATTEMPTS times
+    old["attempts"] = old.get("attempts", 0) + 1
+    con.execute("UPDATE etw_captures SET summary=? WHERE id=?", (json.dumps(old, ensure_ascii=False), cid))
+    con.commit()
     s = settings(config.load())
     t0 = time.time()
     st = {}
@@ -702,6 +707,31 @@ def analyze(con, cid):
                              "disk_files": summ["disk_files"][:3]}, ensure_ascii=False)))
     con.commit()
     return summ
+
+
+def next_to_analyze(con, now=None):
+    """id of the newest capture still waiting for analysis (status captured, file present, settled for
+    ANALYZE_DELAY_S, fewer than MAX_ATTEMPTS runs), None when the backlog is empty.
+    Captures whose runs all died are marked failed here."""
+    now = now or time.time()
+    for cid, summ in con.execute("SELECT id, summary FROM etw_captures WHERE status='captured' AND path IS NOT NULL "
+                                 "AND ts < ? ORDER BY ts DESC", (now - ANALYZE_DELAY_S,)).fetchall():
+        sm = _loads(summ)
+        if sm.get("attempts", 0) < MAX_ATTEMPTS:
+            return cid
+        _fail(con, cid, sm, f"Analiza przerwana {sm['attempts']} razy (proces zabity lub zawieszony)")
+        con.commit()
+    return None
+
+
+def undo_attempt(con, cid):
+    """A run stopped on purpose (a game started) does not count towards MAX_ATTEMPTS."""
+    r = con.execute("SELECT summary FROM etw_captures WHERE id=? AND status='captured'", (cid,)).fetchone()
+    if r:
+        sm = _loads(r[0])
+        sm["attempts"] = max(0, sm.get("attempts", 0) - 1)
+        con.execute("UPDATE etw_captures SET summary=? WHERE id=?", (json.dumps(sm, ensure_ascii=False), cid))
+        con.commit()
 
 
 def spawn_analysis(cid):
