@@ -74,7 +74,7 @@ Pages.timeline = (() => {
         wrap.append(h("div", { class: "empty" }, "Brak danych w tym okresie"));
       } else {
         for (const d of DEFS) charts.push(chart(wrap, { ...d, height: 130, markers, onSelect: zoom, longRange: long, xRange }, cols(s, d.keys)));
-        const ping = pingChart(wrap, net, { height: 130, onSelect: zoom, longRange: long, xRange });
+        const ping = pingChart(wrap, net, { height: 130, markers, onSelect: zoom, longRange: long, xRange });
         if (ping) charts.push(ping);
       }
       if (diag.legend && charts.length) charts[0].el.append(diag.legend);

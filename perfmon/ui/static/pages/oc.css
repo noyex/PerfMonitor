@@ -11,6 +11,7 @@
 .oc-cmp-head h2 { margin: 0; }
 [data-page="oc"] tr.cur td:first-child { font-weight: 500; }
 [data-page="oc"] tbody tr { cursor: default; }
+[data-page="oc"] tbody tr:hover { background: transparent; }
 .empty.small { padding: 40px 0; font-size: 13px; }
 .empty p { margin: 0 0 16px; }
 
@@ -29,8 +30,8 @@
 @keyframes oc-in { from { transform: translateX(24px); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .oc-panel { animation: none; } }
 .oc-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-.oc-panel-head h2 { margin: 0; font-size: 26px; }
 .oc-panel h2 { margin: 24px 0 10px; }
+.oc-panel-head h2 { margin: 0; font-size: 26px; }
 .oc-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 13px; color: var(--label); }
 .oc-field input, .oc-field select, .oc-panel textarea { width: 100%; max-width: none; font: inherit; color: var(--ink); text-align: left; }
 .oc-field small { color: var(--muted); }
