@@ -14,9 +14,9 @@ APP_FPS = f"(CASE WHEN app_frames IS NULL THEN fps * {_NATIVE} ELSE app_fps END)
 APP_FRAMES = f"COALESCE(app_frames, frames * {_NATIVE})"
 APP_FT_P99 = f"(CASE WHEN app_frames IS NULL THEN ft_p99 / {_NATIVE} ELSE app_ft_p99 END)"
 APP_FT_AVG = f"(CASE WHEN app_frames IS NULL THEN ft_avg / {_NATIVE} WHEN app_fps>0 THEN 1000.0/app_fps END)"
+# old 2.x rows averaged the generated frames' MsCPUBusy of 0 in
+APP_CPU_BUSY = f"(CASE WHEN app_frames IS NULL THEN cpu_busy / {_NATIVE} ELSE cpu_busy END)"
 
-SIDES = ("cpu", "gpu", "present")
-BOUND_SIDE = {"CPU": "cpu", "GPU": "gpu", "limit": "present"}   # what a normal second's bound means as a side
 SIDE_LABELS = {"cpu": "po stronie CPU", "gpu": "po stronie GPU", "present": "w prezentacji / kolejce klatek"}
 
 
@@ -37,13 +37,14 @@ def stutter_side(ft, cpu_busy, gpu_busy):
     """cpu / gpu: that processor was busy for most of the long frame; present: neither was, the time went to
     waiting (present queue, vsync, DWM, driver, frame generation pacing). None without timing (old rows).
     A generated frame carrying the gap does not make it 'present': interpolation waits for the next real frame,
-    so a slow application frame shows up as a late generated one."""
-    if cpu_busy is None and gpu_busy is None or not ft:
+    so a slow application frame shows up as a late generated one. With one of the two missing only the known side
+    can be confirmed: the missing one may hold the time."""
+    if not ft:
         return None
     c, g = cpu_busy or 0.0, gpu_busy or 0.0
     if max(c, g) >= STUTTER_BUSY * ft:
         return "cpu" if c >= g else "gpu"
-    return "present"
+    return "present" if cpu_busy is not None and gpu_busy is not None else None
 
 
 def pacing(anim_sum, anim_n, jit_sum, jit_ft_sum, jit_n):
@@ -58,7 +59,8 @@ def pacing(anim_sum, anim_n, jit_sum, jit_ft_sum, jit_n):
 
 
 def pacing_rows(rows):
-    """pacing() from per-second frames rows (dicts with frames, fps, anim_err, disp_ft_sd)."""
+    """pacing() from per-second frames rows (dicts with frames, fps, anim_err, disp_ft_sd); the capture adds up the
+    same per-second values with the same weights."""
     a = an = j = jf = jn = 0.0
     for r in rows:
         n = r["frames"] or 0
@@ -75,11 +77,12 @@ def session_pacing(con, sid):
     return pacing_rows(rows)
 
 
-def side_ranking(stutters, base_ts, bound_at):
-    """stuttercause.rank of stutter sides against the bound of quiet gameplay seconds: a GPU-bound game has GPU-side
-    stutters as its normal state, a CPU-side stutter in it is the anomaly. None without frame timing."""
+def side_ranking(stutters, base_ts, side_at):
+    """stuttercause.rank of stutter sides against the sides of quiet gameplay seconds (side_at: {second: the side
+    stutter_side() gives that second's mean frame}): in a GPU-bound game GPU-side stutters are the normal state,
+    a CPU-side one is the anomaly. None without frame timing."""
     st = [[s["side"]] for s in stutters if s.get("side")]
-    base = [[BOUND_SIDE[bound_at[int(t)]]] for t in base_ts if bound_at.get(int(t)) in BOUND_SIDE]
+    base = [[side_at[int(t)]] for t in base_ts if side_at.get(int(t))]
     if not st or not base:
         return None
     return stuttercause.rank(st, base)

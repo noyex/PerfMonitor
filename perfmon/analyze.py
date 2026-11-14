@@ -348,9 +348,9 @@ def session_report(con, session_id):
            "start": fmt_ts(start), "end": fmt_ts(end)}
 
     # --- frames: bound shares + fps timeline; fps = application frames (frame generation left out), disp_fps presented
-    frames = _rows(con, f"SELECT ts, {framestats.APP_FPS} AS fps, fps AS disp_fps, frames, ft_p99, ft_max, cpu_busy, "
-                        f"gpu_busy, bound, present_mode, frame_gen_pct FROM frames WHERE session=? ORDER BY ts",
-                   (row["id"],))
+    frames = _rows(con, f"SELECT ts, {framestats.APP_FPS} AS fps, fps AS disp_fps, frames, ft_p99, ft_max, "
+                        f"{framestats.APP_FT_AVG} AS app_ft, cpu_busy, gpu_busy, bound, present_mode, frame_gen_pct "
+                        f"FROM frames WHERE session=? ORDER BY ts", (row["id"],))
     bound_counts = Counter(f["bound"] for f in frames if f["bound"])
     nb = sum(bound_counts.values())
     rep["bound_pct"] = {k: _r(100 * bound_counts.get(k, 0) / nb) for k in ("GPU", "CPU", "limit")} if nb else {}
@@ -466,9 +466,10 @@ def _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext):
         return None, None
     base = stuttercause.baseline_ts([f["ts"] for f in keep], [s["ts"] for s in st])
     base_tags = [_causes_for_stutter({"ts": t}, s_ts, samples, p_ts, procs, exe, ext) for t in base]
-    bound_at = {int(f["ts"]): f["bound"] for f in keep if f["bound"]}
+    # normal seconds sided by the same rule as the stutters (the capture's stutter_side on the mean frame)
+    side_at = {int(f["ts"]): framestats.stutter_side(f["app_ft"], f["cpu_busy"], f["gpu_busy"]) for f in keep}
     return (stuttercause.rank([s["causes"] for s in played], base_tags),
-            framestats.side_ranking(played, base, bound_at))
+            framestats.side_ranking(played, base, side_at))
 
 
 def _session_findings(rep, row):
@@ -1228,16 +1229,18 @@ def _session_metrics(con, exe=None, since=None):
         end = ends[r["id"]] or time.time()
         minutes = max(0.0, (end - r["start_ts"]) / 60)
         x = fr.get(r["id"])
-        fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("app_fps_avg") or f.get("fps_avg")
+        summ = _json(r["summary"]) or {}
+        gen = next((g for g in (f.get("frame_gen_pct"), x["gen"] if x else None,
+                                (summ.get("present") or {}).get("frame_gen_pct")) if g is not None), None)
         fps_disp = (x["dnf"] / x["dsecs"]) if x and x["dsecs"] else f.get("fps_avg")
-        gen = f.get("frame_gen_pct") if f.get("frame_gen_pct") is not None else x["gen"] if x else None
+        fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("app_fps_avg") or (
+            f["fps_avg"] * (1 - (gen or 0) / 100) if f.get("fps_avg") else None)   # frames pruned, older summary
         low1 = f.get("app_fps_1low")
         if low1 is None:   # summary from before app frames: its 1% low counts generated frames
             low1 = 1000 / x["p99"] if gen and x and x["p99"] else f.get("fps_1low")
         if low1 is None and x and x["p99"]:
             low1 = 1000 / x["p99"]
         ctx = _ctx(r)
-        summ = _json(r["summary"]) or {}
         gp = summ.get("gameplay")
         stutters = st.get(r["id"], 0)
         pacing = summ.get("pacing")

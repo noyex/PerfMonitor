@@ -17,6 +17,7 @@ class FrameStatsTest(unittest.TestCase):
         self.assertEqual(fs.stutter_side(50, 8, 30), "gpu")
         self.assertEqual(fs.stutter_side(50, 8, 8), "present")
         self.assertEqual(fs.stutter_side(50, None, 30), "gpu")
+        self.assertIsNone(fs.stutter_side(50, None, 8))   # the missing CPU time may hold the stutter
         self.assertIsNone(fs.stutter_side(50, None, None))
 
     def test_pacing(self):
@@ -48,11 +49,11 @@ class FrameStatsTest(unittest.TestCase):
 
     def test_side_ranking(self):
         st = [{"side": "cpu"}] * 6 + [{"side": "gpu"}] * 2 + [{"side": None}]
-        bound_at = {t: "GPU" for t in range(100)}
-        r = {x["tag"]: x for x in fs.side_ranking(st, range(100), bound_at)}
+        side_at = {t: "gpu" for t in range(100)}
+        r = {x["tag"]: x for x in fs.side_ranking(st, range(100), side_at)}
         self.assertEqual(r["cpu"]["verdict"], "confirmed")   # never CPU-bound in normal play
         self.assertEqual(r["gpu"]["verdict"], "ambient")     # GPU is the normal state of this game
-        self.assertIsNone(fs.side_ranking([{"side": None}], range(10), bound_at))
+        self.assertIsNone(fs.side_ranking([{"side": None}], range(10), side_at))
 
 
 if __name__ == "__main__":

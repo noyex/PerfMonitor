@@ -184,6 +184,8 @@ class FrameCapture:
         t = _f(row, "CPUStartTime", "TimeInSeconds", "TimeInMs", "CPUStartQPCTime")
         if t is None:
             return time.time()
+        if self.time_unit is None and "TimeInMs" in self.fields and "CPUStartTime" not in self.fields:
+            self.time_unit = 1000.0   # named: two rows of different swapchains must not make it a guess
         if self.time_unit is None and self.prev_t is not None and ft:
             d = t - self.prev_t
             if d > 0:
@@ -348,8 +350,8 @@ class FrameCapture:
         disp_sd = statistics.pstdev(disp_ft) if len(disp_ft) >= 2 else None
         anim = [f["anim_err"] for f in b if f["anim_err"] is not None]
         disp = [f["displayed"] for f in b if f["displayed"] is not None]
-        if disp and not any(disp):
-            disp = []   # frames but not one shown in a whole second = no display tracking, not 100% dropped
+        if disp and not any(disp) and "MsUntilDisplayed" in self.fields:
+            disp = []   # 2.x NA for a whole second = no display tracking (MsUntilDisplayed 0), not 100% dropped
         typed = [f["ftype"] for f in b if f["ftype"] is not None]
         gen = sum(1 for t in typed if t not in NATIVE_FRAME_TYPES)
         clicks = [f["click"] for f in b if f["click"] is not None]
@@ -376,12 +378,16 @@ class FrameCapture:
             for k, v in (("tear_n", len(tear)), ("tearing", sum(tear)), ("disp_n", len(disp)),
                          ("dropped", sum(1 for d in disp if not d)), ("typed", len(typed)), ("gen", gen),
                          ("click_n", len(clicks)), ("click", sum(clicks)), ("input_n", len(inputs)),
-                         ("input", sum(inputs)), ("anim_n", len(anim)), ("anim", sum(anim))):
+                         ("input", sum(inputs))):
                 self.p[k] += v
-            if disp_sd is not None:   # frame-weighted per-second jitter of the displayed frametime
-                self.p["jit_n"] += len(disp_ft)
-                self.p["jit"] += disp_sd * len(disp_ft)
-                self.p["jit_ft"] += sum(disp_ft)
+            # pacing weighted like framestats.pacing_rows() weights the stored per-second rows
+            if anim:
+                self.p["anim_n"] += len(fts)
+                self.p["anim"] += _avg(anim) * len(fts)
+            if disp_sd is not None:
+                self.p["jit_n"] += len(fts)
+                self.p["jit"] += disp_sd * len(fts)
+                self.p["jit_ft"] += total
 
     def present_summary(self):
         """How the game presented over the whole capture (frame-weighted)."""
@@ -433,7 +439,7 @@ class FrameCapture:
             "ft_p99": round(p99, 2),
             "ft_max": round(fts[-1], 1),
             "error": self.error,
-            "present": self.present_summary(),
+            "present": present,
         }
 
     def retarget(self, child_names):

@@ -138,7 +138,7 @@ class FrameGenerationTest(unittest.TestCase):
 
     def add_fg(self, con, sid, start, minutes=5):
         add_session(con, sid, start, minutes=minutes, fps=200.0)
-        con.execute("UPDATE frames SET app_frames=100, app_fps=100, app_ft_p99=12, frame_gen_pct=50, anim_err=0.4, "
+        con.execute("UPDATE frames SET app_frames=100, app_fps=100, app_ft_p99=12, frame_gen_pct=50, anim_err=0.4, gpu_busy=9.5, "
                     "disp_ft_sd=0.5 WHERE session=?", (sid,))
 
     def test_bottleneck_uses_application_frametime(self):

@@ -35,8 +35,8 @@ def _pct(part, whole):
 def compute(con, sid, start, end, vram_total_mb=None):
     """{kind, why, advice, metrics} for a session, or None without frame data."""
     # application frames: with frame generation the presented frametime is half the one the CPU busy time belongs to
-    frames = an._rows(con, f"SELECT ts, {fs.APP_FPS} AS fps, {fs.APP_FT_AVG} AS ft_avg, cpu_busy, bound FROM frames "
-                           f"WHERE session=? AND {fs.APP_FPS}>0 ORDER BY ts", (sid,))
+    frames = an._rows(con, f"SELECT ts, {fs.APP_FPS} AS fps, {fs.APP_FT_AVG} AS ft_avg, {fs.APP_CPU_BUSY} AS cpu_busy, "
+                           f"bound FROM frames WHERE session=? AND {fs.APP_FPS}>0 ORDER BY ts", (sid,))
     if not frames:
         return None
     samples = an._rows(con, "SELECT ts, gpu_load, gpu_power_w, gpu_clock_mhz, gpu_vram_total_mb, user_idle_s, cpu_total, "
