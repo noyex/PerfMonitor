@@ -14,7 +14,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from perfmon import analyze as an  # noqa: E402
-from perfmon import bottleneck, config, db, present  # noqa: E402
+from perfmon import bottleneck, confdiff, config, db, present  # noqa: E402
 from perfmon import experiments as exps  # noqa: E402
 from perfmon import ocanalyze as oc  # noqa: E402
 from perfmon import ocassist  # noqa: E402
@@ -271,7 +271,41 @@ def cmd_session(con, a):
         out("### Zdarzenia Windows w trakcie sesji")
         table(r["events"], ["time", "provider", "event_id", "level", "message"])
     print_marks(r.get("marks"))
+    print_config(r.get("config"))
     findings(r["findings"])
+
+
+def print_config(c):
+    """Settings in effect for the session and what changed vs the previous session of the game."""
+    if not c:
+        return
+    out("### Ustawienia w tej sesji")
+    gs = c.get("game_settings")
+    if gs:
+        out("Gra: " + ", ".join(f"{k}={cell(v)}" for k, v in gs.items() if v is not None))
+    elif c.get("game_settings_error"):
+        out(f"Gra: {c['game_settings_error']}")
+    amd = c.get("amd") or {}
+    if amd and "error" not in amd:
+        fs = ", ".join(f"{f['name']} {'wł.' if f.get('gaming') else 'wył.'}" for f in amd.get("freesync") or [])
+        out("Adrenalin (globalnie): " + ", ".join(f"{k}={cell(amd.get(k))}" for k in
+            ("anti_lag", "chill", "boost", "afmf", "rsr", "frtc", "vsync")) + (f"; FreeSync {fs}" if fs else ""))
+    for m in ((c.get("modules") or {}).get("procs") or {}).items():
+        name, scan = m
+        if scan.get("status") == "ok":
+            out(f"Moduły {name}: {scan['count']} DLL; oznaczone: " + (", ".join(f["name"] for f in scan["flagged"]) or "brak"))
+        else:
+            out(f"Moduły {name}: nieznane ({scan.get('reason')})")
+    ch = c.get("changes") or {}
+    texts = (ch.get("context") or []) + (ch.get("game") or []) + (ch.get("system") or [])
+    if ch.get("game_raw_changed") and not ch.get("game"):
+        texts.append(f"plik ustawień gry: {ch['game_raw_changed']} zmienionych kluczy")
+    if c.get("previous_session"):
+        out(f"Zmiany od sesji #{c['previous_session']}: " + ("; ".join(texts) if texts else "brak wykrytych"))
+    for e in c.get("mid_session") or []:
+        out(f"- {an.fmt_ts(e['ts'])} zmiana ustawień gry: " + ("; ".join(e.get("changes") or []) or f"{e.get('raw_changed')} kluczy"))
+    for e in c.get("modules_changes") or []:
+        out(f"- {an.fmt_ts(e['ts'])} moduły: " + "; ".join(e["changes"]))
 
 
 def print_marks(ms):
@@ -451,12 +485,11 @@ def cmd_sysinfo(con, a):
     if a.diff:
         if len(rows) < 2:
             return out("Tylko jedna migawka - nie ma z czym porównać.")
-        old = json.loads(rows[1]["info"])
-        d = {k: {"before": old.get(k), "after": cur.get(k)} for k in set(cur) | set(old) if old.get(k) != cur.get(k)}
+        d = confdiff.diff(json.loads(rows[1]["info"]), cur)   # same rules as config_change incidents
         if a.json:
             return dump(d)
         out(f"## Zmiany konfiguracji {an.fmt_ts(rows[1]['ts'])} -> {an.fmt_ts(rows[0]['ts'])}")
-        return table([{"key": k, "before": v["before"], "after": v["after"]} for k, v in d.items()], maxw=300) if d else out("Brak zmian.")
+        return table([{"change": c["text"]} for c in d], maxw=300) if d else out("Brak zmian.")
     if a.json:
         return dump({"ts": rows[0]["ts"], "info": cur})
     out(f"## Konfiguracja systemu (migawka {an.fmt_ts(rows[0]['ts'])})")
@@ -532,6 +565,11 @@ def cmd_compare(con, a):
                  "versions"])
     if any(r.get("frame_gen_pct") for r in rows):
         out("fps_avg / fps_1low liczą tylko klatki gry; fps_displayed_avg z klatkami generowanymi (frame_gen_pct).")
+    for r in rows:
+        if r.get("changes"):
+            out(f"- {r['exe']} {r['group']}: zmiany względem poprzedniej grupy: " + "; ".join(r["changes"]))
+        if r.get("settings_mixed"):
+            out(f"- {r['exe']} {r['group']}: grupa łączy sesje z różnymi ustawieniami gry")
     small = sorted({r["exe"] for r in rows if r.get("small_sample")})
     if small:
         out(f"UWAGA (small_sample): za mało danych dla {', '.join(small)} - grupa ma < {an.SMALL_SAMPLE_MIN} min "

@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, framestats, gameplay, marks, stuttercause
+from . import bottleneck, crashinfo, ctxreport, diagreport, framestats, gameplay, marks, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -491,6 +491,7 @@ def session_report(con, session_id):
     rep["marks"] = marks.report(con, start, end + 5, exe)
     diagreport.extend(con, rep, row, start, end)
     rep["findings"] = _session_findings(rep, row)
+    ctxreport.extend(con, rep, row)   # rep["config"]: settings in effect, changes vs the previous session
     return rep
 
 
@@ -677,6 +678,8 @@ def incidents_between(con, t0, t1, kinds=None, limit=500):
     for r in rows:
         r["details"] = _json(r["details"])
         r["time"] = fmt_ts(r["ts"])
+        if r["kind"] == "config_change" and isinstance(r["details"], dict):   # readable lines (older rows: keys)
+            r["changed"] = [v.get("text") or k if isinstance(v, dict) else k for k, v in r["details"].items()]
     return rows
 
 
@@ -1403,7 +1406,7 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
         small |= {e for e in {r["exe"] for r in rows} if sum(1 for r in rows if r["exe"] == e) < 2}
         for r in rows:
             r["small_sample"] = r["exe"] in small
-    return rows
+    return ctxreport.annotate_compare(con, rows, {s["id"]: {**s["ctx"], "_start": s["start_ts"]} for s in metrics})
 
 
 def _shares(items):

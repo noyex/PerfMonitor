@@ -16,7 +16,7 @@ from pathlib import Path
 import psutil
 
 from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, kdumps, marks, memdiag, memleak,
-               ocanalyze, ocmon, presentmon, procwatch, resetforensics, shadercache, sysinfo)
+               ocanalyze, ocmon, presentmon, procwatch, resetforensics, sessionctx, shadercache)
 from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
@@ -133,6 +133,7 @@ class Collector:
         self.last_mem = 0.0
         self.last_kdumps = 0.0
         self.storage_limits = None     # last NVMe thresholds written to meta
+        self.session_ctx = sessionctx.SessionContext(self)   # game/system settings and DLLs in effect per session
 
     # ---------- helpers ----------
     def exec(self, sql, args=()):
@@ -580,9 +581,11 @@ class Collector:
             ctx = gamectx.collect(exe, self.hw.gpu.Name if self.hw.gpu is not None else None)
         except Exception as e:
             ctx = {"error": str(e)}
+        start = time.time()
         if stress:
             ctx["stress_test"] = stress[0]
-        start = time.time()
+        else:
+            ctx.update(self.session_ctx.start_context(name, exe, start))
         with self.lock:
             profile = ocanalyze.active_profile_id(self.con, start)
         sid = self.exec("INSERT INTO sessions(exe, path, pid, start_ts, context, kind, profile_id) VALUES (?,?,?,?,?,?,?)",
@@ -594,6 +597,7 @@ class Collector:
                            "last_summary": time.time(), "pid": pid, "children": {},
                            "stress": stress[0] if stress else None}
         if not stress:
+            self.session_ctx.started(self.games[pid], ctx)
             self.shader.set_game(exe)   # the newest game: usually the only one
             self.shader_pid = pid
             self.net.set_game(pid, name, sid)
@@ -652,6 +656,17 @@ class Collector:
         if reason == "crash":
             self.save_crash(g["session"], g["exe"], end)
         log.info("game end %s session=%s reason=%s", g["exe"], g["session"], reason)
+
+    def merge_context(self, sid, extra):
+        with self.lock:
+            r = self.con.execute("SELECT context FROM sessions WHERE id=?", (sid,)).fetchone()
+            try:
+                ctx = json.loads(r[0]) if r and r[0] else {}
+            except ValueError:
+                ctx = {}
+            ctx.update(extra)
+            self.con.execute("UPDATE sessions SET context=? WHERE id=?", (json.dumps(ctx, ensure_ascii=False), sid))
+            self.con.commit()
 
     def merge_summary(self, sid, extra):
         with self.lock:
@@ -939,18 +954,12 @@ class Collector:
             log.exception("vacuum setup")
 
     def _sysinfo(self):
-        info = sysinfo.collect()
-        prev = self.exec("SELECT info FROM system_info ORDER BY ts DESC LIMIT 1").fetchone()
-        self.exec("INSERT INTO system_info VALUES (?, ?)", (time.time(), json.dumps(info, ensure_ascii=False)))
-        if prev:
-            old = json.loads(prev[0])
-            changed = {k: {"before": old.get(k), "after": v} for k, v in info.items()
-                       if k in old and k not in ("last_boot", "volumes", "background_tools", "pagefile", "disk_health", "disk_map")
-                       and old.get(k) is not None and old.get(k) != v}   # null = was unreadable, not a change
-            if changed:
-                self.incident("config_change", "info", "Zmiana konfiguracji: " + ", ".join(changed), changed)
-            for kind, sev, title, det in diskinfo.health_changes(old, info):
-                self.incident(kind, sev, title, det)
+        try:
+            self.session_ctx.sysinfo(quick=False)
+        except Exception:
+            log.exception("system snapshot")
+        finally:
+            sessionctx.winq.release()
 
     # ---------- self reload ----------
     def check_reload(self, now):
@@ -1039,6 +1048,7 @@ class Collector:
                         if g["capture"] and now - g["last_summary"] > 60:
                             g["last_summary"] = now
                             self.save_summary(g)
+                    self.session_ctx.tick(now)
                 if now - self.last_events >= self.cfg["event_poll_s"]:
                     self.last_events = now
                     self.poll_events()

@@ -1,20 +1,18 @@
 """Disk health (SMART-like reliability counters) and per-disk stats for the session report.
 
-Pure helpers: PowerShell fragments for sysinfo.PS, health change detection, event message parsing,
+Pure helpers: the PowerShell disk health fragment for sysinfo, health change detection, event message parsing,
 per-session disk stats from samples.extra, report findings. Human-readable strings are Polish."""
 import re
 import sqlite3
 
 from . import analyze as an
 
-# Fragments for the [ordered]@{ ... } hashtable in sysinfo.PS (Get-StorageReliabilityCounter needs admin: nulls otherwise)
+# Fragment for the [ordered]@{ ... } hashtable of sysinfo.DISK_HEALTH_PS (Get-StorageReliabilityCounter needs admin: nulls otherwise)
 HEALTH_PS = (r'disk_health = @(Get-PhysicalDisk | % { $d=$_; $r = $d | Get-StorageReliabilityCounter; '
              r'[ordered]@{device=$d.DeviceId; name=$d.FriendlyName; bus="$($d.BusType)"; temp=$r.Temperature; '
              r'wear=$r.Wear; read_unc=$r.ReadErrorsUncorrected; write_unc=$r.WriteErrorsUncorrected; '
              r'read_total=$r.ReadErrorsTotal; power_on_h=$r.PowerOnHours; flush_lat_max=$r.FlushLatencyMax; '
              r'read_lat_max=$r.ReadLatencyMax; write_lat_max=$r.WriteLatencyMax} })')
-DISK_MAP_PS = (r'disk_map = @(Get-Partition | ? DriveLetter | % { [ordered]@{letter="$($_.DriveLetter)"; '
-               r'disk=$_.DiskNumber} })')
 
 WEAR_SERIOUS = 90      # % of life used: incident
 WEAR_WARN = 80         # % of life used: `pm health` warning

@@ -31,6 +31,14 @@ DEFAULTS = {
     "shader_cache_dirs": [r"%LOCALAPPDATA%\AMD\DxCache", r"%LOCALAPPDATA%\AMD\DxcCache", r"%LOCALAPPDATA%\AMD\VkCache",
                           r"%LOCALAPPDATA%\AMD\OglCache", r"%LOCALAPPDATA%\AMD\DX9Cache", "{steam}"],
     "shader_scan_interval_s": 10,
+    # Session context (perfmon/sessionctx.py): game config files re-read when they change (mtime checked this often);
+    # extra config files per exe {"game.exe": ["%LOCALAPPDATA%\\Game\\settings.ini"]}, parsed by extension
+    "game_settings_poll_s": 30,
+    "game_settings_paths": {},
+    # DLLs in the game process (overlays/hooks): first scan once the game settled, then this often; False = never
+    "game_modules": True,
+    "game_modules_settle_s": 120,
+    "game_modules_poll_s": 600,
     # ETW black box (perfmon/etwbox.py): kernel trace in memory, dumped on these triggers; mode game|always|off
     "etw": {"mode": "game", "buffer_mb": 256, "dump_last_s": 60,
             "triggers": {"dwm_stall": True, "ui_freeze": True, "user_mark": True, "stutter_burst": 5, "dpc_pct": 8},
