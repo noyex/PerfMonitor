@@ -83,6 +83,43 @@ class ServerTest(unittest.TestCase):
         r.read()
         self.assertEqual((r.status, r.getheader("Connection")), (404, "close"))
 
+    def test_cors_only_for_the_desktop_shell_origin(self):
+        r, _ = self.get("/api/games", Origin="http://tauri.localhost")
+        self.assertEqual(r.getheader("Access-Control-Allow-Origin"), "http://tauri.localhost")
+        self.assertIn("Origin", r.getheader("Vary"))
+        for origin in ("http://evil.example", "http://127.0.0.1:1"):
+            r, _ = self.get("/api/games", Origin=origin)
+            self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
+        r, _ = self.get("/api/games")
+        self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
+        r, _ = self.get("/lib.js", Origin="http://tauri.localhost")   # static files are not part of the API
+        self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
+
+    def test_preflight_and_post_from_the_desktop_shell(self):
+        host = {"Host": f"127.0.0.1:{self.port}"}
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request("OPTIONS", "/api/test", headers={**host, "Origin": "http://tauri.localhost",
+                                                    "Access-Control-Request-Method": "POST"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 204)
+        self.assertEqual(r.getheader("Access-Control-Allow-Origin"), "http://tauri.localhost")
+        self.assertIn("Content-Type", r.getheader("Access-Control-Allow-Headers"))
+        c.request("OPTIONS", "/api/test", headers={**host, "Origin": "http://evil.example"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
+        # unknown action: reaches the handler (400), so the origin check let the shell through; a stranger gets 403
+        for origin, status in (("http://tauri.localhost", 400), ("http://evil.example", 403)):
+            c = http.client.HTTPConnection("127.0.0.1", self.port)
+            c.request("POST", "/api/test", body=b'{"action": "nope"}',
+                      headers={**host, "Origin": origin, "Content-Type": "application/json"})
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, status)
+            self.assertEqual(r.getheader("Access-Control-Allow-Origin"), origin if status == 400 else None)
+
 
 if __name__ == "__main__":
     unittest.main()

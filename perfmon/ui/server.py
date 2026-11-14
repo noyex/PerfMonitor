@@ -3,6 +3,7 @@ import gzip
 import json
 import mimetypes
 import sqlite3
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,6 +91,9 @@ def _compact(name, res):
 
 
 GZIP_MIN = 1024
+# The desktop shell (src-tauri) serves the UI from its own origin and calls this API cross-origin. WebView2 on Windows
+# uses http://tauri.localhost (https:// with useHttpsScheme). Only these origins get CORS headers, never "*".
+TAURI_ORIGINS = ("http://tauri.localhost", "https://tauri.localhost")
 
 
 class _Pool:
@@ -167,6 +171,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _cors_origin(self):
+        """The request's Origin when it is the desktop shell and the path is the API, else None."""
+        origin = self.headers.get("Origin")
+        return origin if origin in TAURI_ORIGINS and self.path.startswith("/api/") else None
+
     def _gzip_ok(self):
         return "gzip" in self.headers.get("Accept-Encoding", "")
 
@@ -180,20 +189,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", cache)
+        cors = self._cors_origin()
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", cors)
         if etag:
             self.send_header("ETag", etag)
         if use_gz:
             self.send_header("Content-Encoding", "gzip")
         if self.close_connection:
             self.send_header("Connection", "close")
-        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Vary", "Accept-Encoding, Origin" if cors else "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self):
+        """CORS preflight: only for the desktop shell's origin; anyone else gets no CORS headers, so the browser blocks."""
+        origin = self._cors_origin()
+        self.send_response(204 if origin and _local_host(self.headers.get("Host", "")) else 403)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         """The write endpoints (POSTS: UV/OC profiles, tests). JSON-only + same-origin check: a web page in the browser
-        cannot post here (non-simple content type needs a CORS preflight that this server never allows)."""
+        cannot post here (non-simple content type needs a CORS preflight that only the desktop shell's origin passes)."""
         u = urlparse(self.path)
         self.close_connection = True   # early refusals leave the body unread: never reuse this connection
         origin = self.headers.get("Origin")
@@ -204,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
         if not handler:
             return self._send(404, b'{"error":"not found"}', "application/json")
         if not self.headers.get("Content-Type", "").startswith("application/json") or (
-                origin and urlparse(origin).netloc != host):
+                origin and origin not in TAURI_ORIGINS and urlparse(origin).netloc != host):
             return self._send(403, b'{"error":"forbidden"}', "application/json")
         try:
             body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
@@ -276,3 +301,13 @@ def serve(port: int):
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def main():
+    """Serve forever (the desktop shell starts this when nothing listens on the port): python -m perfmon.ui.server [port]"""
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else config.load()["ui_port"]
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
