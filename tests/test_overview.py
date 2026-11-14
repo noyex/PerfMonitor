@@ -183,10 +183,12 @@ class FrameSeriesTest(unittest.TestCase):
         con = new_db()
         now = time.time()
         add_open_session(con, 2, now - 7200)   # 120 frames in its first two minutes, two hours ago
-        whole = an.frame_series(con, None, now, session=2, max_points=100)
-        self.assertEqual(sum(1 for v in whole["fps"] if v is not None), len(whole["ts"]))
-        self.assertGreater(len(whole["ts"]), 0)
-        self.assertEqual(an.frame_series(con, None, now)["ts"], [])   # last hour: nothing
+        con.execute("UPDATE sessions SET end_ts=? WHERE id=2", (now - 7080,))
+        whole = an.frame_series(con, None, None, session=2, max_points=120)
+        self.assertEqual(whole["step_s"], 1.0)   # spread over the session, not up to now
+        self.assertEqual(len(whole["ts"]), 120)
+        self.assertEqual(whole["ts"][0], now - 7200)
+        self.assertEqual(an.frame_series(con, None, None)["ts"], [])   # last hour: nothing
 
 
 if __name__ == "__main__":
