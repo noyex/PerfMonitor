@@ -2,12 +2,17 @@
 WPR and written to data/traces when something goes wrong (user mark, frozen desktop/DWM, DPC storm, stutter burst).
 
 The capture is analysed later in a separate low-priority process (`python -m perfmon.etwbox analyze ID`, also
-`pm etw analyze ID`): tracerpt converts the .etl to CSV (no xperf/WPA without the ADK) and the last `dump_last_s`
-seconds are aggregated into the top DPC/ISR drivers and disk I/O per process. Needs admin (the collector has it)."""
+`pm etw analyze ID`): tracerpt converts the .etl to CSV (no xperf/WPA without the ADK), streamed through a named pipe
+instead of a multi-GB file, and the last `dump_last_s` seconds are aggregated into the top DPC/ISR drivers and disk I/O
+per process and file. Needs admin (the collector has it)."""
 import bisect
 import csv
+import ctypes
+import heapq
+import itertools
 import json
 import logging
+import msvcrt
 import os
 import queue
 import re
@@ -16,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict
+from array import array
 from pathlib import Path
 
 from . import config
@@ -35,6 +40,7 @@ RETRY_S = 600              # after a failed wpr -start (no admin, another kernel
 BURST_WINDOW_S = 10
 DPC_TRIGGER_S = 2
 MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
+ORPHAN_S = 3600           # a trace file no row points at yet may still be written by wpr -stop
 
 
 def settings(cfg):
@@ -205,12 +211,15 @@ class EtwBox:
         TRACES.mkdir(parents=True, exist_ok=True)
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
         t0 = time.time()
-        rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+        try:
+            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:   # still recorded as a failed capture, with the reason
+            rc, out = -1, f"{type(e).__name__}: {e}"
         self.active = False
         ok = rc == 0 and path.exists()
         summary = {"stop_s": round(time.time() - t0, 1)}
         if not ok:
-            summary["error"] = out[-300:]
+            summary["error"] = tool_error("wpr -stop", rc, out) if rc else f"wpr -stop: brak pliku {path.name}"
         self.on_capture({"ts": ts, "trigger": trigger, "session": session, "path": str(path) if ok else None,
                          "size_mb": round(path.stat().st_size / 2**20, 1) if ok else None,
                          "status": "captured" if ok else "failed", "summary": summary})
@@ -219,38 +228,96 @@ class EtwBox:
             self._start()
 
 
-def retention(con, s, now=None):
-    """Delete trace files older than retention_days, then the oldest until the total is under max_gb.
-    The rows (and their analysis) stay; path becomes NULL. Returns the number of deleted files."""
+def retention(con, s, now=None, folder=None):
+    """Keep the whole traces folder under max_gb, not just the files etw_captures points at:
+    - intermediate .csv files (left by a crashed or old-style analysis) are always deleted,
+    - files no row references (orphans) once they are ORPHAN_S old (younger ones may still be written by wpr -stop),
+    - .etl older than retention_days, then the oldest until the folder fits max_gb; analysed captures go before
+      unanalysed ones, their summary already holds what the trace was kept for.
+    The rows stay with path NULL; a capture deleted before it was analysed is marked failed with the reason.
+    Returns the number of deleted files."""
     now = now or time.time()
-    rows = con.execute("SELECT id, ts, path, size_mb FROM etw_captures WHERE path IS NOT NULL ORDER BY ts").fetchall()
-    total = sum((r[3] or 0) for r in rows)
+    folder = Path(folder or TRACES)
+    if not folder.is_dir():
+        return 0
+    rows = con.execute("SELECT id, ts, path, status FROM etw_captures WHERE path IS NOT NULL").fetchall()
+    known = {os.path.normcase(os.path.abspath(r[2])): r for r in rows}
+    deleted, total = 0, 0
+    for p in folder.iterdir():
+        key = os.path.normcase(os.path.abspath(p))
+        if p.name == "perfmon.wprp" or key in known:
+            continue
+        try:
+            st = p.stat()
+            if p.suffix.lower() == ".csv" or now - st.st_mtime > ORPHAN_S:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+                deleted += 1
+                log.info("ETW: removed intermediate/orphan %s (%.0f MB)", p.name, st.st_size / 2**20)
+            elif p.is_file():
+                total += st.st_size
+        except OSError as e:
+            log.warning("trace %s: %s", p, e)
+    files = []
+    for key, (cid, ts, path, status) in known.items():
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None                       # deleted by hand: only the row is fixed below
+        files.append((status == "captured", ts, cid, path, size))
+        total += size or 0
     gone = []
-    for cid, ts, path, size in rows:
-        if now - ts > s["retention_days"] * 86400 or total > s["max_gb"] * 1024:
-            try:
+    for _, ts, cid, path, size in sorted(files, key=lambda f: (now - f[1] <= s["retention_days"] * 86400, f[0], f[1])):
+        if size is not None and now - ts <= s["retention_days"] * 86400 and total <= s["max_gb"] * 2**30:
+            continue
+        try:
+            if size is not None:
                 os.remove(path)
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                log.warning("trace %s: %s", path, e)
-                continue
-            total -= size or 0
-            gone.append(cid)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("trace %s: %s", path, e)
+            continue
+        total -= size or 0
+        deleted += size is not None
+        gone.append(cid)
     for cid in gone:
         con.execute("UPDATE etw_captures SET path=NULL WHERE id=?", (cid,))
-    return len(gone)
+    # never analysed and now without a file: nothing will ever pick them up again
+    for cid, summ in con.execute("SELECT id, summary FROM etw_captures WHERE status='captured' AND path IS NULL"):
+        _fail(con, cid, _loads(summ), "Plik zrzutu usunięty (retencja) przed analizą")
+    return deleted
+
+
+def _loads(s):
+    try:
+        return json.loads(s) if s else {}
+    except ValueError:
+        return {}
+
+
+def _fail(con, cid, summ, error):
+    summ["error"] = str(error)[:400]
+    con.execute("UPDATE etw_captures SET status='failed', summary=? WHERE id=?",
+                (json.dumps(summ, ensure_ascii=False), cid))
 
 
 # --------------------------------------------------------------------------
-# analysis: tracerpt CSV -> top DPC/ISR drivers and disk I/O
+# analysis: tracerpt CSV (streamed through a named pipe) -> top DPC/ISR drivers and disk I/O
 # --------------------------------------------------------------------------
 # tracerpt CSV: 19 header columns then the event's user data in MOF order.
-C_NAME, C_TYPE, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 6, 9, 10, 16, 19
+C_NAME, C_TYPE, C_VERSION, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 3, 6, 9, 10, 16, 19
 DPC_OPS, ISR_OPS = {"66", "68", "69"}, {"67", "50"}     # ThreadDPC, DPC, TimerDPC / ISR, ISR-MSI
-IMAGE_OPS, PROC_OPS, THREAD_OPS = {"10", "3", "4"}, {"1", "3", "4"}, {"1", "3", "4"}
+IMAGE_OPS = {"10", "3", "4"}
+PROC_OPS = {"1", "2", "3", "4", "39"}                    # Start, End, DCStart, DCEnd, Defunct
+THREAD_OPS = {"1", "2", "3", "4"}
+FILE_NAME_OPS = {"0", "32", "35", "36"}                  # FileIo Name/FileCreate/FileDelete/FileRundown
 DISK_OPS = {"10": "read", "11": "write"}
 TOP = 10
+FT_UNIX = 11644473600                                    # seconds from 1601 (FILETIME) to 1970
+MAX_ATTEMPTS = 3                                         # analysis runs that died (killed, crash) before giving up
+# tracerpt exit codes seen in failed analyses
+TOOL_RC = {0x40010004: "proces przerwany (zabity)", 0x80070005: "odmowa dostępu", 0x80070070: "brak miejsca na dysku",
+           0x800700E7: "potok zajęty", 0x80070020: "plik używany przez inny proces", 0x80070002: "brak pliku"}
 
 
 def _int(v):
@@ -260,95 +327,107 @@ def _int(v):
         return None
 
 
-def _tail_clock(path, nbytes=2 << 20):
-    """Largest Clock-Time in the last nbytes of the CSV (tracerpt writes events in time order)."""
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        f.seek(max(0, f.tell() - nbytes))
-        lines = f.read().decode("utf-8", "replace").splitlines()[1:]
-    best = None
-    for row in csv.reader(lines, skipinitialspace=True):
-        if len(row) > C_CLOCK:
-            c = _int(row[C_CLOCK])
-            if c is not None and (best is None or c > best):
-                best = c
-    return best
+def _str(v):
+    return v.strip().strip('"')
 
 
-def _proc_name(data):
-    """ImageFileName of a Process event: the first file-name-like field after the fixed numeric ones."""
+def _proc_name(data, version=4):
+    """ImageFileName of a Process event: the field after the SID (8 since version 4 added Flags, 7 in version 3);
+    the command line after it can contain quotes that break tracerpt's CSV, so the tail is no anchor.
+    Older layouts: the first file-name-like field after the fixed ones."""
+    i = 8 if version >= 4 else 7 if version == 3 else None
+    if i is not None and len(data) > i and _str(data[i]) and not _str(data[i]).lower().startswith("0x"):
+        return _str(data[i])
     for v in data[7:]:
-        v = v.strip().strip('"')
+        v = _str(v)
         if re.fullmatch(r"[^\\/:*?\"<>|]+\.[A-Za-z0-9]{2,4}", v) and not v.lower().startswith("0x"):
             return v
     return None
 
 
+def parse_rows(lines, last_s=60, trigger_ts=None, devices=None):
+    """Aggregate tracerpt CSV lines (any iterable of str), single pass so the CSV can be streamed.
 
-
-def parse_csv(path, last_s=60):
-    """Aggregate a tracerpt CSV. DPC/ISR duration = event time - InitialTime; both clocks are reduced to 100 ns
-    units and their offset is the smallest difference seen (durations are relative to the shortest DPC, ~1 us)."""
-    end = _tail_clock(path)
-    perf_freq, clock_type, start_ft, lost = 10_000_000, 1, None, 0
-    images = []                                   # (base, end, name) kernel images
-    dpc, isr = defaultdict(list), defaultdict(list)   # routine -> raw (event time - InitialTime) values
-    thread_pid, pid_name = {}, {}
-    disk = defaultdict(lambda: {"bytes": 0, "ios": 0, "max_ms": 0.0, "read": 0, "write": 0})
+    The analysis window is the last `last_s` seconds before the trace's EndTime from the EventTrace header (the
+    first row). DPC/ISR duration = event time - InitialTime; both clocks are reduced to 100 ns units and their offset
+    is the smallest difference seen (durations are relative to the shortest DPC, ~1 us).
+    Disk I/O carries only the issuing thread id and the file object: threads -> processes and file objects -> paths
+    come from Thread/Process/FileIo events, mostly the rundown at the END of the trace, so they are resolved after
+    the pass. `at_s` fields are seconds relative to trigger_ts (negative = before the trigger)."""
+    perf_freq, clock_type, start_ft, end_ft, lost = 10_000_000, 1, None, None, 0
+    images = []                                         # (base, end, name) kernel images
+    dpc, isr = {}, {}                                   # routine -> (array of event time - InitialTime, array of times)
+    thread_pid, pid_name, file_name = {}, {}, {}
+    disk = {}               # (pid or None, tid when pid unknown yet, file object) -> [bytes, ios, rd, wr, max resp, at]
     events = 0
     filetime_clock = None
-    with open(path, encoding="utf-8", errors="replace", newline="") as f:
-        for row in csv.reader(f, skipinitialspace=True):
-            if len(row) <= C_DATA:
+    cutoff = None
+    for row in csv.reader(lines, skipinitialspace=True):
+        if len(row) <= C_DATA:
+            continue
+        name, op = row[C_NAME].strip(), row[C_OPCODE].strip()
+        data = row[C_DATA:]
+        if name == "EventTrace":
+            if row[C_TYPE].strip() == "Header" and len(data) >= 7:
+                pf, ct, st = _int(data[-6]), _int(data[-4]), _int(data[-5])
+                perf_freq = pf if pf and 10_000 <= pf <= 10**10 else perf_freq
+                clock_type, start_ft, end_ft = ct or clock_type, st, _int(data[4])
+                lost = (_int(data[11]) or 0) if len(data) > 11 else 0
+            continue
+        clock = _int(row[C_CLOCK])
+        if clock is None:
+            continue
+        if filetime_clock is None:   # tracerpt prints FILETIME for converted clocks, raw ticks otherwise
+            filetime_clock = bool(start_ft and abs(clock - start_ft) < 30 * 86400 * 10**7)
+            if end_ft and start_ft and end_ft > start_ft:
+                # raw ticks: the first event is about the trace start, the header's times are FILETIME
+                cutoff = (end_ft - int(last_s * 10**7) if filetime_clock else
+                          clock + int(((end_ft - start_ft) / 1e7 - last_s) * perf_freq))
+        if name == "Image" and op in IMAGE_OPS:
+            base, size = _int(data[0]), _int(data[1])
+            if base and size and base >= 1 << 63:     # kernel-mode image
+                images.append((base, base + size, os.path.basename(_str(data[-1])) or "?"))
+            continue
+        if name == "Process" and op in PROC_OPS and len(data) > 1:
+            pid = _int(data[1])
+            if pid is not None:
+                pid_name[pid] = _proc_name(data, _int(row[C_VERSION]) or 0) or pid_name.get(pid)
+            continue
+        if name == "Thread" and op in THREAD_OPS and len(data) > 1:
+            pid, tid = _int(data[0]), _int(data[1])
+            if tid is not None and pid is not None:
+                thread_pid[tid] = pid
+            continue
+        if name == "FileIo" and op in FILE_NAME_OPS and len(data) >= 2:
+            file_name[_str(data[0])] = _str(data[-1])
+            continue
+        if cutoff is not None and clock < cutoff:
+            continue
+        if name == "PerfInfo" and (op in DPC_OPS or op in ISR_OPS) and len(data) >= 2:
+            init, routine = _int(data[0]), _int(data[1])
+            if init is None or routine is None:
                 continue
-            name, op = row[C_NAME].strip(), row[C_OPCODE].strip()
-            data = row[C_DATA:]
-            if name == "EventTrace":
-                if row[C_TYPE].strip() == "Header" and len(data) >= 7:
-                    pf, ct, st = _int(data[-6]), _int(data[-4]), _int(data[-5])
-                    perf_freq = pf if pf and 10_000 <= pf <= 10**10 else perf_freq
-                    clock_type, start_ft = ct or clock_type, st
-                    lost = _int(data[11]) or 0 if len(data) > 11 else 0
-                continue
-            clock = _int(row[C_CLOCK])
-            if clock is None:
-                continue
-            if filetime_clock is None:   # tracerpt prints FILETIME for converted clocks, raw ticks otherwise
-                filetime_clock = bool(start_ft and abs(clock - start_ft) < 30 * 86400 * 10**7)
-            if name == "Image" and op in IMAGE_OPS:
-                base, size = _int(data[0]), _int(data[1])
-                if base and size and base >= 1 << 63:     # kernel-mode image
-                    images.append((base, base + size, os.path.basename(data[-1].strip().strip('"')) or "?"))
-                continue
-            if name == "Process" and op in PROC_OPS and len(data) > 1:
-                pid = _int(data[1])
-                if pid is not None:
-                    pid_name[pid] = _proc_name(data) or pid_name.get(pid)
-                continue
-            if name == "Thread" and op in THREAD_OPS and len(data) > 1:
-                pid, tid = _int(data[0]), _int(data[1])
-                if tid is not None:
-                    thread_pid[tid] = pid
-                continue
-            if end is not None and clock < end - _units(last_s, filetime_clock, perf_freq):
-                continue
-            if name == "PerfInfo" and (op in DPC_OPS or op in ISR_OPS) and len(data) >= 2:
-                init, routine = _int(data[0]), _int(data[1])
-                if init is None or routine is None:
-                    continue
-                if filetime_clock and clock_type == 1:
-                    init = init * 10_000_000 // perf_freq
-                (dpc if op in DPC_OPS else isr)[routine].append(clock - init)
-                events += 1
-            elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
-                size, resp, tid = _int(data[2]) or 0, _int(data[7]) or 0, _int(data[8])
-                pid = thread_pid.get(tid)
-                d = disk[pid]
-                d["bytes"] += size
-                d["ios"] += 1
-                d[DISK_OPS[op]] += size
-                d["max_ms"] = max(d["max_ms"], resp * 1000 / perf_freq)
-                events += 1
+            if filetime_clock and clock_type == 1:
+                init = init * 10_000_000 // perf_freq
+            a = (dpc if op in DPC_OPS else isr).get(routine)
+            if a is None:
+                a = (dpc if op in DPC_OPS else isr)[routine] = (array("q"), array("q"))
+            a[0].append(clock - init)
+            a[1].append(clock)
+            events += 1
+        elif name == "DiskIo" and op in DISK_OPS and len(data) >= 9:
+            size, resp, tid, fobj = _int(data[2]) or 0, _int(data[7]) or 0, _int(data[8]), _str(data[5])
+            pid = thread_pid.get(tid)   # a thread started inside the trace; else the end-of-trace rundown
+            k = (pid, None if pid is not None else tid, fobj)
+            d = disk.get(k)
+            if d is None:
+                d = disk[k] = [0, 0, 0, 0, -1, None]
+            d[0] += size
+            d[1] += 1
+            d[2 if op == "10" else 3] += size
+            if resp > d[4]:
+                d[4], d[5] = resp, clock
+            events += 1
     images.sort()
     starts = [i[0] for i in images]
 
@@ -357,42 +436,226 @@ def parse_csv(path, last_s=60):
         return images[k][2] if k >= 0 and addr < images[k][1] else "?"
 
     to_us = (lambda v: v / 10) if filetime_clock else (lambda v: v * 1e6 / perf_freq)
+    trig_ft = (trigger_ts + FT_UNIX) * 10**7 if trigger_ts and filetime_clock else None
+
+    def at(clock):
+        return round((clock - trig_ft) / 1e7, 2) if trig_ft and clock else None
+
     # The offset of the two clocks = the shortest DPC; a low percentile, because start and end paired across a clock
     # jump give absurd values both ways (seen: "56497207 ms"), and those are dropped against the final offset
-    diffs = sorted(v for aggs in (dpc, isr) for vals in aggs.values() for v in vals)
-    offset = diffs[len(diffs) // 1000] if diffs else None
+    n = sum(len(vals) for aggs in (dpc, isr) for vals, _ in aggs.values())
+    offset = heapq.nsmallest(n // 1000 + 1, (v for aggs in (dpc, isr) for vals, _ in aggs.values() for v in vals))[-1]         if n else None
     limit = _units(MAX_DPC_US / 1e6, filetime_clock, perf_freq)
 
     def top(aggs):
-        by = defaultdict(lambda: [0, 0, 0])       # driver -> [count, sum raw, max raw] (offset removed)
-        for routine, vals in aggs.items():
-            real = [max(0, v - offset) for v in vals if abs(v - offset) <= limit]
-            if real:
-                b = by[driver(routine)]
-                b[0] += len(real)
-                b[1] += sum(real)
-                b[2] = max(b[2], max(real))
-        rows = [{"driver": k, "count": v[0], "sum_us": round(to_us(v[1])), "max_us": round(to_us(v[2]))}
-                for k, v in by.items()]
+        by = {}                                   # driver -> [count, sum raw, max raw, clock of the max]
+        for routine, (vals, clocks) in aggs.items():
+            b = None
+            for v, c in zip(vals, clocks):
+                if abs(v - offset) > limit:
+                    continue
+                v = max(0, v - offset)
+                if b is None:
+                    b = by.setdefault(driver(routine), [0, 0, -1, None])
+                b[0] += 1
+                b[1] += v
+                if v > b[2]:
+                    b[2], b[3] = v, c
+        rows = [{"driver": k, "count": v[0], "sum_us": round(to_us(v[1])), "max_us": round(to_us(v[2])),
+                 "max_at_s": at(v[3])} for k, v in by.items()]
         return sorted(rows, key=lambda r: -r["sum_us"])[:TOP]
 
+    def proc(k):
+        pid = k[0] if k[0] is not None else thread_pid.get(k[1])
+        return pid_name.get(pid) or (f"pid {pid}" if pid is not None else "?")
+
+    def path(fobj):
+        p = file_name.get(fobj)
+        if not p:
+            return None
+        for dev, letter in (devices or {}).items():
+            if p.lower().startswith(dev.lower() + "\\"):
+                return letter + p[len(dev):]
+        return p
+
+    procs, files = {}, {}
+    for k, d in disk.items():
+        pname, fname = proc(k), path(k[2])
+        for agg, key in ((procs, pname), (files, (fname, pname))):
+            a = agg.setdefault(key, [0, 0, 0, 0, -1, None, None])
+            a[0] += d[0]
+            a[1] += d[1]
+            a[2] += d[2]
+            a[3] += d[3]
+            if d[4] > a[4]:
+                a[4], a[5], a[6] = d[4], d[5], fname
+    ms = lambda raw: round(raw * 1000 / perf_freq, 1)
+    mb = lambda b: round(b / 2**20, 1)
+    proc_rows = [{"process": p, "mb": mb(a[0]), "read_mb": mb(a[2]), "write_mb": mb(a[3]), "ios": a[1],
+                  "max_ms": ms(a[4]), "max_at_s": at(a[5]), "max_file": a[6]} for p, a in procs.items()]
+    file_rows = [{"file": f or "?", "process": p, "mb": mb(a[0]), "read_mb": mb(a[2]), "write_mb": mb(a[3]),
+                  "ios": a[1], "max_ms": ms(a[4])} for (f, p), a in files.items()]
     window = None
-    if end is not None and start_ft and filetime_clock:
-        window = round(min(last_s, (end - start_ft) / 1e7), 1)
-    procs = [{"process": pid_name.get(pid) or (f"pid {pid}" if pid is not None else "?"),
-              "mb": round(d["bytes"] / 2**20, 1), "read_mb": round(d["read"] / 2**20, 1),
-              "write_mb": round(d["write"] / 2**20, 1), "ios": d["ios"], "max_ms": round(d["max_ms"], 1)}
-             for pid, d in disk.items()]
+    if cutoff is not None:
+        window = round(min(last_s, (end_ft - start_ft) / 1e7), 1)
+    total = sum(d[0] for d in disk.values())
     return {
         "window_s": window, "events": events, "events_lost": lost, "images": len(images),
+        "trigger_at_s": round((end_ft - trig_ft) / -1e7, 1) if trig_ft and end_ft else None,
         "dpc_top": top(dpc), "isr_top": top(isr),
-        "disk_top": sorted(procs, key=lambda r: -r["mb"])[:TOP],
-        "disk_slowest": sorted(procs, key=lambda r: -r["max_ms"])[:5],
+        "disk_top": sorted(proc_rows, key=lambda r: -r["mb"])[:TOP],
+        "disk_slowest": sorted(proc_rows, key=lambda r: -r["max_ms"])[:5],
+        "disk_files": sorted(file_rows, key=lambda r: -r["mb"])[:TOP],
+        "disk_unattributed_pct": round(100 * sum(d[0] for k, d in disk.items() if proc(k) == "?") / total, 1)
+        if total else None,
     }
+
+
+def parse_csv(path, last_s=60, trigger_ts=None, devices=None):
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        return parse_rows(f, last_s, trigger_ts, devices)
 
 
 def _units(seconds, filetime_clock, perf_freq):
     return int(seconds * (10_000_000 if filetime_clock else perf_freq))
+
+
+def dos_devices():
+    """\\Device\\HarddiskVolumeN -> C: for the file paths of disk I/O."""
+    out = {}
+    buf = ctypes.create_unicode_buffer(1024)
+    for c in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        if ctypes.windll.kernel32.QueryDosDeviceW(f"{c}:", buf, len(buf)):
+            out[buf.value] = f"{c}:"
+    return out
+
+
+def tool_error(tool, rc, out):
+    """A short, diagnosable reason: the exit code (hex, with a known meaning) and the last real output line
+    (tracerpt prints its input file list and a progress bar before the error)."""
+    rc &= 0xFFFFFFFF
+    lines = [ln.strip() for ln in re.sub(r"\d+\.\d+%", "\n", out or "").splitlines()]
+    lines = [ln for ln in lines if ln and not set(ln) <= set("-") and not ln.lower().endswith(".etl")]
+    hint = TOOL_RC.get(rc)
+    return f"{tool} 0x{rc:08X}" + (f" ({hint})" if hint else "") + (f": {' '.join(lines[-2:])[:200]}" if lines else "")
+
+
+PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED_INSTANCES, ERROR_PIPE_CONNECTED, ERROR_NO_DATA = 3, 255, 535, 232
+INVALID_HANDLE = ctypes.c_void_p(-1).value
+TRACERPT = ["tracerpt"]
+
+
+def tracerpt_lines(etl, timeout=1800, stats=None):
+    """Yield the CSV lines of `tracerpt etl` streamed through a named pipe: no multi-GB intermediate file (a 256 MB
+    trace used to become a 2.6 GB CSV on the same disk). tracerpt opens its output several times (an empty probe,
+    the dump, a reopen after writing; a failed open = exit code 1 or 0x800700E7), so every connection gets its own
+    reader thread and two instances always listen. Raises RuntimeError when tracerpt fails.
+    stats (dict) receives bytes and the exit code."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateNamedPipeW.restype = k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateNamedPipeW.argtypes = [ctypes.c_wchar_p] + [ctypes.c_uint32] * 6 + [ctypes.c_void_p]
+    k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    k32.ConnectNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    name = rf"\\.\pipe\perfmon_etw_{os.getpid()}_{threading.get_ident()}_{time.monotonic_ns()}"
+    chunks = queue.Queue(maxsize=32)       # bounded: a slow parser throttles tracerpt instead of filling memory
+    lock, active = threading.Lock(), [0]   # instances not finished yet (listening or being read)
+    done, closed, out = threading.Event(), threading.Event(), [b""]
+    conn_ids = itertools.count()
+
+    def put(item):
+        while not closed.is_set():
+            try:
+                return chunks.put(item, timeout=0.5)
+            except queue.Full:
+                pass
+
+    def listen():
+        h = k32.CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX, 0, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 20, 0, None)
+        if h in (None, INVALID_HANDLE):
+            raise OSError(ctypes.get_last_error(), "CreateNamedPipe")
+        with lock:
+            active[0] += 1
+        threading.Thread(target=serve, args=(h, next(conn_ids)), daemon=True, name="tracerpt-pipe").start()
+
+    def serve(h, conn):
+        try:
+            # ERROR_NO_DATA: the client already opened and closed it (the probe); still an answered open
+            if not k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() not in (ERROR_PIPE_CONNECTED,
+                                                                                      ERROR_NO_DATA):
+                k32.CloseHandle(h)
+                return
+            if not done.is_set():
+                try:
+                    listen()
+                except OSError as e:
+                    log.warning("tracerpt pipe: %s", e)
+            with open(msvcrt.open_osfhandle(h, os.O_RDONLY), "rb", buffering=0) as f:
+                while b := f.read(1 << 20):
+                    put((conn, b))
+        except OSError as e:
+            log.warning("tracerpt pipe: %s", e)
+        finally:
+            with lock:
+                active[0] -= 1
+            put(None)                       # wakes the consumer to check whether everything is finished
+
+    def watch():
+        try:
+            out[0] = proc.communicate(timeout=timeout)[0] or b""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out[0] = proc.communicate()[0] or b""
+        done.set()
+        for _ in range(600):                 # end the waits of instances nobody will open now (30 s at most)
+            if not active[0]:
+                break
+            c = k32.CreateFileW(name, 0x40000000, 0, None, 3, 0, None)
+            if c not in (None, INVALID_HANDLE):
+                k32.CloseHandle(c)
+            time.sleep(0.05)
+        put(None)
+
+    listen()
+    listen()
+    proc = subprocess.Popen(TRACERPT + [str(etl), "-o", name, "-of", "CSV", "-y"], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
+    w = threading.Thread(target=watch, daemon=True, name="tracerpt")
+    w.start()
+    n, rest, src = 0, b"", None
+    try:
+        while True:
+            item = chunks.get()
+            if item is None:
+                if done.is_set() and not active[0] and chunks.empty():
+                    break
+                continue
+            if src is None:
+                src = item[0]
+            elif item[0] != src:           # only one open carries the dump; never splice another into it
+                log.warning("tracerpt: data on a second pipe connection dropped (%s bytes)", len(item[1]))
+                continue
+            b = item[1]
+            n += len(b)
+            lines = (rest + b).split(b"\n")
+            rest = lines.pop()
+            for ln in lines:
+                yield ln.decode("utf-8", "replace") + "\n"
+        if rest:
+            yield rest.decode("utf-8", "replace")
+    finally:
+        closed.set()
+        if proc.poll() is None:
+            proc.kill()
+        w.join(timeout=30)
+    rc = proc.returncode
+    if stats is not None:
+        stats.update(bytes=n, rc=rc)
+    if rc != 0 or not n:
+        raise RuntimeError(tool_error("tracerpt", rc if rc is not None else -1,
+                                      out[0].decode("oem", "replace") or "brak danych"))
 
 
 def headline(summary):
@@ -421,43 +684,71 @@ def fix_old_headlines(con):
                         (f"ETW: pominięty błędny pomiar {m[1]}", iid))
 
 
-def analyze(con, cid, keep_csv=False):
-    """tracerpt + parse_csv for capture `cid`; stores the summary and an etw_capture incident. Returns the summary."""
+def analyze(con, cid):
+    """tracerpt (streamed) + parse_rows for capture `cid`; stores the summary and an etw_capture incident.
+    Failures are stored as status failed + summary.error. Returns the summary."""
     r = con.execute("SELECT ts, trigger, path, summary FROM etw_captures WHERE id=?", (cid,)).fetchone()
     if not r:
         raise ValueError(f"Brak zrzutu ETW {cid}")
-    ts, trigger, path, old = r[0], r[1], r[2], json.loads(r[3]) if r[3] else {}
+    ts, trigger, path, old = r[0], r[1], r[2], _loads(r[3])
     if not path or not os.path.exists(path):
         raise ValueError(f"Plik zrzutu {cid} nie istnieje (retencja?)")
+    # counted before the run: one that dies (killed, out of memory) is retried at most MAX_ATTEMPTS times
+    old["attempts"] = old.get("attempts", 0) + 1
+    con.execute("UPDATE etw_captures SET summary=? WHERE id=?", (json.dumps(old, ensure_ascii=False), cid))
+    con.commit()
     s = settings(config.load())
-    out = os.path.splitext(path)[0] + ".csv"
     t0 = time.time()
+    st = {}
     try:
-        tr = subprocess.run(["tracerpt", path, "-o", out, "-of", "CSV", "-y"], capture_output=True, text=True,
-                            errors="replace", timeout=1800, creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
-        if tr.returncode != 0 or not os.path.exists(out):
-            raise RuntimeError(f"tracerpt {tr.returncode}: {(tr.stdout + tr.stderr).strip()[-300:]}")
-        t_conv = time.time() - t0
-        csv_mb = os.path.getsize(out) / 2**20
-        summ = parse_csv(out, s["dump_last_s"])
+        try:
+            devices = dos_devices()
+        except (OSError, AttributeError):
+            devices = {}
+        summ = parse_rows(tracerpt_lines(path, stats=st), s["dump_last_s"], ts, devices)
     except Exception as e:
-        old.update(error=str(e)[:300])
-        con.execute("UPDATE etw_captures SET status='failed', summary=? WHERE id=?", (json.dumps(old), cid))
+        _fail(con, cid, old, e if isinstance(e, RuntimeError) else f"analiza: {type(e).__name__}: {e}")
         con.commit()
         raise
-    finally:
-        if not keep_csv and os.path.exists(out):
-            os.remove(out)
-    summ.update(old, convert_s=round(t_conv, 1), analysis_s=round(time.time() - t0, 1), csv_mb=round(csv_mb, 1))
+    summ.update(old, analysis_s=round(time.time() - t0, 1), csv_mb=round(st.get("bytes", 0) / 2**20, 1))
     summ.pop("error", None)
-    con.execute("UPDATE etw_captures SET status='analyzed', summary=? WHERE id=?", (json.dumps(summ), cid))
+    con.execute("UPDATE etw_captures SET status='analyzed', summary=? WHERE id=?",
+                (json.dumps(summ, ensure_ascii=False), cid))
     sev, title = headline(summ)
+    # a re-analysis (pm etw analyze) replaces the capture's incident instead of adding a second one
+    con.execute("DELETE FROM incidents WHERE kind='etw_capture' AND json_extract(details, '$.capture')=?", (cid,))
     con.execute("INSERT INTO incidents(ts, end_ts, kind, severity, title, details) VALUES (?,?,?,?,?,?)",
                 (ts, None, "etw_capture", sev, f"{title} ({trigger})",
                  json.dumps({"capture": cid, "trigger": trigger, "dpc_top": summ["dpc_top"][:3],
-                             "isr_top": summ["isr_top"][:3], "disk_top": summ["disk_top"][:3]}, ensure_ascii=False)))
+                             "isr_top": summ["isr_top"][:3], "disk_top": summ["disk_top"][:3],
+                             "disk_files": summ["disk_files"][:3]}, ensure_ascii=False)))
     con.commit()
     return summ
+
+
+def next_to_analyze(con, now=None):
+    """id of the newest capture still waiting for analysis (status captured, file present, settled for
+    ANALYZE_DELAY_S, fewer than MAX_ATTEMPTS runs), None when the backlog is empty.
+    Captures whose runs all died are marked failed here."""
+    now = now or time.time()
+    for cid, summ in con.execute("SELECT id, summary FROM etw_captures WHERE status='captured' AND path IS NOT NULL "
+                                 "AND ts < ? ORDER BY ts DESC", (now - ANALYZE_DELAY_S,)).fetchall():
+        sm = _loads(summ)
+        if sm.get("attempts", 0) < MAX_ATTEMPTS:
+            return cid
+        _fail(con, cid, sm, f"Analiza przerwana {sm['attempts']} razy (proces zabity lub zawieszony)")
+        con.commit()
+    return None
+
+
+def undo_attempt(con, cid):
+    """A run stopped on purpose (a game started) does not count towards MAX_ATTEMPTS."""
+    r = con.execute("SELECT summary FROM etw_captures WHERE id=? AND status='captured'", (cid,)).fetchone()
+    if r:
+        sm = _loads(r[0])
+        sm["attempts"] = max(0, sm.get("attempts", 0) - 1)
+        con.execute("UPDATE etw_captures SET summary=? WHERE id=?", (json.dumps(sm, ensure_ascii=False), cid))
+        con.commit()
 
 
 def spawn_analysis(cid):
@@ -490,7 +781,8 @@ if __name__ == "__main__":
         c = db.connect()
         try:
             res = analyze(c, int(sys.argv[2]))
-            log.info("ETW capture %s analysed in %s s (%s MB CSV)", sys.argv[2], res["analysis_s"], res["csv_mb"])
+            log.info("ETW capture %s analysed in %s s (%s MB CSV streamed)", sys.argv[2], res["analysis_s"],
+                     res["csv_mb"])
         except Exception:
             log.exception("ETW capture %s analysis", sys.argv[2])
             sys.exit(1)

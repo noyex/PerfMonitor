@@ -93,6 +93,8 @@ class Collector:
         self.etw = etwbox.EtwBox(self.cfg, self.save_etw_capture)
         self.etw_pending = []          # (due ts, capture id) waiting for analysis
         self.etw_proc = None           # running analysis process
+        self.etw_proc_cid = None
+        self.etw_backlog_check = 0.0
         self.net = NetMonitor(self.cfg, self.on_net_second, self._net_incident, self._close_incident)
         self.name_cache = {}
         self.proc_prev = {}
@@ -657,14 +659,41 @@ class Collector:
             log.info("ETW request: %s", action)
             self.etw.control(action)
         self.etw.ensure(bool(self.games), now)
+        s = self.etw.s
+        quiet = not self.games or s["analyze_during_game"]
         if self.etw_proc is not None and self.etw_proc.poll() is None:
-            return
+            if not quiet:   # a game started: tracerpt must not compete with it; the run is not held against the capture
+                try:
+                    p = psutil.Process(self.etw_proc.pid)
+                    procs = [p] + p.children(recursive=True)   # tracerpt is the analysis process's child
+                    for c in procs:
+                        c.kill()
+                    psutil.wait_procs(procs, timeout=10)
+                except psutil.Error:
+                    pass
+                with self.lock:
+                    etwbox.undo_attempt(self.con, self.etw_proc_cid)
+                self.etw_pending.append((now, self.etw_proc_cid))     # again once the game is over
+                log.info("ETW capture %s: analysis stopped, a game started", self.etw_proc_cid)
+            else:
+                return
         self.etw_proc = None
+        if not s["analyze"] or not quiet:
+            return
         due = [p for p in self.etw_pending if p[0] <= now]
-        if due and (not self.games or self.etw.s["analyze_during_game"]):
+        cid = None
+        if due:
             self.etw_pending.remove(due[0])
-            self.etw_proc = etwbox.spawn_analysis(due[0][1])
-            log.info("ETW capture %s: analysis started", due[0][1])
+            cid = due[0][1]
+        elif now - self.etw_backlog_check >= 60 and (user_idle_s() or 0) >= s["analyze_idle_s"]:
+            # captures left over from earlier runs (the pending list is in memory) while the user is away
+            self.etw_backlog_check = now
+            with self.lock:
+                cid = etwbox.next_to_analyze(self.con, now)
+            self.etw_pending = [p for p in self.etw_pending if p[1] != cid]
+        if cid:
+            self.etw_proc, self.etw_proc_cid = etwbox.spawn_analysis(cid), cid
+            log.info("ETW capture %s: analysis started", cid)
 
     def save_crash(self, sid, exe, end):
         try:
