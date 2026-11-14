@@ -1,4 +1,4 @@
-//! PerfMonitor window: serves the static UI (from the checkout on disk) and talks to the Python API over HTTP.
+//! NX Frame window: serves the static UI (from the checkout on disk) and talks to the Python API over HTTP.
 //! The collector, analytics and CLI stay in Python; this crate only owns the window and its API server process.
 
 use std::borrow::Cow;
@@ -279,7 +279,7 @@ pub fn run() {
             Ok(())
         })
         .build(context)
-        .expect("error while building PerfMonitor")
+        .expect("error while building NX Frame")
         .run(move |_app, event| {
             if let RunEvent::Exit = event {
                 // Killing the launcher is not enough (the interpreter is its child): dropping the job ends both.

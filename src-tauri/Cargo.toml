@@ -1,12 +1,12 @@
 [package]
-name = "perfmonitor"
+name = "nxframe"
 version = "0.1.0"
-description = "PerfMonitor window"
+description = "NX Frame window"
 edition = "2021"
 publish = false
 
 [lib]
-name = "perfmonitor_lib"
+name = "nxframe_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]

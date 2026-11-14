@@ -2153,6 +2153,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxframe"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-single-instance",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2429,17 +2440,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "perfmonitor"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "tauri",
- "tauri-build",
- "tauri-plugin-single-instance",
- "windows-sys 0.60.2",
-]
 
 [[package]]
 name = "phf"
