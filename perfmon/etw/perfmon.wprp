@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- PerfMonitor ETW black box: kernel DPC/ISR, image loads (routine -> driver), disk I/O, processes/threads in a
+<!-- NX Frame ETW black box: kernel DPC/ISR, image loads (routine -> driver), disk I/O, processes/threads in a
      circular in-memory buffer. etwbox.py writes a copy with Buffers = etw.buffer_mb (1 MB buffers) and starts it with
      wpr -start <copy>!PerfMonBox -instancename PerfMonBox. CSwitch is left out on purpose (overhead). -->
-<WindowsPerformanceRecorder Version="1.0" Author="PerfMonitor">
+<WindowsPerformanceRecorder Version="1.0" Author="NX Frame">
   <Profiles>
     <SystemCollector Id="SC_PerfMonBox" Name="PerfMonBox Kernel Logger">
       <BufferSize Value="1024"/>
@@ -17,7 +17,7 @@
         <Keyword Value="DiskIO"/>
       </Keywords>
     </SystemProvider>
-    <Profile Id="PerfMonBox.Verbose.Memory" Name="PerfMonBox" Description="PerfMonitor ETW black box"
+    <Profile Id="PerfMonBox.Verbose.Memory" Name="PerfMonBox" Description="NX Frame ETW black box"
              LoggingMode="Memory" DetailLevel="Verbose">
       <Collectors>
         <SystemCollectorId Value="SC_PerfMonBox">

@@ -1,4 +1,4 @@
-"""`pm test`: change ONE setting, keep playing, get a verdict whether it helped. PerfMonitor never changes anything.
+"""`pm test`: change ONE setting, keep playing, get a verdict whether it helped. NX Frame never changes anything.
 
 Compares the last usable sessions of a game before the test started with the sessions played after; a change only counts
 when it is bigger than the session-to-session noise."""

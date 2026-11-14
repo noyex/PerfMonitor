@@ -163,7 +163,7 @@ def diff(old, new, volatile=VOLATILE, null_is_unknown=True):
         if null_is_unknown and (a is None or b is None):
             continue   # a value that became (un)readable is not a change
         if top not in old or top not in new:
-            continue   # key added by a newer PerfMonitor version: not a change of the PC
+            continue   # key added by a newer NX Frame version: not a change of the PC
         if isinstance(a, frozenset) or isinstance(b, frozenset):
             a, b = a or frozenset(), b or frozenset()
             added, removed = sorted(map(str, b - a)), sorted(map(str, a - b))

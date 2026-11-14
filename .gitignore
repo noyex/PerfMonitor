@@ -6,3 +6,4 @@ __pycache__/
 src-tauri/target/
 src-tauri/gen/
 /PerfMonitor.exe
+/NXFrame.exe

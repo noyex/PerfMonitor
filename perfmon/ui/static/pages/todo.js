@@ -1,5 +1,5 @@
 // "Co zrobić": ranked changes backed by the user's data, and before/after tests proving what helped.
-// PerfMonitor changes nothing itself: the user applies a change, then starts a test here.
+// NX Frame changes nothing itself: the user applies a change, then starts a test here.
 Pages.todo = (() => {
   const VERDICT_SEV = { pomogło: "good", pogorszyło: "critical", mieszane: "warning", "bez zmian": "muted", "za mało danych": "muted" };
   const KIND = { stability: "Stabilność", smoothness: "Płynność", latency: "Opóźnienie", fps: "FPS" };

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    perfmonitor_lib::run()
+    nxframe_lib::run()
 }

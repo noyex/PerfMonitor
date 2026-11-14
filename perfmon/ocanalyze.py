@@ -1,7 +1,7 @@
 """UV/OC: profile registry, per-session aggregates, profile comparison, V/F curves, per-core view, stability.
 
 Pure functions over a sqlite connection (the write helpers commit themselves). Used by the collector
-(session_stats, active_profile_id), the CLI (`pm oc`, `pm stress`) and the UI API. PerfMonitor never
+(session_stats, active_profile_id), the CLI (`pm oc`, `pm stress`) and the UI API. NX Frame never
 changes hardware settings: profiles only describe what the user set in BIOS / Adrenalin."""
 import json
 import time

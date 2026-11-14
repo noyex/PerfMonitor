@@ -24,9 +24,9 @@ def main():
         return
     try:
         # Own taskbar identity, otherwise Windows groups the window under pythonw.exe and its icon
-        __import__("ctypes").windll.shell32.SetCurrentProcessExplicitAppUserModelID("PerfMonitor.UI")
+        __import__("ctypes").windll.shell32.SetCurrentProcessExplicitAppUserModelID("NXFrame.UI")
         import webview
-        webview.create_window("PerfMonitor", url, width=1440, height=920, min_size=(1000, 700),
+        webview.create_window("NX Frame", url, width=1440, height=920, min_size=(1000, 700),
                               background_color="#000000")
         webview.start(icon=str(Path(__file__).parent / "static" / "favicon.ico"))
     except Exception:
