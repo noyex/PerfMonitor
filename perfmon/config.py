@@ -1,10 +1,14 @@
 """Paths and settings. Overridable via data/config.json."""
 import json
 import os
+import sys
 from pathlib import Path
 
+FROZEN = bool(getattr(sys, "frozen", False))   # the installed build (PyInstaller); else a source checkout
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or ROOT / "data")   # env override: tests
+# The installed build keeps data outside its own folder, so an update (which replaces that folder) never touches it
+_DEFAULT_DATA = Path(os.environ.get("LOCALAPPDATA", ROOT)) / "PerfMonitor" if FROZEN else ROOT / "data"
+DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or _DEFAULT_DATA)   # env override: tests
 DB_PATH = DATA_DIR / "perf.db"
 GPU_PCT_MAX = 100.0   # GPU load of one process / engine above this is a PDH artifact (seen: 3e13 %), never real
 LOG_PATH = DATA_DIR / "collector.log"
@@ -100,6 +104,15 @@ DEFAULTS = {
     # CoreCycler runs the Prime95 copy from its own folder
     "stress_path_markers": {"\\corecycler": "CoreCycler", "\\y-cruncher": "y-cruncher"},
 }
+
+
+def module_argv(module, *args, console=False):
+    """argv running `python -m module args`: the installed exe dispatches "-m" itself (perfmon/launcher.py).
+    console: python.exe rather than pythonw.exe in a source checkout (a child whose output is read)."""
+    exe = sys.executable
+    if console and not FROZEN and exe.lower().endswith("pythonw.exe") and os.path.exists(exe[:-5] + ".exe"):
+        exe = exe[:-5] + ".exe"
+    return [exe, "-m", module, *map(str, args)]
 
 
 def load() -> dict:

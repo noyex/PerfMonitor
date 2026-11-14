@@ -20,7 +20,7 @@ import time
 import zlib
 from pathlib import Path
 
-from . import config
+from . import __version__, config
 
 REPORT_VERSION = "2"   # 2: frame generation, stutter sides, settings context and hardware sections; bump for changes the source hash cannot see (e.g. a new external input)
 MIN_AGE_S = 600
@@ -28,7 +28,7 @@ _lock = threading.Lock()
 
 
 def _source_hash():
-    h = hashlib.sha1(REPORT_VERSION.encode())
+    h = hashlib.sha1((REPORT_VERSION + __version__).encode())   # the version: the installed build has no sources
     for p in sorted(Path(__file__).parent.glob("*.py")):
         h.update(p.name.encode())
         h.update(p.read_bytes())

@@ -66,7 +66,7 @@ MUTEX_NAME = os.environ.get("PERFMON_MUTEX", "Global\\PerfMonitorCollector")   #
 
 def source_stamp():
     """Newest mtime of the collector's modules (ui/ is not imported by the collector)."""
-    return max(p.stat().st_mtime for p in SRC_DIR.glob("*.py"))
+    return max((p.stat().st_mtime for p in SRC_DIR.glob("*.py")), default=0.0)   # installed build: no sources
 
 
 def is_admin():
@@ -1051,8 +1051,10 @@ class Collector:
     @staticmethod
     def _import_check():
         """Import the new code in a throwaway interpreter; returns the error text or None."""
+        if config.FROZEN:
+            return None   # the installed build's code only changes with an update, which restarts the collector
         try:
-            r = subprocess.run([sys.executable.replace("pythonw.exe", "python.exe"), "-c",
+            r = subprocess.run([*config.module_argv("perfmon.collector", console=True)[:1], "-c",
                                 "import perfmon.collector, perfmon.analyze"],
                                cwd=str(SRC_DIR.parent), capture_output=True, text=True, timeout=120,
                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -1149,7 +1151,7 @@ def single_instance(wait_s=0.0):
 
 def spawn_successor():
     """Start a new collector that takes over once we exit; it inherits our token (elevation)."""
-    args = [sys.executable, "-m", "perfmon.collector", "--wait-mutex"]
+    args = config.module_argv("perfmon.collector", "--wait-mutex")
     base = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     for flags in (base | subprocess.CREATE_BREAKAWAY_FROM_JOB, base):
         try:

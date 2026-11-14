@@ -755,10 +755,8 @@ def undo_attempt(con, cid):
 
 def spawn_analysis(cid):
     """Analyse in a separate idle-priority process (keeps the collector's GIL free)."""
-    exe = sys.executable
-    if exe.lower().endswith("pythonw.exe") and os.path.exists(exe[:-5] + ".exe"):
-        exe = exe[:-5] + ".exe"
-    return subprocess.Popen([exe, "-m", "perfmon.etwbox", "analyze", str(cid)], cwd=str(Path(__file__).parent.parent),
+    return subprocess.Popen(config.module_argv("perfmon.etwbox", "analyze", cid, console=True),
+                            cwd=str(Path(__file__).parent.parent),
                             creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
