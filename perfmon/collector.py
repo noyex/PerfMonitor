@@ -15,7 +15,7 @@ from pathlib import Path
 
 import psutil
 
-from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memdiag, memleak,
+from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, kdumps, marks, memdiag, memleak,
                ocanalyze, ocmon, presentmon, procwatch, resetforensics, shadercache, sysinfo)
 from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
 from .events import LOGS, EventReader, classify
@@ -129,6 +129,7 @@ class Collector:
         self.top_commit = []           # commit holders / compressed store size of the last procs tick (commit_full)
         self.compressed_mb = None
         self.last_mem = 0.0
+        self.last_kdumps = 0.0
         self.storage_limits = None     # last NVMe thresholds written to meta
 
     # ---------- helpers ----------
@@ -808,6 +809,20 @@ class Collector:
         if now - self.last_oc_stats > 60:
             self.last_oc_stats = now
             self.save_oc_stats()
+        if now - self.last_kdumps >= kdumps.SCAN_EVERY_S:
+            self.last_kdumps = now
+            self.scan_kdumps()
+
+    def scan_kdumps(self):
+        """New LiveKernelReports / Minidump files -> kernel_dump incidents (dated by the file)."""
+        try:
+            with self.lock:
+                new = kdumps.scan(self.con)
+                self.con.commit()
+            for sev, title, det, ts in new:
+                self.incident("kernel_dump", sev, title, det, ts=ts)
+        except Exception:
+            log.exception("kernel dump scan")
 
     # ---------- UV/OC ----------
     def check_gpu_od(self, now):

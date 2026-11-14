@@ -3,9 +3,10 @@
 Kept out of analyze.py (which only calls in here) so parallel branches touching analyze.py merge cheaply.
 Human-readable strings are Polish, like the rest of the analysis."""
 import bisect
+import time
 
 from . import analyze as an
-from . import (bottleneck, config, crashinfo, diskinfo, disktemp, etwbox, memdiag, memleak, present, procwatch,
+from . import (bottleneck, config, crashinfo, diskinfo, disktemp, etwbox, kdumps, memdiag, memleak, present, procwatch,
                resetforensics)
 
 VRAM_SHARED_MIN_MB = 512      # game's shared GPU memory above max(this, 5% of VRAM) = VRAM spills into RAM
@@ -244,6 +245,8 @@ def health_findings(con, rep):
     for w in diskinfo.health_warnings(an._json(r[0]) if r else {}):
         f.append({"severity": "warning", "title": "Zdrowie dysku", "detail": w})
     f += resetforensics.findings(rep.get("unclean_shutdowns"))
+    f += kdumps.findings(con, time.time() - float(rep.get("days") or 14) * 86400, rep.get("unclean_shutdowns"),
+                         kdumps.latest_crash_dump(con))
     if bk.get("disk_health"):
         f.append({"severity": "serious", "title": f"{bk['disk_health']}x pogorszenie zdrowia dysku",
                   "detail": "Przybyło błędów nieskorygowanych lub zużycie nośnika przekroczyło 90% - kopia zapasowa, "
@@ -268,7 +271,7 @@ def diag_markers(con, t0, t1):
 
 
 DIAG_INCIDENTS = ["user_mark", "nvme_reset", "disk_retry", "disk_removed", "disk_health", "defender_scan", "malware",
-                  "game_mem_leak", "etw_capture"]
+                  "game_mem_leak", "etw_capture", "kernel_dump"]
 
 
 def health_incidents(con, t0):

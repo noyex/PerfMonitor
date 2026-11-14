@@ -12,6 +12,7 @@ RX 9070 XT + Adrenalin 26.10 PC):
 import json
 import subprocess
 
+from . import dumpconfig
 from .diskinfo import DISK_MAP_PS, HEALTH_PS
 
 PS = r"""
@@ -86,6 +87,10 @@ def _post(info: dict) -> dict:
     dgpus = [g for g in gpus if not g.get("igpu")]
     bars = [g["bar_mb"] for g in dgpus if g.get("bar_mb")]
     info["rebar"] = (max(bars) > 256) if bars else None   # BAR above 256 MB = Resizable BAR / SAM active
+    try:
+        info["crash_dump"] = dumpconfig.read()
+    except Exception:
+        info["crash_dump"] = None   # unreadable = null, never a config change
     return info
 
 
