@@ -8,9 +8,10 @@ CTX = {"adrenalin": "26.10.1", "game_version": "1.0", "os_build": "26200.1", "bi
        "steam": {"buildid": "100", "last_updated": 5.0}, "gpus": [{"name": "RX", "driver": "32.0.1"}]}
 
 
-def add(con, sid, fps, low=95.0, spm=5.0, minutes=30, ctx=None, exe="cod.exe", lat=10.0, start=None):
+def add(con, sid, fps, low=95.0, spm=5.0, minutes=30, ctx=None, exe="cod.exe", lat=10.0, start=None, fg=None):
     start = start if start is not None else 1.7e9 + sid * 86400
-    gp = {"seconds": minutes * 60, "usable": minutes * 60 >= 120, "fps_avg": fps, "fps_1low": low, "stutters_per_min": spm}
+    gp = {"seconds": minutes * 60, "usable": minutes * 60 >= 120, "fps_avg": fps, "fps_1low": low, "stutters_per_min": spm,
+          "frame_gen_pct": fg}
     con.execute("INSERT INTO sessions(id, exe, start_ts, end_ts, end_reason, summary, context) VALUES (?,?,?,?,?,?,?)",
                 (sid, exe, start, start + minutes * 60 + 60, "exit",
                  json.dumps({"gameplay": gp, "present": {"click_lat_avg": lat}}), json.dumps(ctx or CTX)))
@@ -26,7 +27,7 @@ class RegressionTest(unittest.TestCase):
         con = new_db()
         baseline(con)
         ctx = dict(CTX, adrenalin="26.10.2", exe_mtime=2.0, steam={"buildid": "101", "last_updated": 9.0},
-                   gpus=[{"name": "RX", "driver": "32.0.2"}], game_settings={"preset": "ultra"})
+                   gpus=[{"name": "RX", "driver": "32.0.2"}])
         add(con, 10, 120, low=80, ctx=ctx)
         con.execute("INSERT INTO incidents(ts, kind, severity, title, details) VALUES (?,?,?,?,?)",
                     (1.7e9 + 7 * 86400, "config_change", "info", "Zmiana konfiguracji: bios",
@@ -35,8 +36,9 @@ class RegressionTest(unittest.TestCase):
         self.assertEqual(a["verdict"], "regression")
         v = {m["key"]: m["verdict"] for m in a["metrics"]}
         self.assertEqual((v["fps_avg"], v["fps_1low"], v["stutters_per_min"]), ("regression", "regression", "noise"))
-        keys = {c["key"] for c in a["changes"]}
-        self.assertEqual(keys, {"adrenalin", "steam.buildid", "gpus[RX].driver", "bios"})   # volatile keys skipped
+        texts = [c["text"] for c in a["changes"]]
+        self.assertEqual(texts, ["Adrenalin: 26.10.1 → 26.10.2", "build Steam: 100 → 101",
+                                 "Zmiana konfiguracji: bios"])   # volatile keys (exe_mtime, last_updated) skipped
         self.assertEqual(a["last_good"]["session"], 5)
         self.assertIn("26.10.1 → 26.10.2", a["message"])
         f = regression.finding(a)
@@ -51,14 +53,27 @@ class RegressionTest(unittest.TestCase):
         add(con, 10, 112, low=71, ctx=dict(CTX, adrenalin="26.10.2"))
         a = regression.assess(con, 10)
         self.assertEqual(a["last_good"]["session"], 2)
-        self.assertEqual([c["key"] for c in a["changes"]], ["adrenalin"])
+        self.assertEqual([c["text"] for c in a["changes"]], ["Adrenalin: 26.10.1 → 26.10.2"])
 
-    def test_new_context_keys_diff_generically(self):
+    def test_game_settings_changes_are_named(self):
         con = new_db()
         for i in range(1, 5):
-            add(con, i, 140, ctx=dict(CTX, game_settings={"preset": "high"}))
-        add(con, 10, 120, ctx=dict(CTX, game_settings={"preset": "ultra"}))
-        self.assertEqual([c["key"] for c in regression.assess(con, 10)["changes"]], ["game_settings.preset"])
+            add(con, i, 140, ctx=dict(CTX, game_settings={"normalized": {"preset": "high"}, "hash": "a"}))
+        add(con, 10, 120, ctx=dict(CTX, game_settings={"normalized": {"preset": "ultra"}, "hash": "b"}))
+        self.assertEqual([c["text"] for c in regression.assess(con, 10)["changes"]], ["preset grafiki: high → ultra"])
+
+    def test_frame_generation_sessions_only_compare_with_each_other(self):
+        con = new_db()
+        baseline(con)
+        add(con, 10, 125, low=50, fg=42.6)   # frame generation on: lower application FPS by design, not a regression
+        a = regression.assess(con, 10)
+        self.assertEqual(a["verdict"], "insufficient")
+        self.assertIn("generowania klatek", a["reason"])
+        for i in (11, 12, 13):
+            add(con, i, 124 + i % 2, low=51, fg=40)
+        add(con, 14, 126, low=50, fg=43)
+        b = regression.assess(con, 14)
+        self.assertEqual((b["verdict"], b["baseline"]["sessions"]), ("noise", [10, 11, 12, 13]))
 
     def test_within_noise_and_improvement(self):
         con = new_db()

@@ -1,27 +1,28 @@
 """Does a session play worse (or better) than the earlier sessions of the same game, and what changed in between?
 
 Baseline: up to BASELINE_N earlier usable sessions of the same game with at least MIN_MINUTES of gameplay (menus and
-loading excluded, perfmon/gameplay.py). Robust statistics: the baseline median, and its session-to-session spread as
+loading excluded, perfmon/gameplay.py) and the same frame generation state: with frame generation on, the
+application FPS and its 1% low are not comparable with sessions without it (the setting, not the PC, moved them).
+Robust statistics: the baseline median, and its session-to-session spread as
 1.4826 x MAD. A metric moved only when the change beats the minimum relative change, an absolute floor and NOISE_K
-times that spread; anything smaller is reported as within noise, never as a regression. The context diff is generic
-(every key of sessions.context, nested ones flattened), so settings other code adds to the context show up without
-changes here, plus config_change / gpu_settings_change incidents and the UV/OC profile between the last good session
-and this one."""
+times that spread; anything smaller is reported as within noise, never as a regression. What changed since the last
+good session is perfmon/ctxreport.py's readable diff (driver / OS / game build, game settings, system snapshot) plus
+config_change / gpu_settings_change incidents and the UV/OC profile in between."""
 import json
 import re
 import time
 from datetime import datetime
 
-from . import gameplay
+from . import ctxreport, gameplay
 
 BASELINE_N = 8
 MIN_BASELINE = 3          # fewer comparable sessions: no verdict
 MIN_MINUTES = 10          # gameplay minutes of the session and of each baseline session
 NOISE_K = 2.0
+FRAME_GEN_ON = 5.0        # % generated frames from which a session counts as played with frame generation
 # key, label, direction (+1 higher is better), minimum relative change, absolute floor
 METRICS = (("fps_avg", "średni FPS", 1, 0.05, 1.0), ("fps_1low", "1% low", 1, 0.07, 1.0),
            ("stutters_per_min", "stuttery/min", -1, 0.30, 0.3), ("click_lat_avg", "opóźnienie klik→obraz", -1, 0.10, 2.0))
-SKIP_CTX = re.compile(r"(_mtime|last_updated|_date)$")   # volatile or duplicate of a version key
 CHANGE_KINDS = ("config_change", "gpu_settings_change")
 GAME_ALIAS = re.compile(r"^(sp|mp|zm)\d*-", re.I)    # sp26-cod.exe and cod.exe are one game
 NO_PROBLEMS = "Brak wykrytych problemów"            # analyze._session_findings' all-clear finding
@@ -59,32 +60,13 @@ def metrics(con, r):
         return None
     return {"fps_avg": gp.get("fps_avg"), "fps_1low": gp.get("fps_1low"), "stutters_per_min": gp.get("stutters_per_min"),
             "click_lat_avg": (summ.get("present") or {}).get("click_lat_avg"), "minutes": gp["seconds"] / 60,
-            "usable": gp.get("usable", True)}
+            "usable": gp.get("usable", True), "frame_gen": (gp.get("frame_gen_pct") or 0) >= FRAME_GEN_ON}
 
 
 def _median(vs):
     vs = sorted(vs)
     n = len(vs)
     return (vs[n // 2] + vs[(n - 1) // 2]) / 2
-
-
-def _flat(d, prefix=""):
-    """{"steam": {"buildid": 1}, "gpus": [{"name": "X", "driver": 2}]} -> {"steam.buildid": 1, "gpus[X].driver": 2}."""
-    out = {}
-    for k, v in (d or {}).items():
-        if isinstance(v, dict):
-            out.update(_flat(v, f"{prefix}{k}."))
-        elif isinstance(v, list) and v and all(isinstance(x, dict) and x.get("name") for x in v):
-            for x in v:
-                out.update(_flat({kk: vv for kk, vv in x.items() if kk != "name"}, f"{prefix}{k}[{x['name']}]."))
-        elif not SKIP_CTX.search(k):
-            out[prefix + k] = v
-    return out
-
-
-def _short(v):
-    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-    return s if len(s) <= 40 else s[:39] + "…"
 
 
 def _judge(cur, base, min_n=MIN_BASELINE):
@@ -132,11 +114,16 @@ def assess(con, session_id, rows=None):
         return {"session": r["id"], "exe": r["exe"], "verdict": "insufficient",
                 "reason": f"za mało rozgrywki (potrzeba {MIN_MINUTES} min)"}
     rows = rows if rows is not None else _rows(con, r["exe"])
-    earlier = [x for x in _comparable(con, [x for x in rows if x["start_ts"] < r["start_ts"]
-                                            and game_key(x["exe"]) == game_key(r["exe"])])][-BASELINE_N:]
+    same_game = _comparable(con, [x for x in rows if x["start_ts"] < r["start_ts"] and game_key(x["exe"]) == game_key(r["exe"])])
+    earlier = [(x, m) for x, m in same_game if m["frame_gen"] == cur["frame_gen"]][-BASELINE_N:]
     if len(earlier) < MIN_BASELINE:
-        return {"session": r["id"], "exe": r["exe"], "verdict": "insufficient",
-                "reason": f"za mało porównywalnych wcześniejszych sesji ({len(earlier)} z {MIN_BASELINE})"}
+        other = len(same_game) - len([1 for _, m in same_game if m["frame_gen"] == cur["frame_gen"]])
+        why = f"za mało porównywalnych wcześniejszych sesji ({len(earlier)} z {MIN_BASELINE})"
+        if other:
+            why += (f"; {other} wcześniejszych sesji grano {'bez generowania' if cur['frame_gen'] else 'z generowaniem'} "
+                    "klatek, a to zmienia FPS gry i 1% low niezależnie od komputera")
+        return {"session": r["id"], "exe": r["exe"], "verdict": "insufficient", "reason": why,
+                "frame_gen": cur["frame_gen"]}
     base = [m for _, m in earlier]
     judged = _judge(cur, base)
     worse = [j for j in judged if j["verdict"] == "regression"]
@@ -151,7 +138,7 @@ def assess(con, session_id, rows=None):
             good = x
             break
     good = good or earlier[-1][0]
-    out = {"session": r["id"], "exe": r["exe"], "verdict": verdict, "metrics": judged,
+    out = {"session": r["id"], "exe": r["exe"], "verdict": verdict, "metrics": judged, "frame_gen": cur["frame_gen"],
            "minutes": round(cur["minutes"], 1),
            "baseline": {"sessions": [x["id"] for x, _ in earlier], "minutes": round(sum(m["minutes"] for m in base))},
            "last_good": {"session": good["id"], "time": _fmt(good["start_ts"])}}
@@ -161,22 +148,29 @@ def assess(con, session_id, rows=None):
 
 
 def context_changes(con, before, after):
-    """[{key, before, after}] of the session context, the UV/OC profile, and config incidents in between."""
-    a, b = _flat(_json(before["context"])), _flat(_json(after["context"]))
-    out = [{"key": k, "before": a.get(k), "after": b.get(k)} for k in sorted(set(a) | set(b))
-           if a.get(k) != b.get(k) and a.get(k) is not None and b.get(k) is not None]
+    """[{key, text}]: readable changes of the session context, game settings and system snapshot (ctxreport), the UV/OC
+    profile, and config / GPU tuning incidents in between that the snapshots do not already name."""
+    ch = ctxreport.changes_between(con, before, after)
+    out, values = [], set()
+    for k in ("context", "game", "system"):
+        for t in ch[k]:
+            v = t.split(": ", 1)[-1]
+            if k == "system" and "→" in v and v in values:
+                continue   # the driver change the context already names, seen again in the system snapshot
+            values.add(v)
+            out.append({"key": k, "text": t})
     if before["profile_id"] != after["profile_id"]:
-        out.append({"key": "oc_profile", "before": before["profile_id"], "after": after["profile_id"]})
+        out.append({"key": "oc_profile", "text": f"profil UV/OC: {before['profile_id']} → {after['profile_id']}"})
+    seen = {c["text"] for c in out}
     for ts, kind, title, det in con.execute(
             f"SELECT ts, kind, title, details FROM incidents WHERE kind IN ({','.join('?' * len(CHANGE_KINDS))}) "
             "AND ts > ? AND ts < ? ORDER BY ts", (*CHANGE_KINDS, before["end_ts"], after["start_ts"])):
         d = _json(det)
-        if kind == "config_change" and d:
-            have = {c["key"] for c in out}
-            out += [{"key": k, "before": v.get("before"), "after": v.get("after"), "time": _fmt(ts)}
-                    for k, v in d.items() if isinstance(v, dict) and k not in have]
-        else:
-            out.append({"key": kind, "before": None, "after": title, "time": _fmt(ts)})
+        texts = [v.get("text") for v in d.values() if isinstance(v, dict) and v.get("text")] if kind == "config_change" else []
+        for t in texts or [title]:
+            if t not in seen:
+                seen.add(t)
+                out.append({"key": kind, "text": t, "time": _fmt(ts)})
     return out
 
 
@@ -196,12 +190,11 @@ def message(a):
     txt = f"{head} względem {n} wcześniejszych sesji: " + "; ".join(_metric_text(j) for j in moved) + "."
     if a["changes"]:
         txt += (f" Od ostatniej dobrej sesji ({a['last_good']['time']}) zmieniło się: "
-                + ", ".join(f"{c['key']} {_short(c['before'])} → {_short(c['after'])}" if c["before"] is not None
-                            else _short(c["after"]) for c in a["changes"][:6])
+                + "; ".join(c["text"] for c in a["changes"][:6])
                 + (f" i {len(a['changes']) - 6} więcej" if len(a["changes"]) > 6 else "") + ".")
     else:
-        txt += (" Zapisany kontekst sesji (sterownik, wersja gry, system, BIOS, ustawienia) się nie zmienił, więc przyczyna "
-                "leży poza nim (np. ustawienia w grze, mapa, tryb).")
+        txt += (" W zapisanym kontekście (sterownik, wersja gry, Windows, BIOS, migawka systemu i ustawienia gry, o ile "
+                "były zapisane) nie ma zmian, więc przyczyny trzeba szukać poza nim (np. mapa, tryb gry, serwer).")
     return txt
 
 
