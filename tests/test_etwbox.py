@@ -192,28 +192,31 @@ class BoxTest(unittest.TestCase):
         self.assertFalse(self.box.active)
         self.assertEqual(self.calls, ["-cancel", "-start", "-stop", "-start", "-cancel"])
 
-    def test_dump_runs_below_normal_and_settles(self):
+    def test_dump_runs_below_normal(self):
         self.box.active = True
         self.box.want = True
         self.assertTrue(self.box.trigger("user_mark", now=1000.0))
-        self.assertEqual(self.box.quiet_until, float("inf"))         # queued: its stutters are no burst yet
         self.drain()
         self.assertEqual(self.calls[-2:], ["-stop", "-start"])
         self.assertEqual(self.flags["-stop"], etwbox.BELOW_NORMAL_PRIORITY_CLASS)
-        self.assertLess(self.box.quiet_until, time.time() + etwbox.DUMP_SETTLE_S + 1)
 
-    def test_burst_cooldown_and_dump_stutters(self):
+    def test_failed_burst_dump_frees_the_burst_cooldown(self):
         self.box.active = True
-        p = mock.patch.object(self.box.q, "put")                     # no worker: the dump stays "running"
+        with mock.patch.object(etwbox, "wpr", lambda *a, **k: (1, "error")):
+            self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0))
+            self.drain()
+        self.assertEqual(self.captures[-1]["status"], "failed")
+        self.box.active = True
+        self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0 + etwbox.COOLDOWN_S))
+
+    def test_burst_cooldown(self):
+        self.box.active = True
+        p = mock.patch.object(self.box.q, "put")                     # no worker: the box stays recording
         p.start()
         self.addCleanup(p.stop)
         for i in range(5):
             self.box.on_stutter(100.0 + i, 1)
         self.assertEqual(self.box.last_burst, self.box.last_dump)
-        for i in range(10):                                          # the dump's own stutters
-            self.assertFalse(self.box.on_stutter(110.0 + i, 1))
-        self.assertEqual(self.box.stutters, [])
-        self.box.quiet_until = 0.0
         later = self.box.last_dump + etwbox.COOLDOWN_S + 1
         self.assertFalse(self.box.trigger("stutter_burst", now=later))   # burst cooldown, not the 120 s one
         self.assertTrue(self.box.trigger("dwm_stall", now=later))        # other triggers keep the short one
@@ -308,14 +311,16 @@ class RetentionTest(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         self.con.executemany("INSERT INTO etw_captures(ts, trigger, session, status, summary) VALUES (?,?,?,?,?)",
                              [(1000.0, "stutter_burst", 1, "analyzed", json.dumps({"stop_s": 8.0})),
-                              (2000.0, "user_mark", 1, "failed", "{}")])
+                              (2000.0, "dwm_stall", 1, "analyzed", json.dumps({"stop_s": 8.0})),
+                              (3000.0, "user_mark", 1, "failed", "not json")])
         ext = diagreport.StutterExt(self.con, {"exe": "game.exe", "id": 1, "path": None}, 900, 3000)
-        tags = lambda ts: ext.refine(ts, [], [])
-        self.assertNotIn("etw_dump", tags(1000.0))                   # the burst that triggered it is the game's
-        self.assertIn("etw_dump", tags(1005.0))
-        self.assertIn("etw_dump", tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S))
-        self.assertNotIn("etw_dump", tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S + 1))
-        self.assertIn("etw_dump", tags(2015.0))                      # no stop_s recorded: the default length
+        tags = lambda ts: ext.refine(ts, [], ["disk"])
+        self.assertEqual(tags(1000.0), ["disk"])                     # the burst that triggered it is the game's
+        self.assertEqual(tags(1005.0), ["etw_dump"])                 # the dump's flush is no disk problem
+        self.assertEqual(tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S), ["etw_dump"])
+        self.assertEqual(tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S + 1), ["disk"])
+        self.assertEqual(tags(2005.0), ["disk", "etw_dump"])         # a freeze dump: the problem may still be on
+        self.assertEqual(tags(3005.0), ["disk"])                     # no stop_s: not a dump that ran
 
     def test_settings_merge(self):
         s = etwbox.settings({"etw": {"mode": "always", "triggers": {"dpc_pct": 0}}})

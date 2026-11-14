@@ -110,7 +110,8 @@ KEY_COLS = ["cpu_total", "cpu_core_max", "cpu_clock_mhz", "cpu_temp", "cpu_power
             "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w", "gpu_fan_rpm", "disk_lat_ms",
             "disk_busy_pct", "ui_ms", "dwm_ms"]
 
-NOT_BACKGROUND = {"system idle process", "system", "idle", "presentmon.exe", "memory compression", "registry"}
+NOT_BACKGROUND = {"system idle process", "system", "idle", "presentmon.exe", "memory compression", "registry",
+                  "wpr.exe"}   # wpr.exe: PerfMonitor's own ETW dump, tagged etw_dump instead
 
 
 # --------------------------------------------------------------------------
