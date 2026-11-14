@@ -24,7 +24,10 @@ Pages.overview = (() => {
   const perMin = (s) => (s.duration_s > 0 ? (s.stutters || 0) / (s.duration_s / 60) : 0);
   const severity = (s) => (perMin(s) >= 20 ? "bad" : perMin(s) >= 5 ? "warn" : "ok");
   const hasFrames = (s) => !!s.frames || s.fps_live != null;
-  const fpsOf = (s) => (s.running ? s.fps_live ?? s.fps_avg : s.fps_avg);
+  // with frame generation the game's own frames are the number to judge; the presented ones go in the stat row
+  const frameGen = (s) => s.frame_gen_pct > 0 && s.app_fps_avg != null;
+  const fpsOf = (s) => (s.running ? (frameGen(s) ? s.app_fps_live : null) ?? s.fps_live ?? s.fps_avg : frameGen(s) ? s.app_fps_avg : s.fps_avg);
+  const shownOf = (s) => (s.running ? s.fps_live ?? s.fps_avg : s.fps_avg);
   const ms = (v) => (v == null ? "–" : v >= 1000 ? `${fmt(v / 1000, 1)} s` : `${fmt(v)} ms`);
   const count = (v) => String(v).replace(/\B(?=(\d{3})+$)/g, " ");
   const label = (s) => `${s.running ? "na żywo" : when(s.start_ts)}, ${fmtDur(s.duration_s)}`;
@@ -58,8 +61,9 @@ Pages.overview = (() => {
     const b = s.bottleneck;
     const share = b && b.share != null && b.kind !== "mixed" ? ` ${fmt(b.share)}% czasu` : "";
     return [
-      stat(fmt(s.fps_1low), "1% low"),
-      stat(fmt(s.fps_01low), "0,1% low"),
+      ...(frameGen(s) ? [stat(fmt(shownOf(s)), "wyświetlane")] : []),
+      stat(fmt(frameGen(s) ? s.app_fps_1low ?? s.fps_1low : s.fps_1low), "1% low"),
+      stat(fmt(frameGen(s) ? s.app_fps_01low ?? s.fps_01low : s.fps_01low), "0,1% low"),
       stat(count(s.stutters || 0), "przycięcia", severity(s)),
       stat(ms(s.ft_max), "najdłuższa klatka"),
       stat(b ? BOTTLENECK[b.kind] || b.kind : "–", `ogranicza${share}`),

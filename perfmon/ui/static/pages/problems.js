@@ -48,15 +48,18 @@ Pages.problems = (() => {
     if (interp.length) title = interp[0].replace(/^[^:]*:\s*/, "").split(" (")[0].split(" - ")[0];
     else title = r.source || "Nieoczekiwane wyłączenie";
     title = title.charAt(0).toUpperCase() + title.slice(1);
+    const fx = r.forensics || {};   // last minute before the reset (perfmon/resetforensics.py)
     const sample = r.last_sample_before;
     const sampleTs = sample && (sample.ts || (sample.time ? localTs(sample.time) : null));
     const flags = [
       bc ? `BugCheck 0x${bc.toString(16).toUpperCase()}` : null,
       r.power_button_ts && r.power_button_ts !== "0" ? "przycisk zasilania" : null,
       r.during_shutdown || (r.sleep_in_progress && r.sleep_in_progress !== "0") ? "podczas zamykania/usypiania" : null,
+      fx.frozen_s_before ? `obraz zamrożony ${fmtDur(fx.frozen_s_before)} wcześniej` : null,
+      fx.down_s != null && fx.down_s < 300 ? `sam wstał po ${fmtDur(fx.down_s)}` : null,
       sampleTs ? `ostatni pomiar ${fmtTime(sampleTs, false)}` : null,
     ].filter(Boolean);
-    return h("div", { class: "row", title: interp.join("\n") || r.message || "", onclick: () => (sampleTs ? go(sampleTs - 900, sampleTs + 120) : around(r.ts, 900, 120)) },
+    return h("div", { class: "row", title: [...interp, ...(fx.notes || [])].join("\n") || r.message || "", onclick: () => (sampleTs ? go(sampleTs - 900, sampleTs + 120) : around(r.ts, 900, 120)) },
       h("span", { class: "time" }, fmtTime(r.ts)),
       h("span", { class: "title" }, title),
       h("span", { class: "aside" }, flags.join(" · ")));
@@ -94,7 +97,8 @@ Pages.problems = (() => {
     return limited(events, (g) => {
       const ts = localTs(g.time);
       const dur = g.items.map((i) => i.duration_s).find((d) => d != null);
-      const title = g.items.some((i) => i.kind === "app_not_responding") ? g.items[0].title : g.items.map((i) => KIND[i.kind] || i.title).join(" · ");
+      const n = Math.max(...g.items.map((i) => i.count || 1));   // repeats coalesced into one episode
+      const title = (g.items.some((i) => i.kind === "app_not_responding") ? g.items[0].title : g.items.map((i) => KIND[i.kind] || i.title).join(" · ")) + (n > 1 ? ` · ${n}×` : "");
       return h("div", { class: "row", onclick: () => around(ts, 300) },
         h("span", { class: "time" }, fmtTime(ts)),
         h("span", { class: "title" }, title),
@@ -107,7 +111,7 @@ Pages.problems = (() => {
     limited(items.slice().sort((a, b) => b.ts - a.ts), (i) =>
       h("div", { class: "row", onclick: () => around(i.ts, 300) },
         h("span", { class: "time" }, fmtTime(i.ts)),
-        h("span", { class: "title" }, i.title),
+        h("span", { class: "title" }, i.count > 1 ? `${i.title} · ${i.count}×` : i.title),
         h("span", { class: `sev ${i.severity}` }, sevLabel[i.severity] || i.severity)));
 
   // ---------- Powtarzające się crashe ----------

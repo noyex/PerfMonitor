@@ -13,6 +13,7 @@ Pages.games = (() => {
     shader_or_unknown: "Kompilacja shaderów / nieznane",
     vram_shared: "VRAM przelewa się do RAM",
     disk_reset: "Reset dysku",
+    disk_hot: "Gorący dysk z grą",
     pagefile: "Plik wymiany",
     shader_compile: "Kompilacja shaderów",
     "background_scan:defender": "Skan Defendera",
@@ -24,6 +25,16 @@ Pages.games = (() => {
   };
 
   const END = { crash: ["critical", "Crash"], unknown: ["serious", "Nieznany koniec"] };
+  const SIDE = { cpu: "po stronie CPU", gpu: "po stronie GPU", present: "w kolejce klatek" };
+
+  // normalized game settings (perfmon/gamesettings.py) as one line; values the game stores as bare numbers stay numbers
+  const GS = [["resolution"], ["preset", "preset"], ["upscaler"], ["upscaler_mode"], ["frame_gen", "generator klatek"], ["fps_cap", "limit FPS"], ["vsync", "VSync"], ["ray_tracing", "RT"]];
+  const gameSettings = (g) => {
+    if (!g) return null;
+    const on = (v) => (v === true ? "wł." : v === false || v === "off" ? "wył." : v);
+    return GS.filter(([k]) => g[k] != null && g[k] !== "").map(([k, l]) => (l ? `${l} ${on(g[k])}` : on(g[k]))).join(" · ") || null;
+  };
+  const overlays = (m) => (m && m.status === "ok" && (m.flagged || []).length ? m.flagged.map((x) => x.name).join(", ") : null);
 
   const tile = (label, value, unit, meta) =>
     h("div", { class: "tile" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value, unit ? h("small", {}, unit) : null), h("div", { class: "meta" }, meta || ""));
@@ -113,11 +124,15 @@ Pages.games = (() => {
 
     const st = d.stutters || {};
     if (hasFrames) {
+      // with frame generation the game renders fewer frames than the screen shows: judge the game's own frames
+      const fg = s.frame_gen_pct > 0 && s.app_fps_avg != null;
+      // lows of the game's frames exist only for sessions recorded with them; older ones show the presented lows
+      const low = (app, shown) => (fg && app != null ? [fmt(app), null, `wyświetlane ${fmt(shown)}`] : [fmt(shown), null, fg ? "z generowanymi" : ""]);
       view.append(
         h("div", { class: "tiles" },
-          tile("Średni FPS", fmt(s.fps_avg)),
-          tile("1% low", fmt(s.fps_1low)),
-          tile("0,1% low", fmt(s.fps_01low)),
+          tile("Średni FPS", fmt(fg ? s.app_fps_avg : s.fps_avg), null, fg ? `wyświetlane ${fmt(s.fps_avg)} · ${fmt(s.frame_gen_pct)}% generowanych` : ""),
+          tile("1% low", ...low(s.app_fps_1low, s.fps_1low)),
+          tile("0,1% low", ...low(s.app_fps_01low, s.fps_01low)),
           tile("Przycięcia", fmt(st.per_min, 2), "/min", `${fmt(st.count)} łącznie · najgorsze ${fmt(st.worst_ft_ms)} ms`))
       );
     }
@@ -201,10 +216,14 @@ Pages.games = (() => {
 
     // Stutters
     const causes = Object.entries(st.cause_counts || {}).sort((a, b) => b[1] - a[1]);
-    if (causes.length) {
+    // where the long frames' time went (PresentMon busy times; sessions recorded before them have none)
+    const sides = Object.entries(st.sides || {}).sort((a, b) => b[1] - a[1]);
+    if (causes.length || sides.length) {
       view.append(
         h("h2", {}, "Przyczyny przycięć"),
-        h("div", { class: "list static" }, causes.map(([c, n]) => h("div", { class: "row" }, h("span", { class: "title" }, causeLabel(c)), h("span", { class: "aside" }, fmt(n)))))
+        h("div", { class: "list static" },
+          causes.map(([c, n]) => h("div", { class: "row" }, h("span", { class: "title" }, causeLabel(c)), h("span", { class: "aside" }, fmt(n)))),
+          sides.map(([c, n]) => h("div", { class: "row" }, h("span", { class: "title" }, `Klatka utknęła ${SIDE[c] || c}`), h("span", { class: "aside" }, fmt(n)))))
       );
     }
     const worst = (st.worst || []).slice(0, 5);
@@ -215,7 +234,7 @@ Pages.games = (() => {
           worst.map((w) =>
             h("div", { class: "row go", onclick: () => zoom(w.ts - 30, w.ts + 30) },
               h("span", { class: "time" }, fmtTime(w.ts, false)),
-              h("span", { class: "title" }, (w.causes || []).map(causeLabel).join(", ") || "Nieznana przyczyna"),
+              h("span", { class: "title" }, [(w.causes || []).map(causeLabel).join(", ") || "Nieznana przyczyna", SIDE[w.side]].filter(Boolean).join(" · ")),
               h("span", { class: "aside" }, `${fmt(w.ft_ms)} ms`))))
       );
     }
@@ -237,6 +256,7 @@ Pages.games = (() => {
         p.composed_pct > 0 ? `przez DWM ${fmt(p.composed_pct)}%` : null,
         lat != null ? `opóźnienie klik→obraz ${fmt(lat)} ms` : null,
         p.frame_gen_pct > 0 ? `generowane klatki ${fmt(p.frame_gen_pct)}%` : null,
+        d.pacing && d.pacing.disp_jitter_pct != null ? `nierówność klatek ${fmt(d.pacing.disp_jitter_pct, 1)}%` : null,
       ].filter(Boolean);
       if (parts.length) view.append(h("div", { class: "line" }, `Prezentacja: ${parts.join(" · ")}`));
     }
@@ -244,6 +264,11 @@ Pages.games = (() => {
     const mg = d.mem_growth;
     if (mg) {
       view.append(h("div", { class: "line" }, `Pamięć gry: ${fmt(mg.private_start_mb)} → ${fmt(mg.private_end_mb)} MB (${mg.mem_growth_mb_h > 0 ? "+" : ""}${fmt(mg.mem_growth_mb_h)} MB/h)${mg.leak ? " – możliwy wyciek" : ""}`));
+    }
+
+    const dt = d.disk_temp;
+    if (dt && dt.hottest_max_c != null) {
+      view.append(h("div", { class: "line" }, `Dysk z grą: do ${fmt(dt.hottest_max_c)}°C${dt.warn_c ? ` (próg ostrzegawczy ${fmt(dt.warn_c)}°C)` : ""}`));
     }
 
     const inc = d.incidents || [];
@@ -254,15 +279,19 @@ Pages.games = (() => {
           inc.map((i) =>
             h("div", { class: "row go", onclick: () => zoom(i.ts - 120, (i.end_ts || i.ts) + 120) },
               h("span", { class: "time" }, fmtTime(i.ts, false)),
-              h("span", { class: "title" }, i.title),
+              h("span", { class: "title" }, i.count > 1 ? `${i.title} · ${i.count}×` : i.title),
               h("span", { class: `sev ${i.severity}` }, sevLabel[i.severity] || i.severity)))
         )
       );
     }
 
-    // Context
+    // Context: what was in effect (what changed vs the previous session is a finding above)
     const c = s.context || {};
+    const cfg = d.config || {};
     const kv = [
+      ["Ustawienia gry", gameSettings(cfg.game_settings)],
+      ["Nakładki w grze", overlays(cfg.modules)],
+      ["Plan zasilania", (cfg.power || {}).name],
       ["Sterownik GPU", [c.adrenalin || s.gpu_driver, c.gpu_driver ? `(${c.gpu_driver})` : null].filter(Boolean).join(" ")],
       ["Wersja gry", s.game_version],
       ["Windows", c.os_build],

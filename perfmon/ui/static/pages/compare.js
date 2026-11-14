@@ -125,8 +125,14 @@ Pages.compare = (() => {
     const head = h("tr", {}, h("th", {}, first), h("th", { class: "num" }, "Sesje"), h("th", { class: "num" }, "Minuty"), h("th", { class: "num" }, "Śr. FPS"), h("th", { class: "num" }, "Δ"), h("th", { class: "num" }, "1% low"), h("th", { class: "num" }, "Δ"), h("th", { class: "num" }, "Stutter/min"), extra.map(([l]) => h("th", {}, l)));
     const body = groups.map((g) => {
       const small = g.small_sample ?? g.minutes < MIN_MINUTES;
-      return h("tr", { class: small ? "small" : "", onclick: () => (location.hash = `#/games?id=${g.session_ids[0]}`) },
-        h("td", {}, split ? SPLIT_LABEL[g.group] || g.group : groupLabel(g, by), small ? h("span", { class: "note" }, "mała próba") : null),
+      // FPS columns count the game's own frames; a group played with frame generation says so, and what changed
+      // since the previous group (settings, driver, system) is in the row's tooltip
+      const changes = g.changes || [];
+      return h("tr", { class: small ? "small" : "", title: changes.join("
+"), onclick: () => (location.hash = `#/games?id=${g.session_ids[0]}`) },
+        h("td", {}, split ? SPLIT_LABEL[g.group] || g.group : groupLabel(g, by), small ? h("span", { class: "note" }, "mała próba") : null,
+          g.frame_gen_pct >= 5 ? h("span", { class: "note" }, `generowanie klatek ${fmt(g.frame_gen_pct)}%`) : null,
+          changes.length ? h("span", { class: "note" }, changes.length === 1 ? changes[0] : `${changes.length} zmiany ustawień`) : null),
         h("td", { class: "num" }, fmt(g.sessions)),
         h("td", { class: "num" }, fmt(g.minutes)),
         h("td", { class: "num" }, fmt(g.fps_avg, 1)),
