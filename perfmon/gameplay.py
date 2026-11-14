@@ -5,6 +5,8 @@ bottleneck use gameplay seconds only. Rules come from this PC's data: menus run 
 cutscenes and AFK have no input, shader compilation pegs all cores."""
 from collections import Counter
 
+from . import framestats as fs
+
 MIN_GAMEPLAY_S = 120     # below this a session says nothing about FPS (launcher restarts, 40 s sessions)
 WARMUP_S = 30            # first seconds: shader warm-up, intro, loading
 IDLE_S = 30              # no input this long = cutscene, AFK, match wait
@@ -60,10 +62,12 @@ def _fill_gaps(frames, kept):
 
 
 def session_rows(con, sid, start, end):
-    """(frames, samples) as dicts, the input of select()."""
-    fkeys = ("ts", "fps", "frames", "ft_p99")
-    frames = [dict(zip(fkeys, r)) for r in con.execute(
-        f"SELECT {', '.join(fkeys)} FROM frames WHERE session=? AND fps>0 ORDER BY ts", (sid,))]
+    """(frames, samples) as dicts, the input of select(). fps / frames / ft_p99 are application frames (frame
+    generation left out, old rows as recorded); disp_* the presented ones."""
+    cols = {"ts": "ts", "fps": fs.APP_FPS, "frames": fs.APP_FRAMES, "ft_p99": fs.APP_FT_P99, "disp_fps": "fps",
+            "disp_frames": "frames", "anim_err": "anim_err", "disp_ft_sd": "disp_ft_sd", "frame_gen_pct": "frame_gen_pct"}
+    frames = [dict(zip(cols, r)) for r in con.execute(
+        f"SELECT {', '.join(cols.values())} FROM frames WHERE session=? AND {fs.APP_FPS}>0 ORDER BY ts", (sid,))]
     skeys = ("ts", "gpu_load", "gpu_power_w", "user_idle_s", "cpu_total", "fg_exe")
     samples = [dict(zip(skeys, r)) for r in con.execute(
         f"SELECT {', '.join(skeys)} FROM samples WHERE ts BETWEEN ? AND ?", (start, end + 1))]
@@ -72,6 +76,8 @@ def session_rows(con, sid, start, end):
 
 def stats(con, sid, start, end):
     """summary.gameplay: gameplay-only FPS / 1% low / stutters and whether the session is usable for comparisons.
+    fps_avg / fps_1low count application frames (what comparisons use), fps_displayed_avg the presented ones;
+    they differ only with frame generation (frame_gen_pct).
     None without frames (no PresentMon, pruned by retention): nothing to judge, not a bad session."""
     frames, samples = session_rows(con, sid, start, end)
     if not frames:
@@ -89,4 +95,11 @@ def stats(con, sid, start, end):
                # frame-weighted mean of the per-second p99 frame time: comparable between sessions, not PresentMon's 1% low
                fps_1low=round(1000 * sum(w for _, w in p99) / sum(v * w for v, w in p99), 1) if p99 else None,
                stutters=stutters, stutters_per_min=round(60 * stutters / secs, 2))
+    disp = [(f["disp_frames"], f["disp_fps"]) for f in keep if f["disp_frames"] and f["disp_fps"]]
+    gen = [(f["frame_gen_pct"], f["disp_frames"] or 0) for f in keep if f["frame_gen_pct"] is not None]
+    gw = sum(w for _, w in gen)
+    out.update(fps_displayed_avg=round(sum(n for n, _ in disp) / sum(n / v for n, v in disp), 1) if disp else None,
+               frame_gen_pct=round(sum(v * w for v, w in gen) / gw, 1) if gw else None,
+               pacing=fs.pacing_rows([{"frames": f["disp_frames"], "fps": f["disp_fps"], "anim_err": f["anim_err"],
+                                       "disp_ft_sd": f["disp_ft_sd"]} for f in keep]))
     return out

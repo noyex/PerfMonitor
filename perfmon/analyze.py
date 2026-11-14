@@ -13,7 +13,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-from . import bottleneck, crashinfo, diagreport, gameplay, marks, stuttercause
+from . import bottleneck, crashinfo, diagreport, framestats, gameplay, marks, stuttercause
 
 # --------------------------------------------------------------------------
 # Time parsing / generic helpers
@@ -295,7 +295,8 @@ def _flatten_session(r, stutters=None, ends=None):
         "duration_s": round((end or time.time()) - r["start_ts"]) if r["start_ts"] else None,
         "running": running, "kind": r.get("kind") or "game", "profile_id": r.get("profile_id"),
     }
-    for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error"):
+    for k in ("frames", "fps_avg", "fps_1low", "fps_01low", "ft_median", "ft_p99", "ft_max", "error",
+              "app_fps_avg", "app_fps_1low", "app_fps_01low", "frame_gen_pct"):   # app_*: frame generation left out
         d[k] = summ.get(k)
     ctx = _ctx(r)
     d["context"] = ctx or None
@@ -386,9 +387,10 @@ def session_report(con, session_id):
     rep = {"session": _flatten_session(row, ends=ends), "summary": _json(row["summary"]) or {}, "duration_s": round(dur),
            "start": fmt_ts(start), "end": fmt_ts(end)}
 
-    # --- frames: bound shares + fps timeline
-    frames = _rows(con, "SELECT ts, fps, ft_p99, ft_max, cpu_busy, gpu_busy, bound, present_mode FROM frames "
-                        "WHERE session=? ORDER BY ts", (row["id"],))
+    # --- frames: bound shares + fps timeline; fps = application frames (frame generation left out), disp_fps presented
+    frames = _rows(con, f"SELECT ts, {framestats.APP_FPS} AS fps, fps AS disp_fps, frames, ft_p99, ft_max, "
+                        f"{framestats.APP_FT_AVG} AS app_ft, cpu_busy, gpu_busy, bound, present_mode, frame_gen_pct "
+                        f"FROM frames WHERE session=? ORDER BY ts", (row["id"],))
     bound_counts = Counter(f["bound"] for f in frames if f["bound"])
     nb = sum(bound_counts.values())
     rep["bound_pct"] = {k: _r(100 * bound_counts.get(k, 0) / nb) for k in ("GPU", "CPU", "limit")} if nb else {}
@@ -403,11 +405,20 @@ def session_report(con, session_id):
             "present_mode": Counter(f["present_mode"] for f in frames if f["present_mode"]).most_common(1)[0][0]
             if any(f["present_mode"] for f in frames) else None,
         }
+        disp = [f["disp_fps"] for f in frames if f["disp_fps"]]
+        gen = [(f["frame_gen_pct"], f["frames"] or 0) for f in frames if f["frame_gen_pct"] is not None]
+        gw = sum(w for _, w in gen)
+        rep["fps_timeline"].update(displayed_avg=_r(sum(disp) / len(disp)) if disp else None,
+                                   frame_gen_pct=_r(sum(v * w for v, w in gen) / gw) if gw else None)
     else:
         rep["fps_timeline"] = {}
+    summ = rep["summary"]
+    rep["pacing"] = summ.get("pacing") or framestats.session_pacing(con, row["id"])
 
     # --- stutters with causes
-    st = _rows(con, "SELECT ts, ft_ms, median_ms, causes FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
+    # stutters.causes is never written (causes need the session's baseline): judged here on every report
+    st = _rows(con, "SELECT ts, ft_ms, median_ms, side, cpu_busy, cpu_wait, gpu_busy, gpu_wait, generated, anim_err "
+                    "FROM stutters WHERE session=? ORDER BY ts", (row["id"],))
     samples = _rows(con, "SELECT ts, cpu_core_max, gpu_load, gpu_vram_mb, gpu_vram_total_mb, ram_pct, commit_gb, pagefile_pct, "
                          "commit_limit_gb, disk_lat_ms, hard_faults_s, dpc_pct, interrupt_pct, cpu_temp, gpu_hotspot, "
                          "fg_exe, gpu_power_w, user_idle_s, cpu_total FROM samples WHERE ts BETWEEN ? AND ? ORDER BY ts",
@@ -425,7 +436,7 @@ def session_report(con, session_id):
             cause_counts[c] += 1
             if c.startswith("background:"):
                 bg_counts[c.split(":", 1)[1]] += 1
-    ranked = _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext)
+    ranked, sides = _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext)
     if ranked is not None:   # keep only what stutters have more often than normal gameplay
         confirmed = {r["tag"] for r in ranked if r["verdict"] in ("confirmed", "weak")}
         cause_counts = Counter()
@@ -442,7 +453,12 @@ def session_report(con, session_id):
         "ambient": [r for r in ranked or [] if r["verdict"] == "ambient" and r["tag"] != "shader_or_unknown"],
         "background_procs": dict(bg_counts.most_common(5)),
         "worst": [{"ts": w["ts"], "time": fmt_ts(w["ts"]), "ft_ms": _r(w["ft_ms"]), "median_ms": _r(w["median_ms"]),
-                   "causes": w["causes"]} for w in worst],
+                   "causes": w["causes"], "side": w["side"], "cpu_busy": _r(w["cpu_busy"]),
+                   "gpu_busy": _r(w["gpu_busy"]), "cpu_wait": _r(w["cpu_wait"]), "gpu_wait": _r(w["gpu_wait"]),
+                   "generated": w["generated"], "anim_err": _r(w["anim_err"])} for w in worst],
+        # where the long frames' time went (PresentMon busy times); NULL side = recorded before the 2.x columns
+        "sides": dict(Counter(s["side"] for s in st if s["side"]).most_common()),
+        "side_ranking": sides,
     }
 
     # --- hardware peaks
@@ -479,17 +495,21 @@ def session_report(con, session_id):
 
 
 def _rank_causes(st, frames, samples, start, s_ts, p_ts, procs, exe, ext):
-    """stuttercause.rank over gameplay seconds, or None when the session has too little gameplay to judge."""
+    """(stuttercause.rank of the causes, framestats.side_ranking of the stutter sides) over gameplay seconds;
+    None for either when the session has too little gameplay or timing to judge."""
     keep = gameplay.select(frames, samples, start)
     if len(keep) < gameplay.MIN_GAMEPLAY_S:
-        return None
+        return None, None
     secs = {int(f["ts"]) for f in keep}
     played = [s for s in st if int(s["ts"]) in secs]
     if not played:
-        return None
+        return None, None
     base = stuttercause.baseline_ts([f["ts"] for f in keep], [s["ts"] for s in st])
     base_tags = [_causes_for_stutter({"ts": t}, s_ts, samples, p_ts, procs, exe, ext) for t in base]
-    return stuttercause.rank([s["causes"] for s in played], base_tags)
+    # normal seconds sided by the same rule as the stutters (the capture's stutter_side on the mean frame)
+    side_at = {int(f["ts"]): framestats.stutter_side(f["app_ft"], f["cpu_busy"], f["gpu_busy"]) for f in keep}
+    return (stuttercause.rank([s["causes"] for s in played], base_tags),
+            framestats.side_ranking(played, base, side_at))
 
 
 def _session_findings(rep, row):
@@ -527,8 +547,9 @@ def _session_findings(rep, row):
                 add("info", f"Brak limitu CPU/GPU przez {bp['limit']:.0f}% czasu (limit FPS / vsync)",
                     "Ani CPU, ani GPU nie pracują pełnym czasem klatki. Sprawdź limiter FPS w grze, V-Sync, Radeon Chill, "
                     "FRTC (Frame Rate Target Control) w Adrenalinie oraz limit odświeżania monitora.")
-        avg = summ.get("fps_avg") or fl.get("avg")
-        low1 = summ.get("fps_1low")
+        # application frames: with frame generation the presented 1% low hides hitches between generated frames
+        avg = summ.get("app_fps_avg") or summ.get("fps_avg") or fl.get("avg")
+        low1 = summ.get("app_fps_1low") or summ.get("fps_1low")
         if avg and low1 and low1 / avg < 0.6:
             add("warning", f"Nierówny frametime: 1% low {low1} FPS przy średniej {avg} FPS",
                 "Duża rozbieżność między średnią a 1% low oznacza przycięcia. Zobacz przyczyny stutterów poniżej.")
@@ -572,6 +593,15 @@ def _session_findings(rep, row):
             add("info", "Większość stutterów bez przyczyny systemowej",
                 "Zwykle kompilacja shaderów lub streaming zasobów w grze. Pomaga: wstępna kompilacja shaderów, "
                 "aktualne sterowniki Adrenalin, gra na szybkim SSD, ReBAR/SAM włączony.")
+        side = next((r for r in st.get("side_ranking") or [] if r["verdict"] == "confirmed"), None)
+        if side:
+            add("info", f"{side['stutter_pct']:.0f}% stutterów powstaje {framestats.SIDE_LABELS[side['tag']]}",
+                {"cpu": "W długich klatkach procesor pracował przez większość czasu klatki, częściej niż w zwykłej grze: "
+                        "kompilacja shaderów, streaming, wątek gry, procesy w tle lub DPC.",
+                 "gpu": "W długich klatkach karta pracowała przez większość czasu klatki, częściej niż w zwykłej grze: "
+                        "skoki obciążenia GPU, przepełniony VRAM lub zegar GPU.",
+                 "present": "Ani CPU, ani GPU nie pracowały przez większość długiej klatki: czekała w kolejce prezentacji "
+                            "(V-Sync, DWM, sterownik, nakładki, generowanie klatek)."}[side["tag"]])
         amb = st.get("ambient") or []
         if st.get("cause_ranking") is None:
             add("info", "Za mało rozgrywki, by ocenić przyczyny stutterów",
@@ -1221,10 +1251,14 @@ def _session_metrics(con, exe=None, since=None):
         return []
     ids = [r["id"] for r in rows]
     q = ",".join("?" * len(ids))
+    # application frames: comparing a session with frame generation to one without must not double its FPS
+    af, afps = framestats.APP_FRAMES, framestats.APP_FPS
     fr = {r["session"]: r for r in con.execute(
-        f"SELECT session, SUM(frames) AS nf, SUM(frames/fps) AS secs, COUNT(*) AS n, "
+        f"SELECT session, SUM({af}) AS nf, SUM({af}/{afps}) AS secs, COUNT(*) AS n, "
         f"SUM(bound='GPU') AS g, SUM(bound='CPU') AS c, SUM(bound='limit') AS l, "
-        f"AVG(ft_p99) AS p99 FROM frames WHERE fps>0 AND session IN ({q}) GROUP BY session", ids)}
+        f"AVG({framestats.APP_FT_P99}) AS p99, SUM(frames) AS dnf, SUM(frames/fps) AS dsecs, "
+        f"SUM(frame_gen_pct*frames)/SUM(CASE WHEN frame_gen_pct IS NOT NULL THEN frames END) AS gen "
+        f"FROM frames WHERE {afps}>0 AND session IN ({q}) GROUP BY session", ids)}
     st = {r["session"]: r["n"] for r in con.execute(
         f"SELECT session, COUNT(*) AS n FROM stutters WHERE session IN ({q}) GROUP BY session", ids)}
     out = []
@@ -1235,24 +1269,38 @@ def _session_metrics(con, exe=None, since=None):
         end = ends[r["id"]] or time.time()
         minutes = max(0.0, (end - r["start_ts"]) / 60)
         x = fr.get(r["id"])
-        fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("fps_avg")
-        low1 = f.get("fps_1low")
+        summ = _json(r["summary"]) or {}
+        gen = next((g for g in (f.get("frame_gen_pct"), x["gen"] if x else None,
+                                (summ.get("present") or {}).get("frame_gen_pct")) if g is not None), None)
+        fps_disp = (x["dnf"] / x["dsecs"]) if x and x["dsecs"] else f.get("fps_avg")
+        fps = (x["nf"] / x["secs"]) if x and x["secs"] else f.get("app_fps_avg") or (
+            f["fps_avg"] * (1 - (gen or 0) / 100) if f.get("fps_avg") else None)   # frames pruned, older summary
+        low1 = f.get("app_fps_1low")
+        if low1 is None:   # summary from before app frames: its 1% low counts generated frames
+            low1 = 1000 / x["p99"] if gen and x and x["p99"] else f.get("fps_1low")
         if low1 is None and x and x["p99"]:
             low1 = 1000 / x["p99"]
         ctx = _ctx(r)
-        gp = (_json(r["summary"]) or {}).get("gameplay")
+        gp = summ.get("gameplay")
         stutters = st.get(r["id"], 0)
+        pacing = summ.get("pacing")
         if gp and gp.get("seconds"):   # menus and loading screens do not count
             fps, low1, stutters, minutes = gp["fps_avg"], gp["fps_1low"], gp["stutters"], gp["seconds"] / 60
-        bn = (_json(r["summary"]) or {}).get("bottleneck") or {}
+            if "fps_displayed_avg" in gp:   # stored since frame generation is told apart
+                fps_disp, gen, pacing = gp["fps_displayed_avg"], gp["frame_gen_pct"], gp["pacing"]
+        bn = summ.get("bottleneck") or {}
         out.append({
             "id": r["id"], "exe": r["exe"], "start_ts": r["start_ts"], "end_ts": f["end_ts"], "minutes": _r(minutes),
-            "fps_avg": _r(fps), "fps_1low": _r(low1), "fps_01low": f.get("fps_01low"),
+            # fps_*: application frames; fps_displayed_avg what the screen showed (higher with frame generation)
+            "fps_avg": _r(fps), "fps_1low": _r(low1),
+            "fps_01low": f.get("app_fps_01low") or (None if gen else f.get("fps_01low")),
+            "fps_displayed_avg": _r(fps_disp), "frame_gen_pct": _r(gen),
+            "anim_err_ms": (pacing or {}).get("anim_err_ms"), "disp_jitter_pct": (pacing or {}).get("disp_jitter_pct"),
             "stutters": stutters, "stutters_per_min": _r(stutters / minutes, 2) if minutes > 0.5 else None,
             "usable": gp.get("usable", True) if gp else True,
             "gpu_driver": _driver(ctx), "game_version": ctx.get("game_version"),
             "steam_buildid": (ctx.get("steam") or {}).get("buildid"), "ctx": ctx,
-            # PresentMon writes no GPUBusy on this PC: `bound` stays empty, the shares come from summary.bottleneck
+            # rows recorded before the PresentMon 2.x columns were parsed have no `bound`: shares from summary.bottleneck
             "_g": (x["g"] or 0 if x else 0) or (bn.get("gpu_bound_pct") or 0) * minutes,
             "_c": (x["c"] or 0 if x else 0) or (bn.get("cpu_bound_pct") or 0) * minutes,
             "_l": (x["l"] or 0 if x else 0) or (bn.get("limit_pct") or 0) * minutes,
@@ -1318,11 +1366,18 @@ def compare(con, exe=None, group_by="week", since=None, before=None, after=None)
         fps = nf / secs if secs else None
         lw = [(s["fps_1low"], s["minutes"] or 0) for s in ss if s["fps_1low"]]
         low1 = sum(v * w for v, w in lw) / sum(w for _, w in lw) if lw and sum(w for _, w in lw) else None
+
+        def mavg(k):   # minutes-weighted over the sessions that have the value
+            vs = [(s[k], s["minutes"] or 0) for s in ss if s.get(k) is not None]
+            w = sum(m for _, m in vs)
+            return _r(sum(v * m for v, m in vs) / w, 2) if w else None
         nb = sum(s["_g"] + s["_c"] + s["_l"] for s in ss)
         rows.append({
             "exe": e, "group": key, "from": min(s["start_ts"] for s in ss),
             "to": max((s["end_ts"] or s["start_ts"]) for s in ss),
             "sessions": len(ss), "minutes": _r(mins), "fps_avg": _r(fps), "fps_1low": _r(low1),
+            "fps_displayed_avg": mavg("fps_displayed_avg"), "frame_gen_pct": mavg("frame_gen_pct"),
+            "anim_err_ms": mavg("anim_err_ms"), "disp_jitter_pct": mavg("disp_jitter_pct"),
             "stutters_per_min": _r(sum(s["stutters"] for s in ss) / mins, 2) if mins > 0.5 else None,
             "gpu_bound_pct": _r(100 * sum(s["_g"] for s in ss) / nb) if nb else None,
             "cpu_bound_pct": _r(100 * sum(s["_c"] for s in ss) / nb) if nb else None,
