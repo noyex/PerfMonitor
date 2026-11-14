@@ -75,6 +75,7 @@ main[data-page="overview"] { padding-top: 0; }
 .dock nav a.on { color: #fff; background: linear-gradient(170deg, rgba(255, 255, 255, .26), rgba(255, 255, 255, .09)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5); }
 .temps { padding-right: 14px; font-size: 14.5px; color: #d6d6dc; display: flex; gap: 16px; }
 .temps b { color: #fff; font-weight: 500; }
+.temps .warn b { color: var(--warning); }
 .status.bad { color: var(--critical); }
 .status.warn { color: var(--warning); }
 

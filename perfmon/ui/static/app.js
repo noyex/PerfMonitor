@@ -32,10 +32,12 @@ const status = async () => {
     const s = await api("latest");
     const alive = s.collector_alive ?? s.alive;
     setTemps(alive && s.sample ? { cpu: s.sample.cpu_temp, gpu: s.sample.gpu_temp } : null);
+    setPing(alive ? s.net : null);
     if (!alive) problem = ["bad", "Kolektor nie działa"];
     else if (s.admin === false) problem = ["warn", "Zbieranie bez uprawnień administratora"];
   } catch {
     setTemps(null);
+    setPing(null);
     problem = ["bad", "Brak danych"];
   }
   box.hidden = !problem;

@@ -63,6 +63,16 @@ const setTemps = (t) => {
   document.getElementById("temp-gpu").textContent = t && t.gpu != null ? `${fmt(t.gpu)}°` : "–";
 };
 
+// Live internet ping in the dock, only while netmon reports it; packet loss turns it amber.
+const setPing = (n) => {
+  const el = document.getElementById("ping");
+  el.hidden = !n || n.inet_ms == null;
+  if (el.hidden) return;
+  el.lastChild.textContent = `${fmt(n.inet_ms)} ms`;
+  el.classList.toggle("warn", n.inet_loss > 0);
+  el.title = n.inet_loss > 0 ? `utrata pakietów ${fmt(n.inet_loss * 100)}%` : "";
+};
+
 const toast = (msg) => {
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -276,5 +286,5 @@ const pingChart = (container, n, opt) => {
   if (!has("gw_ms") && !has("inet_ms") && !has("game_ms")) return null;
   const keys = [["gw_ms", "Router"], ["inet_ms", "Internet"], ["game_ms", "Serwer gry"]].filter(([k]) => has(k));
   const loss = (n.ts || []).filter((_, i) => n.inet_loss[i] > 0).map((ts) => ({ ts, color: css("--warning") }));
-  return chart(container, { title: "Ping", unit: "ms", series: keys.map(([, label]) => ({ label })), yFloor: 50, markers: () => loss, ...opt }, cols(n, keys.map(([k]) => k)));
+  return chart(container, { title: "Ping", unit: "ms", series: keys.map(([, label]) => ({ label })), yFloor: 50, ...opt, markers: () => [...loss, ...(opt.markers ? opt.markers() : [])] }, cols(n, keys.map(([k]) => k)));
 };
