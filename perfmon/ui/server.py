@@ -307,16 +307,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, ctype, cache="no-cache", etag=etag, gz=gz)
 
 
+def _server(port: int):
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
 def serve(port: int):
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv = _server(port)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
 
 def main():
-    """Serve forever (the desktop shell starts this when nothing listens on the port): python -m perfmon.ui.server [port]"""
+    """Serve forever (the desktop shell starts its own server this way): python -m perfmon.ui.server [port]"""
     port = int(sys.argv[1]) if len(sys.argv) > 1 else config.load()["ui_port"]
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    _server(port).serve_forever()
 
 
 if __name__ == "__main__":
