@@ -137,6 +137,14 @@ CREATE TABLE IF NOT EXISTS experiments (        -- pm test: one setting changed,
     result TEXT,                                 -- JSON verdict stored at stop
     notes TEXT
 );
+CREATE TABLE IF NOT EXISTS mem_samples (       -- memory lists every ~5 s in sessions, ~30 s otherwise (perfmon/memdiag.py)
+    ts REAL PRIMARY KEY, session INTEGER,
+    standby_mb REAL, modified_mb REAL, free_mb REAL,   -- standby cache (all priorities) / modified list / free + zero lists
+    compressed_mb REAL, pool_np_mb REAL,         -- MemCompression working set (compressed store) / nonpaged pool
+    pf_mb REAL, pf_max_mb REAL,                  -- pagefiles now / their configured or system-managed maximum
+    pf_free_gb REAL, pf_grow_mb REAL,            -- free space on their volumes / room left to grow (min of both limits)
+    pf_drives TEXT                               -- "C:" (volumes holding a pagefile)
+);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
@@ -170,9 +178,10 @@ def migrate(con):
     add_columns(con, "events", {"data": "TEXT"})
     add_columns(con, "samples", {"pagefile_pct": "REAL", "cpu_vcore": "REAL", "gpu_voltage": "REAL", "vrm_temp": "REAL",
                                   "cpu_eff_max": "REAL"})
-    # PSU rails / board temperatures (hard-reset forensics), GPU fan duty
+    # PSU rails / board temperatures (hard-reset forensics), GPU fan duty; per-process private bytes (commit holders)
     add_columns(con, "hw_detail", {"v12": "REAL", "v5": "REAL", "v33": "REAL", "v3sb": "REAL", "sys_temp": "REAL",
                                    "pch_temp": "REAL", "pcie_temp": "REAL", "gpu_fan_pct": "REAL"})
+    add_columns(con, "procs", {"commit_mb": "REAL"})
     add_columns(con, "frames", {"runtime": "TEXT", "sync_interval": "INTEGER", "tearing": "INTEGER", "dropped": "INTEGER",
                                 "click_lat": "REAL", "input_lat": "REAL", "frame_gen_pct": "REAL"})
 

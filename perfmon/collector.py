@@ -15,8 +15,8 @@ from pathlib import Path
 
 import psutil
 
-from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memleak, ocanalyze, ocmon,
-               presentmon, procwatch, resetforensics, shadercache, sysinfo)
+from . import (bottleneck, config, crashinfo, db, diskinfo, etwbox, gamectx, gameplay, gpuproc, marks, memdiag, memleak,
+               ocanalyze, ocmon, presentmon, procwatch, resetforensics, shadercache, sysinfo)
 from .disktemp import LIMITS_KEY as STORAGE_LIMITS_KEY
 from .events import LOGS, EventReader, classify
 from .netmon import INCIDENT_KINDS as NET_INCIDENTS, NetMonitor
@@ -125,6 +125,10 @@ class Collector:
         self.last_gpu_od = 0.0
         self.last_oc_stats = 0.0
         self.vacuuming = False
+        self.last_pdh = {}             # last PdhCounters.read(): memory lists for mem_samples / commit_full
+        self.top_commit = []           # commit holders / compressed store size of the last procs tick (commit_full)
+        self.compressed_mb = None
+        self.last_mem = 0.0
         self.storage_limits = None     # last NVMe thresholds written to meta
 
     # ---------- helpers ----------
@@ -217,7 +221,7 @@ class Collector:
         now = time.time()
         vm = psutil.virtual_memory()
         cores = psutil.cpu_percent(percpu=True)
-        p = self.pdh.read()
+        p = self.last_pdh = self.pdh.read()
         session = next(iter(self.games.values()))["session"] if self.games else next(iter(self.manual), None)
         self.hw.storage_fast = session is not None
         h = self.hw.read()
@@ -364,8 +368,9 @@ class Collector:
         self._ongoing("vram_full", bool(vram and vt and vram / vt > 0.95), "warning", "VRAM prawie pełny (>95%)", r,
                       lambda: {"vram_mb": vram, "total_mb": vt, "fg_exe": r["fg_exe"]})
         cl = r.get("commit_limit_gb") or 0
-        self._ongoing("commit_full", bool(cl and r["commit_gb"] / cl > 0.92), "serious",
-                      "Pamięć zadeklarowana (commit) >92% limitu", r, ctx)
+        self._ongoing("commit_full", bool(cl and r["commit_gb"] / cl > memdiag.COMMIT_FULL), "serious",
+                      "Pamięć zadeklarowana (commit) >92% limitu", r,
+                      lambda: dict(ctx(), **memdiag.commit_details(self.last_pdh, self.top_commit, self.compressed_mb)))
 
     # ---------- user marks ----------
     def process_marks(self):
@@ -385,6 +390,7 @@ class Collector:
     def sample_procs(self):
         now = time.time()
         rows, cur = [], {}
+        compressed = None
         ncpu = psutil.cpu_count()
         snap = {}   # pid -> (create_time, name, ppid) for the process start/stop log
         for pr in psutil.process_iter(["pid", "name", "cpu_times", "memory_info", "ppid", "create_time"]):
@@ -394,6 +400,8 @@ class Collector:
                     continue  # "System Idle Process": idle time, not load
                 if i["create_time"] is not None:   # psutil gives None when it cannot read it
                     snap[i["pid"]] = (i["create_time"], i["name"], i["ppid"])
+                if i["name"] in memdiag.COMPRESSION_PROCS and i["memory_info"] is not None:
+                    compressed = i["memory_info"].rss / 2**20
                 ct = i["cpu_times"]
                 cpu_s = ct.user + ct.system
                 try:
@@ -405,28 +413,41 @@ class Collector:
                 prev = self.proc_prev.get(i["pid"])
                 if prev:
                     dt = now - prev[2]
-                    rows.append((i["name"], i["pid"], (cpu_s - prev[0]) / dt * 100 / ncpu,
-                                 i["memory_info"].rss / 2**20, (iob - prev[1]) / dt / 1e6))
+                    mi = i["memory_info"]
+                    rows.append((i["name"], i["pid"], (cpu_s - prev[0]) / dt * 100 / ncpu, mi.rss / 2**20,
+                                 (iob - prev[1]) / dt / 1e6, getattr(mi, "private", mi.vms) / 2**20))
             except Exception:
                 pass
         self.proc_prev = cur
+        self.compressed_mb = compressed and round(compressed, 1)
         if not rows:
             return
+        self.top_commit = memdiag.top_commit(rows)
         out = []
-        for kind, key, n in (("cpu", 2, 8), ("mem", 3, 5), ("io", 4, 5)):
-            for name, pid, c, m, io in sorted(rows, key=lambda x: -x[key])[:n]:
+        for kind, key, n in (("cpu", 2, 8), ("mem", 3, 5), ("io", 4, 5), ("commit", 5, memdiag.TOP_COMMIT)):
+            for name, pid, c, m, io, cm in sorted(rows, key=lambda x: -x[key])[:n]:
                 if kind == "io" and io < 0.5:
                     continue
-                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2), None, None))
+                if kind == "commit" and any(o[3] == pid for o in out):
+                    continue   # already in a cpu/mem/io row, which carries commit_mb too
+                out.append((now, kind, name, pid, round(c, 2), round(m, 1), round(io, 2), None, None, round(cm, 1)))
         session = next(iter(self.games.values()))["session"] if self.games else None
+        mem_session = session if session is not None else next(iter(self.manual), None)
+        mem = None
+        if mem_session is not None or now - self.last_mem >= memdiag.MEM_EVERY_S:
+            self.last_mem = now
+            mem = memdiag.mem_row(now, mem_session, self.last_pdh, self.compressed_mb, memdiag.pagefile_status())
         pe = self.procwatch.update(now, snap, session)
         game_rows = []
         if now - self.last_gpu_proc >= self.cfg.get("gpu_proc_interval_s", 5) - 0.5:
             self.last_gpu_proc = now
             out += self.sample_gpu(now, {r[1]: r for r in rows}, game_rows)
         with self.lock:
-            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs, gpu_pct, vram_mb) "
-                                 "VALUES (?,?,?,?,?,?,?,?,?)", out)
+            self.con.executemany("INSERT INTO procs(ts, kind, name, pid, cpu_pct, mem_mb, io_mbs, gpu_pct, vram_mb, commit_mb) "
+                                 "VALUES (?,?,?,?,?,?,?,?,?,?)", out)
+            if mem:
+                self.con.execute(f"INSERT OR REPLACE INTO mem_samples ({','.join(mem)}) VALUES ({','.join('?' * len(mem))})",
+                                 list(mem.values()))
             if pe:
                 self.con.executemany("INSERT INTO proc_events(ts, pid, name, ppid, parent_name, action, session, path) "
                                      "VALUES (:ts,:pid,:name,:ppid,:parent_name,:action,:session,:path)", pe)
@@ -450,7 +471,7 @@ class Collector:
             r = by_pid.get(pid)
             out.append((now, "gpu", r[0] if r else self.pname(pid), pid, round(r[2], 2) if r else None,
                         round(r[3], 1) if r else None, None, round(d["gpu"], 1),
-                        round(d["ded_mb"]) if d["ded_mb"] is not None else None))
+                        round(d["ded_mb"]) if d["ded_mb"] is not None else None, round(r[5], 1) if r else None))
         return out
 
     # ---------- games ----------
@@ -832,6 +853,7 @@ class Collector:
                 self.incident("db_size", "warning", f"Baza perf.db ma {size / 2**30:.1f} GB - retencja szczegółów "
                               "UV/OC skrócona do 14 dni", {"bytes": size}, ts=now)
         self.exec("DELETE FROM hw_detail WHERE ts < ?", (now - days * 86400,))
+        self.exec("DELETE FROM mem_samples WHERE ts < ?", (now - days * 86400,))
         with self.lock:
             last = float(db.get_meta(self.con, "last_vacuum", 0))
         incremental = self.exec("PRAGMA auto_vacuum").fetchone()[0] == 2

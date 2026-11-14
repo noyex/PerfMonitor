@@ -246,6 +246,13 @@ class PdhCounters:
         "commit_bytes": r"\Memory\Committed Bytes",
         "commit_limit": r"\Memory\Commit Limit",
         "pagefile_pct": r"\Paging File(_Total)\% Usage",
+        # memory lists (perfmon/memdiag.py): what the RAM not in use by processes holds
+        "standby_core": r"\Memory\Standby Cache Core Bytes",
+        "standby_normal": r"\Memory\Standby Cache Normal Priority Bytes",
+        "standby_reserve": r"\Memory\Standby Cache Reserve Bytes",
+        "modified_bytes": r"\Memory\Modified Page List Bytes",
+        "free_zero_bytes": r"\Memory\Free & Zero Page List Bytes",
+        "pool_np_bytes": r"\Memory\Pool Nonpaged Bytes",
     }
     MULTI = {
         "lat": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",
