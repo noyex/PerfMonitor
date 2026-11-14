@@ -188,8 +188,9 @@ def cmd_session(con, a):
     out(f"## Sesja #{s['id']} - {s['exe']}  ({r['start']} -> {r['end']}, {r['duration_s'] // 60} min, koniec: {s['end_reason']})")
     kv({"fps_avg": s["fps_avg"], "fps_1low": s["fps_1low"], "fps_01low": s["fps_01low"], "ft_p99_ms": s["ft_p99"],
         "ft_max_ms": s["ft_max"], "sterownik": s.get("gpu_driver"), "wersja gry": s.get("game_version")}, "Podsumowanie")
-    if s.get("frame_gen_pct"):   # the fps_* above count generated frames too
-        kv({"generowane klatki %": s["frame_gen_pct"], "FPS gry (bez generowanych)": s.get("app_fps_avg"),
+    gen = s.get("frame_gen_pct") or r["fps_timeline"].get("frame_gen_pct")
+    if gen:   # the fps_* above count generated frames too; sessions from before app_fps_* have the timeline's estimate
+        kv({"generowane klatki %": gen, "FPS gry (bez generowanych)": s.get("app_fps_avg") or r["fps_timeline"].get("avg"),
             "1% low gry": s.get("app_fps_1low"), "0.1% low gry": s.get("app_fps_01low")}, "Generowanie klatek")
     if r.get("pacing"):
         kv({"błąd animacji ms": r["pacing"].get("anim_err_ms"), "rozrzut czasu wyświetlania ms":
