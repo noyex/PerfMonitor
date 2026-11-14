@@ -7,24 +7,23 @@ window.Pages = {};
 const API_BASE = window.__PERFMON_API__ || "";
 const API_TOKEN = window.__PERFMON_TOKEN__ || "";
 const apiUrl = (path) => `${API_BASE}${path}`;
-const API_START_MS = 10000;   // the shell may have just started the Python server: ~1 s for it to listen
-let apiAnswered = false;
+// The shell starts its Python server together with the window (~1 s until it listens): during the first 10 s after page
+// load, connection failures are retried quietly instead of reaching the page as errors. After that, or in a browser,
+// a failure surfaces at once.
+const API_START_DEADLINE = API_BASE ? 10000 : 0;   // ms since page load (performance.now)
 
 const api = async (name, params = {}) => {
   const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""));
-  // Until the API has answered once, connection failures are retried quietly instead of reaching the page as errors.
-  const giveUp = Date.now() + (API_BASE && !apiAnswered ? API_START_MS : 0);
   let r;
   for (let wait = 150; ; wait = Math.min(wait * 1.5, 800)) {
     try {
       r = await fetch(apiUrl(`/api/${name}?${q}`));
       break;
     } catch (e) {
-      if (Date.now() >= giveUp) throw e;
-      await new Promise((done) => setTimeout(done, wait));
+      if (performance.now() >= API_START_DEADLINE) throw e;
+      await new Promise((done) => setTimeout(done, Math.min(wait, API_START_DEADLINE - performance.now())));
     }
   }
-  apiAnswered = true;
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
