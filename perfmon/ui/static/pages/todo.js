@@ -6,7 +6,7 @@ Pages.todo = (() => {
   let view = null;
 
   const post = async (body) => {
-    const r = await fetch("/api/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(apiUrl("/api/test"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
     return j;

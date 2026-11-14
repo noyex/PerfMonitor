@@ -1,9 +1,28 @@
 // Shared helpers: API, formatting, DOM, charts. Pages register themselves in window.Pages.
 window.Pages = {};
 
+// In the desktop shell the page is served by Tauri and window.__PERFMON_API__ is the Python API's origin; in a browser
+// or pywebview the page comes from the API server itself and URLs stay relative.
+const API_BASE = window.__PERFMON_API__ || "";
+const apiUrl = (path) => `${API_BASE}${path}`;
+const API_START_MS = 10000;   // the shell may have just started the Python server: ~1 s for it to listen
+let apiAnswered = false;
+
 const api = async (name, params = {}) => {
   const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""));
-  const r = await fetch(`/api/${name}?${q}`);
+  // Until the API has answered once, connection failures are retried quietly instead of reaching the page as errors.
+  const giveUp = Date.now() + (API_BASE && !apiAnswered ? API_START_MS : 0);
+  let r;
+  for (let wait = 150; ; wait = Math.min(wait * 1.5, 800)) {
+    try {
+      r = await fetch(apiUrl(`/api/${name}?${q}`));
+      break;
+    } catch (e) {
+      if (Date.now() >= giveUp) throw e;
+      await new Promise((done) => setTimeout(done, wait));
+    }
+  }
+  apiAnswered = true;
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
