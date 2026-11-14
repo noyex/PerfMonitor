@@ -137,6 +137,13 @@ CREATE TABLE IF NOT EXISTS experiments (        -- pm test: one setting changed,
     result TEXT,                                 -- JSON verdict stored at stop
     notes TEXT
 );
+CREATE TABLE IF NOT EXISTS game_settings (      -- game config files parsed (perfmon/gamesettings.py), stored when they change
+    ts REAL, exe TEXT,                           -- exe lowercase
+    hash TEXT,                                   -- of the non-volatile raw keys
+    normalized TEXT,                             -- JSON: resolution, upscaler, frame_gen, fps_cap, vsync, ...
+    raw TEXT                                     -- JSON {key: value} as read from the files
+);
+CREATE INDEX IF NOT EXISTS ix_game_settings_exe ON game_settings(exe, ts);
 CREATE INDEX IF NOT EXISTS ix_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS ix_stutters_ts ON stutters(ts);
 CREATE INDEX IF NOT EXISTS ix_procs_ts ON procs(ts);
