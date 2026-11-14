@@ -18,6 +18,7 @@ DEFAULTS = {
     "event_poll_s": 30.0,
     "retention_days": 90,
     "detail_retention_days": 30,        # hw_detail (UV/OC telemetry); per-session aggregates are kept forever
+    "incident_retention_days": 365,     # incidents + system_info snapshots (sessions, profiles, tests: forever)
     "detail_interval_s": 10.0,          # hw_detail outside game/stress sessions (1 s inside them)
     "db_guard_gb": 2.0,                 # above this perf.db size: warning incident + detail retention cut to 14 days
     "apic_ids_per_core": 2,             # WHEA APIC ID -> core (7700X with SMT: 2 threads per core)

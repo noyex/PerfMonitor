@@ -778,6 +778,10 @@ class Collector:
             for t in ("samples", "frames", "stutters", "procs", "events", "game_proc", "proc_events", "net_samples",
                       "report_cache"):
                 self.exec(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
+            # incidents and config snapshots outlive the raw data: comparisons mark config changes over 180 days
+            long_cut = now - max(self.cfg["incident_retention_days"], self.cfg["retention_days"]) * 86400
+            self.exec("DELETE FROM incidents WHERE ts < ?", (long_cut,))
+            self.exec("DELETE FROM system_info WHERE ts < ? AND ts < (SELECT MAX(ts) FROM system_info)", (long_cut,))
             with self.lock:
                 etwbox.retention(self.con, self.etw.s, now)
                 # rows outlive their trace file (kept for the analysis) until the general retention
