@@ -1,9 +1,11 @@
 // Shared helpers: API, formatting, DOM, charts. Pages register themselves in window.Pages.
 window.Pages = {};
 
-// In the desktop shell the page is served by Tauri and window.__PERFMON_API__ is the Python API's origin; in a browser
-// or pywebview the page comes from the API server itself and URLs stay relative.
+// In the desktop shell the page is served by Tauri, window.__PERFMON_API__ is the origin of the window's own Python API
+// server and window.__PERFMON_TOKEN__ the per-launch token its POSTs must carry. In a browser or pywebview the page
+// comes from the API server itself: URLs stay relative and there is no token.
 const API_BASE = window.__PERFMON_API__ || "";
+const API_TOKEN = window.__PERFMON_TOKEN__ || "";
 const apiUrl = (path) => `${API_BASE}${path}`;
 const API_START_MS = 10000;   // the shell may have just started the Python server: ~1 s for it to listen
 let apiAnswered = false;
@@ -23,6 +25,15 @@ const api = async (name, params = {}) => {
     }
   }
   apiAnswered = true;
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+};
+
+// The write endpoints (/api/oc_profile, /api/test): JSON body, JSON answer.
+const apiPost = async (name, body) => {
+  const headers = { "Content-Type": "application/json", ...(API_TOKEN && { "X-PerfMon-Token": API_TOKEN }) };
+  const r = await fetch(apiUrl(`/api/${name}`), { method: "POST", headers, body: JSON.stringify(body) });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;

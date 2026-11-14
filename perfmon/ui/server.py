@@ -1,7 +1,9 @@
 """Local HTTP server for the UI: static files + JSON API over analyze.py (read-only DB)."""
 import gzip
+import hmac
 import json
 import mimetypes
+import os
 import sqlite3
 import sys
 import threading
@@ -91,9 +93,12 @@ def _compact(name, res):
 
 
 GZIP_MIN = 1024
-# The desktop shell (src-tauri) serves the UI from its own origin and calls this API cross-origin. WebView2 on Windows
-# uses http://tauri.localhost (https:// with useHttpsScheme). Only these origins get CORS headers, never "*".
+# The desktop shell (src-tauri) serves the UI from its own origin and starts this server with a per-launch token in
+# PERFMON_UI_TOKEN. Only then does that origin get CORS on the API, and its POSTs must carry the token: every Tauri 2
+# app on Windows shares the origin http://tauri.localhost (https:// with useHttpsScheme). Never "*".
 TAURI_ORIGINS = ("http://tauri.localhost", "https://tauri.localhost")
+TOKEN_HEADER = "X-PerfMon-Token"
+UI_TOKEN = os.environ.get("PERFMON_UI_TOKEN", "")
 
 
 class _Pool:
@@ -172,9 +177,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors_origin(self):
-        """The request's Origin when it is the desktop shell and the path is the API, else None."""
+        """The request's Origin when this server belongs to the desktop shell, the request comes from its origin and the
+        path is the API, else None."""
         origin = self.headers.get("Origin")
-        return origin if origin in TAURI_ORIGINS and self.path.startswith("/api/") else None
+        return origin if UI_TOKEN and origin in TAURI_ORIGINS and self.path.startswith("/api/") else None
+
+    def _token_ok(self):
+        return bool(UI_TOKEN) and hmac.compare_digest(self.headers.get(TOKEN_HEADER, "").encode(), UI_TOKEN.encode())
 
     def _gzip_ok(self):
         return "gzip" in self.headers.get("Accept-Encoding", "")
@@ -210,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", f"Content-Type, {TOKEN_HEADER}")
             self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Vary", "Origin")
         self.send_header("Content-Length", "0")
@@ -218,7 +227,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """The write endpoints (POSTS: UV/OC profiles, tests). JSON-only + same-origin check: a web page in the browser
-        cannot post here (non-simple content type needs a CORS preflight that only the desktop shell's origin passes)."""
+        cannot post here (non-simple content type needs a CORS preflight); the desktop shell's page may, with its token."""
         u = urlparse(self.path)
         self.close_connection = True   # early refusals leave the body unread: never reuse this connection
         origin = self.headers.get("Origin")
@@ -228,8 +237,9 @@ class Handler(BaseHTTPRequestHandler):
         handler = POSTS.get(u.path)
         if not handler:
             return self._send(404, b'{"error":"not found"}', "application/json")
+        cross_site = origin and urlparse(origin).netloc != host
         if not self.headers.get("Content-Type", "").startswith("application/json") or (
-                origin and origin not in TAURI_ORIGINS and urlparse(origin).netloc != host):
+                cross_site and not (self._cors_origin() and self._token_ok())):
             return self._send(403, b'{"error":"forbidden"}', "application/json")
         try:
             body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")

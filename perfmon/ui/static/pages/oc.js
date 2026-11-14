@@ -10,12 +10,7 @@ Pages.oc = (() => {
   const deltaCell = (v, goodUp = true) =>
     h("td", { class: `num${v ? ((v > 0) === goodUp ? " up" : " down") : ""}` }, pct(v));
 
-  const post = async (body) => {
-    const r = await fetch(apiUrl("/api/oc_profile"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.statusText);
-    return j;
-  };
+  const post = (body) => apiPost("oc_profile", body);
 
   // ---------- stability ----------
   const check = (st, prefix) => st.checks.find((c) => c.check.startsWith(prefix)) || {};
