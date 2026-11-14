@@ -1,4 +1,4 @@
-﻿# Builds the PerfMonitor window (src-tauri, Rust) and puts it at <root>\PerfMonitor.exe, where install.ps1 looks for it.
+﻿# Builds the NX Frame window (src-tauri, Rust) and puts it at <root>\NXFrame.exe, where install.ps1 looks for it.
 # Run: powershell -ExecutionPolicy Bypass -File build-ui.ps1
 # Needed again only after changes in src-tauri: the window reads perfmon\ui\static from disk at runtime.
 $ErrorActionPreference = 'Stop'
@@ -18,7 +18,7 @@ if (-not $msvc) {
     exit 1
 }
 
-Write-Host "Budowanie okna PerfMonitor (pierwszy raz trwa kilka minut)..."
+Write-Host "Budowanie okna NX Frame (pierwszy raz trwa kilka minut)..."
 Push-Location (Join-Path $root 'src-tauri')
 try {
     & $cargo build --release --features custom-protocol
@@ -27,11 +27,11 @@ try {
     Pop-Location
 }
 
-$exe = Join-Path $root 'PerfMonitor.exe'
+$exe = Join-Path $root 'NXFrame.exe'
 try {
-    Copy-Item (Join-Path $root 'src-tauri\target\release\perfmonitor.exe') $exe -Force
+    Copy-Item (Join-Path $root 'src-tauri\target\release\nxframe.exe') $exe -Force
 } catch {
-    throw "Nie można zastąpić $exe. Zamknij okno PerfMonitor i uruchom skrypt ponownie."
+    throw "Nie można zastąpić $exe. Zamknij okno NX Frame i uruchom skrypt ponownie."
 }
 Write-Host "Gotowe: $exe" -ForegroundColor Green
-Write-Host "Uruchom install.ps1, żeby skróty na pulpicie i w menu Start otwierały PerfMonitor.exe."
+Write-Host "Uruchom install.ps1, żeby skróty na pulpicie i w menu Start otwierały NXFrame.exe."
