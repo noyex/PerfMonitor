@@ -125,6 +125,12 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(dpc["storport.sys"], {"driver": "storport.sys", "count": 3, "sum_us": 36, "max_us": 17,
                                                "max_at_s": 0.16})
 
+    def test_proc_name_by_event_version(self):
+        v4 = ["0xFFFF1", "0x15F0", "0x6F0", "0", "259", "0x45E12C000", "4", "", '"MsMpEng.exe"', '""C:\\x" -a"']
+        self.assertEqual(etwbox._proc_name(v4, 4), "MsMpEng.exe")
+        self.assertEqual(etwbox._proc_name(v4[:6] + v4[7:], 3), "MsMpEng.exe")   # no Flags field
+        self.assertEqual(etwbox._proc_name(["0x1", "0x4", "0", "0", "0", "0", "0", "x", "game.exe"], 2), "game.exe")
+
     def test_tool_error(self):
         out = "\r\nDane wejściowe\r\n----------------\r\nPliki:\r\n     D:\\x\\a.etl\r\n\n0.00%10.67%21.33%"
         self.assertEqual(etwbox.tool_error("tracerpt", 1073807364, out),

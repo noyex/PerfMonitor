@@ -662,10 +662,17 @@ class Collector:
         quiet = not self.games or s["analyze_during_game"]
         if self.etw_proc is not None and self.etw_proc.poll() is None:
             if not quiet:   # a game started: tracerpt must not compete with it; the run is not held against the capture
-                self.etw_proc.kill()
-                self.etw_proc.wait(timeout=10)
+                try:
+                    p = psutil.Process(self.etw_proc.pid)
+                    procs = [p] + p.children(recursive=True)   # tracerpt is the analysis process's child
+                    for c in procs:
+                        c.kill()
+                    psutil.wait_procs(procs, timeout=10)
+                except psutil.Error:
+                    pass
                 with self.lock:
                     etwbox.undo_attempt(self.con, self.etw_proc_cid)
+                self.etw_pending.append((now, self.etw_proc_cid))     # again once the game is over
                 log.info("ETW capture %s: analysis stopped, a game started", self.etw_proc_cid)
             else:
                 return

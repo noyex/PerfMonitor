@@ -8,6 +8,8 @@ per process and file. Needs admin (the collector has it)."""
 import bisect
 import csv
 import ctypes
+import heapq
+import itertools
 import json
 import logging
 import msvcrt
@@ -303,7 +305,7 @@ def _fail(con, cid, summ, error):
 # analysis: tracerpt CSV (streamed through a named pipe) -> top DPC/ISR drivers and disk I/O
 # --------------------------------------------------------------------------
 # tracerpt CSV: 19 header columns then the event's user data in MOF order.
-C_NAME, C_TYPE, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 6, 9, 10, 16, 19
+C_NAME, C_TYPE, C_VERSION, C_OPCODE, C_PID, C_TID, C_CLOCK, C_DATA = 0, 1, 3, 6, 9, 10, 16, 19
 DPC_OPS, ISR_OPS = {"66", "68", "69"}, {"67", "50"}     # ThreadDPC, DPC, TimerDPC / ISR, ISR-MSI
 IMAGE_OPS = {"10", "3", "4"}
 PROC_OPS = {"1", "2", "3", "4", "39"}                    # Start, End, DCStart, DCEnd, Defunct
@@ -329,11 +331,13 @@ def _str(v):
     return v.strip().strip('"')
 
 
-def _proc_name(data):
-    """ImageFileName of a Process event: field 8 (after the SID) since version 3, the command line after it can
-    contain quotes that break tracerpt's CSV. Older layouts: the first file-name-like field after the fixed ones."""
-    if len(data) > 8 and _str(data[8]) and not _str(data[8]).lower().startswith("0x"):
-        return _str(data[8])
+def _proc_name(data, version=4):
+    """ImageFileName of a Process event: the field after the SID (8 since version 4 added Flags, 7 in version 3);
+    the command line after it can contain quotes that break tracerpt's CSV, so the tail is no anchor.
+    Older layouts: the first file-name-like field after the fixed ones."""
+    i = 8 if version >= 4 else 7 if version == 3 else None
+    if i is not None and len(data) > i and _str(data[i]) and not _str(data[i]).lower().startswith("0x"):
+        return _str(data[i])
     for v in data[7:]:
         v = _str(v)
         if re.fullmatch(r"[^\\/:*?\"<>|]+\.[A-Za-z0-9]{2,4}", v) and not v.lower().startswith("0x"):
@@ -375,8 +379,10 @@ def parse_rows(lines, last_s=60, trigger_ts=None, devices=None):
             continue
         if filetime_clock is None:   # tracerpt prints FILETIME for converted clocks, raw ticks otherwise
             filetime_clock = bool(start_ft and abs(clock - start_ft) < 30 * 86400 * 10**7)
-            if filetime_clock and end_ft and end_ft > start_ft:
-                cutoff = end_ft - int(last_s * 10**7)
+            if end_ft and start_ft and end_ft > start_ft:
+                # raw ticks: the first event is about the trace start, the header's times are FILETIME
+                cutoff = (end_ft - int(last_s * 10**7) if filetime_clock else
+                          clock + int(((end_ft - start_ft) / 1e7 - last_s) * perf_freq))
         if name == "Image" and op in IMAGE_OPS:
             base, size = _int(data[0]), _int(data[1])
             if base and size and base >= 1 << 63:     # kernel-mode image
@@ -385,7 +391,7 @@ def parse_rows(lines, last_s=60, trigger_ts=None, devices=None):
         if name == "Process" and op in PROC_OPS and len(data) > 1:
             pid = _int(data[1])
             if pid is not None:
-                pid_name[pid] = _proc_name(data) or pid_name.get(pid)
+                pid_name[pid] = _proc_name(data, _int(row[C_VERSION]) or 0) or pid_name.get(pid)
             continue
         if name == "Thread" and op in THREAD_OPS and len(data) > 1:
             pid, tid = _int(data[0]), _int(data[1])
@@ -437,9 +443,8 @@ def parse_rows(lines, last_s=60, trigger_ts=None, devices=None):
 
     # The offset of the two clocks = the shortest DPC; a low percentile, because start and end paired across a clock
     # jump give absurd values both ways (seen: "56497207 ms"), and those are dropped against the final offset
-    diffs = sorted(v for aggs in (dpc, isr) for vals, _ in aggs.values() for v in vals)
-    offset = diffs[len(diffs) // 1000] if diffs else None
-    del diffs
+    n = sum(len(vals) for aggs in (dpc, isr) for vals, _ in aggs.values())
+    offset = heapq.nsmallest(n // 1000 + 1, (v for aggs in (dpc, isr) for vals, _ in aggs.values() for v in vals))[-1]         if n else None
     limit = _units(MAX_DPC_US / 1e6, filetime_clock, perf_freq)
 
     def top(aggs):
@@ -535,7 +540,7 @@ def tool_error(tool, rc, out):
     return f"{tool} 0x{rc:08X}" + (f" ({hint})" if hint else "") + (f": {' '.join(lines[-2:])[:200]}" if lines else "")
 
 
-PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED_INSTANCES, ERROR_PIPE_CONNECTED = 3, 255, 535
+PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED_INSTANCES, ERROR_PIPE_CONNECTED, ERROR_NO_DATA = 3, 255, 535, 232
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 TRACERPT = ["tracerpt"]
 
@@ -557,6 +562,7 @@ def tracerpt_lines(etl, timeout=1800, stats=None):
     chunks = queue.Queue(maxsize=32)       # bounded: a slow parser throttles tracerpt instead of filling memory
     lock, active = threading.Lock(), [0]   # instances not finished yet (listening or being read)
     done, closed, out = threading.Event(), threading.Event(), [b""]
+    conn_ids = itertools.count()
 
     def put(item):
         while not closed.is_set():
@@ -571,18 +577,23 @@ def tracerpt_lines(etl, timeout=1800, stats=None):
             raise OSError(ctypes.get_last_error(), "CreateNamedPipe")
         with lock:
             active[0] += 1
-        threading.Thread(target=serve, args=(h,), daemon=True, name="tracerpt-pipe").start()
+        threading.Thread(target=serve, args=(h, next(conn_ids)), daemon=True, name="tracerpt-pipe").start()
 
-    def serve(h):
+    def serve(h, conn):
         try:
-            if not k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+            # ERROR_NO_DATA: the client already opened and closed it (the probe); still an answered open
+            if not k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() not in (ERROR_PIPE_CONNECTED,
+                                                                                      ERROR_NO_DATA):
                 k32.CloseHandle(h)
                 return
             if not done.is_set():
-                listen()
+                try:
+                    listen()
+                except OSError as e:
+                    log.warning("tracerpt pipe: %s", e)
             with open(msvcrt.open_osfhandle(h, os.O_RDONLY), "rb", buffering=0) as f:
                 while b := f.read(1 << 20):
-                    put(b)
+                    put((conn, b))
         except OSError as e:
             log.warning("tracerpt pipe: %s", e)
         finally:
@@ -613,14 +624,20 @@ def tracerpt_lines(etl, timeout=1800, stats=None):
                             creationflags=CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
     w = threading.Thread(target=watch, daemon=True, name="tracerpt")
     w.start()
-    n, rest = 0, b""
+    n, rest, src = 0, b"", None
     try:
         while True:
-            b = chunks.get()
-            if b is None:
+            item = chunks.get()
+            if item is None:
                 if done.is_set() and not active[0] and chunks.empty():
                     break
                 continue
+            if src is None:
+                src = item[0]
+            elif item[0] != src:           # only one open carries the dump; never splice another into it
+                log.warning("tracerpt: data on a second pipe connection dropped (%s bytes)", len(item[1]))
+                continue
+            b = item[1]
             n += len(b)
             lines = (rest + b).split(b"\n")
             rest = lines.pop()
