@@ -179,6 +179,9 @@ tbody tr:hover { background: var(--surface-2); }
 .wc.close:hover { background: #c42b1c; color: #fff; }
 .wc:focus-visible { outline-offset: -3px; }
 .wc svg { display: block; }
+/* The page scrolls inside .shell, not the viewport: a viewport scrollbar would push the controls off the window edge. */
+.tauri, .tauri body { height: 100%; overflow: hidden; }
+.tauri .shell { height: 100vh; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #3a3a40 transparent; }
 /* The controls take the top right corner (4 px more room than the 30 px page padding): content moves, they do not. */
 .tauri .shell { padding-top: 34px; }
 .tauri .brand { top: 34px; }
