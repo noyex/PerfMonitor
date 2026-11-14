@@ -1,12 +1,82 @@
-//! PerfMonitor window: serves the static UI and talks to the Python API over HTTP.
+//! PerfMonitor window: serves the static UI (from the checkout on disk) and talks to the Python API over HTTP.
 //! The collector, analytics and CLI stay in Python; this crate only owns the window and its API server process.
 
+use std::borrow::Cow;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use tauri::{Manager, RunEvent, WebviewWindowBuilder};
+use tauri::utils::assets::{AssetKey, AssetsIter, CspHash};
+use tauri::{Assets, Manager, RunEvent, Runtime, WebviewWindowBuilder};
+
+/// Serves the UI from `<root>\perfmon\ui\static` at runtime, so after a `git pull` the window shows the same JS/CSS as
+/// the Python on disk without a rebuild. Tauri applies the CSP from tauri.conf.json to these files like to embedded ones.
+struct DiskAssets {
+    dir: PathBuf, // canonical
+}
+
+impl DiskAssets {
+    fn new(root: &Path) -> Option<Self> {
+        let dir = root
+            .join("perfmon")
+            .join("ui")
+            .join("static")
+            .canonicalize()
+            .ok()?;
+        dir.join("index.html").is_file().then_some(Self { dir })
+    }
+
+    /// The file behind an asset key, or None when the key names no file inside the directory.
+    fn file(&self, key: &AssetKey) -> Option<PathBuf> {
+        let mut path = self.dir.clone();
+        for part in key.as_ref().split('/').filter(|part| !part.is_empty()) {
+            // AssetKey keeps "..", drive prefixes and backslashes: allow plain names only.
+            if part == "." || part == ".." || part.contains([':', '\\']) {
+                return None;
+            }
+            path.push(part);
+        }
+        // Canonical again, so a link inside the directory cannot lead out of it either.
+        let path = path.canonicalize().ok()?;
+        (path.starts_with(&self.dir) && path.is_file()).then_some(path)
+    }
+}
+
+impl<R: Runtime> Assets<R> for DiskAssets {
+    fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
+        std::fs::read(self.file(key)?).ok().map(Cow::Owned)
+    }
+
+    fn iter(&self) -> Box<AssetsIter<'_>> {
+        let mut keys = Vec::new();
+        let mut dirs = vec![self.dir.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => dirs.push(entry.path()),
+                    Ok(kind) if kind.is_file() => {
+                        if let Ok(rel) = entry.path().strip_prefix(&self.dir) {
+                            keys.push(format!("/{}", rel.to_string_lossy().replace('\\', "/")));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Box::new(keys.into_iter().filter_map(move |key| {
+            let bytes = std::fs::read(self.file(&AssetKey::from(key.as_str()))?).ok()?;
+            Some((Cow::Owned(key), Cow::Owned(bytes)))
+        }))
+    }
+
+    fn csp_hashes(&self, _html_path: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
+        // The embedded build adds hashes of inline <script>s and of every .js file. index.html has no inline script
+        // and script-src already allows 'self', so the policy is the same without them. An inline <script> added to
+        // index.html would be blocked here: keep scripts in files.
+        Box::new(std::iter::empty())
+    }
+}
 
 /// The API server of this window. It is never shared: an old pywebview server or a foreign process on `ui_port`
 /// would lack the CORS setup or die with its own window. Dropped (and killed) on exit.
@@ -86,8 +156,9 @@ mod job {
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
@@ -114,7 +185,9 @@ mod job {
                     &info as *const _ as *const _,
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 );
-                if set == 0 || AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                if set == 0
+                    || AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0
+                {
                     return None;
                 }
                 Some(job)
@@ -162,6 +235,12 @@ pub fn run() {
     let server: Arc<Mutex<Option<SpawnedServer>>> = Arc::default();
     let spawned = server.clone();
 
+    // The copy embedded at build time is only the fallback for an exe without a checkout around it.
+    let mut context = tauri::generate_context!();
+    if let Some(assets) = root.as_deref().and_then(DiskAssets::new) {
+        context.set_assets(Box::new(assets));
+    }
+
     tauri::Builder::default()
         // Must be first: a second launch focuses the running window and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -199,7 +278,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building PerfMonitor")
         .run(move |_app, event| {
             if let RunEvent::Exit = event {
@@ -210,4 +289,42 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_assets_stay_inside_the_static_directory() {
+        let root = std::env::temp_dir().join(format!("perfmon-assets-{}", std::process::id()));
+        let static_dir = root.join("perfmon").join("ui").join("static");
+        std::fs::create_dir_all(static_dir.join("pages")).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<!doctype html>").unwrap();
+        std::fs::write(static_dir.join("pages").join("games.js"), "1").unwrap();
+        std::fs::write(root.join("secret.txt"), "no").unwrap();
+
+        let assets = DiskAssets::new(&root).unwrap();
+        let get = |key: &str| {
+            <DiskAssets as Assets<tauri::Wry>>::get(&assets, &AssetKey::from(key))
+                .map(|b| b.into_owned())
+        };
+        assert_eq!(get("/index.html").as_deref(), Some(&b"<!doctype html>"[..]));
+        assert_eq!(get("/pages/games.js").as_deref(), Some(&b"1"[..]));
+        for key in [
+            "/../../../secret.txt",
+            "../../../secret.txt",
+            "/pages/../../../../secret.txt",
+            r"/pages\..\index.html",
+            "C:/Windows/win.ini",
+            "/index.html:stream",
+            "/pages",
+            "/missing.js",
+        ] {
+            assert_eq!(get(key), None, "{key}");
+        }
+        assert!(DiskAssets::new(&root.join("perfmon")).is_none()); // no index.html there: embedded fallback
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
