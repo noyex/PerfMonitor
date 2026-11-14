@@ -255,6 +255,16 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(n, 2)
         self.assertEqual(sorted(os.listdir(self.dir)), ["a.etl", "fresh.etl", "perfmon.wprp"])
 
+    def test_files_outside_the_folder_are_never_deleted(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        p = os.path.join(other.name, "live.etl")
+        touch(p, 10)
+        self.con.execute("INSERT INTO etw_captures(ts, trigger, path, size_mb, status, summary) VALUES (?,?,?,?,?,?)",
+                         (self.now - 20 * 86400, "user_mark", p, 0, "analyzed", "{}"))
+        etwbox.retention(self.con, {"retention_days": 14, "max_gb": 0}, self.now, self.dir)
+        self.assertTrue(os.path.exists(p))
+
     def test_unanalysed_capture_without_file_fails_with_reason(self):
         cid = self.capture("gone.etl", 20, 1)
         etwbox.retention(self.con, {"retention_days": 14, "max_gb": 2}, self.now, self.dir)

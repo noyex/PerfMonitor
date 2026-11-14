@@ -241,7 +241,9 @@ def retention(con, s, now=None, folder=None):
     if not folder.is_dir():
         return 0
     rows = con.execute("SELECT id, ts, path, status FROM etw_captures WHERE path IS NOT NULL").fetchall()
-    known = {os.path.normcase(os.path.abspath(r[2])): r for r in rows}
+    # only files inside this folder: a DB copy run with another data dir still points at the live traces
+    base = os.path.normcase(os.path.abspath(folder))
+    known = {k: r for r in rows if os.path.dirname(k := os.path.normcase(os.path.abspath(r[2]))) == base}
     deleted, total = 0, 0
     for p in folder.iterdir():
         key = os.path.normcase(os.path.abspath(p))
