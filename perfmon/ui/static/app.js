@@ -65,8 +65,11 @@ const update = async () => {
   if (btn.disabled) setTimeout(update, 1000);
 };
 document.getElementById("update").addEventListener("click", async () => {
-  const r = await fetch("/api/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-  if (!r.ok) toast((await r.json()).error || r.statusText);
+  try {
+    await apiPost("update", {});
+  } catch (e) {
+    toast(e.message);
+  }
   update.shown = null;
   update();
 });
