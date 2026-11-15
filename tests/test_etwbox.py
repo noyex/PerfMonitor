@@ -22,7 +22,8 @@ import sys
 out = sys.argv[sys.argv.index("-o") + 1]
 mode = open(sys.argv[2]).read()
 if mode == "fail":
-    sys.stdout.buffer.write("Dane wejściowe\nPliki:\n  x.etl\n0.00%50.00%\nBłąd: Odmowa dostępu.\n".encode("oem"))
+    # ASCII only: the OEM code page of the machine running the tests may lack Polish letters
+    sys.stdout.buffer.write(b"Input\nFiles:\n  x.etl\n0.00%50.00%\nError: Access is denied.\n")
     sys.exit(0x80070005)
 open(out, "r+b").close()
 with open(out, "r+b") as f:
@@ -311,7 +312,7 @@ class StreamTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as e:
             list(etwbox.tracerpt_lines(self.etl("fail"), timeout=60))
         self.assertIn("0x80070005 (odmowa dostępu)", str(e.exception))
-        self.assertIn("Odmowa dostępu.", str(e.exception))
+        self.assertIn("Access is denied.", str(e.exception))
 
 
 class BacklogTest(unittest.TestCase):
