@@ -41,6 +41,7 @@ DEFAULTS = {
     "apic_ids_per_core": 2,             # WHEA APIC ID -> core (7700X with SMT: 2 threads per core)
     "gpu_od_poll_s": 600,               # Adrenalin tuning readout via ADL; 0 = never touch ADL
     "ui_port": 8765,
+    "steam_banners": True,      # fetch a missing game banner from Steam's public CDN (perfmon/banners.py)
     "hotkey_mark": "ctrl+alt+l",   # global shortcut for `pm mark` while playing; "" = off
     "hotkey_beep": True,           # short beep confirming the mark
     "gpu_proc_interval_s": 5.0,    # GPU load / VRAM per process and the game process sampler
