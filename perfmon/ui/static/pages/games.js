@@ -1,323 +1,143 @@
-﻿// "Gry": list of game sessions + session detail. Deep link: #/games?id=<id>
+// "Gry": one tile per game, and the game's own page. Deep link: #/games?exe=<exe>
 Pages.games = (() => {
-  let charts = [];
-
-  const CAUSES = {
-    disk: "Dysk",
-    vram: "VRAM",
-    ram: "RAM",
-    cpu_thread: "Wątek CPU",
-    alt_tab: "Alt+Tab",
-    dpc: "Sterownik (DPC)",
-    thermal: "Temperatura",
-    shader_or_unknown: "Kompilacja shaderów / nieznane",
-    vram_shared: "VRAM przelewa się do RAM",
-    disk_reset: "Reset dysku",
-    disk_hot: "Gorący dysk z grą",
-    pagefile: "Plik wymiany",
-    shader_compile: "Kompilacja shaderów",
-    etw_dump: "Zrzut ETW (NX Frame)",
-    "background_scan:defender": "Skan Defendera",
+  const STATUS = {
+    test: ["warning", () => "trwa test agenta"],
+    crash: ["critical", (s) => `awaria ${whenDay(s.ts)}`],
+    live: ["good", () => "gra trwa"],
+    slower: ["warning", (s) => (s.cause === "driver" ? "wolniej od nowego sterownika" : s.cause === "game" ? "wolniej od aktualizacji gry" : "wolniej niż zwykle")],
+    ok: ["good", () => "jak zwykle"],
+    unknown: ["", () => "za mało sesji do porównania"],
   };
-  const CAUSE_PREFIX = { "background:": "Proces w tle", "background_start:": "Start procesu", "background_gpu:": "GPU w tle" };
-  const causeLabel = (c) => {
-    const p = Object.keys(CAUSE_PREFIX).find((k) => c.startsWith(k));
-    return p ? `${CAUSE_PREFIX[p]}: ${c.slice(p.length)}` : CAUSES[c] || c;
+  const STUTTERS = { ok: "Mało", warn: "Sporo", bad: "Dużo" };
+  const ENDED = { crash: "awaria", unknown: "przerwana" };
+  const SETTINGS = [["resolution", "Rozdzielczość"], ["preset", "Jakość"], ["upscaler", "Upscaler"], ["frame_gen", "Generator klatek"], ["fps_cap", "Limit FPS"], ["vsync", "VSync"], ["ray_tracing", "Ray tracing"]];
+  const VERSIONS = { game: "Gra", driver: "Sterownik", os: "Windows" };
+
+  const fps = (v) => [v == null ? "–" : fmt(v), h("small", {}, "fps")];
+  const status = (st) => {
+    const [sev, text] = STATUS[st.kind] || STATUS.unknown;
+    return h("span", { class: `sev ${sev}` }, text(st));
   };
+  const tile = (label, value, meta, cls) =>
+    h("div", { class: "tile" }, h("div", { class: "label" }, label), h("div", { class: `value${cls ? ` ${cls}` : ""}` }, value), h("div", { class: "meta" }, meta || ""));
+  const kv = (title, rows) =>
+    h("section", { class: "tile kv" }, h("h2", {}, title), rows.map(([k, v, note]) => h("div", {}, h("span", {}, k), h("span", {}, v, note ? h("em", {}, note) : null))));
 
-  const END = { crash: ["critical", "Crash"], unknown: ["serious", "Nieznany koniec"] };
-  const SIDE = { cpu: "po stronie CPU", gpu: "po stronie GPU", present: "w kolejce klatek" };
-
-  // normalized game settings (perfmon/gamesettings.py) as one line; values the game stores as bare numbers stay numbers
-  const GS = [["resolution"], ["preset", "preset"], ["upscaler"], ["upscaler_mode"], ["frame_gen", "generator klatek"], ["fps_cap", "limit FPS"], ["vsync", "VSync"], ["ray_tracing", "RT"]];
-  const gameSettings = (g) => {
-    if (!g) return null;
-    const on = (v) => (v === true ? "wł." : v === false || v === "off" ? "wył." : v);
-    return GS.filter(([k]) => g[k] != null && g[k] !== "").map(([k, l]) => (l ? `${l} ${on(g[k])}` : on(g[k]))).join(" · ") || null;
-  };
-  // summary.modules = {ts, procs: {exe: scan}}; only readable scans count (a protected game is "unknown", not "none")
-  const overlays = (m) => {
-    const names = Object.values((m && m.procs) || {}).filter((x) => x && x.status === "ok")
-      .flatMap((x) => (x.flagged || []).filter((f) => f.category !== "anticheat").map((f) => f.name));
-    return names.length ? [...new Set(names)].join(", ") : null;
-  };
-
-  const tile = (label, value, unit, meta) =>
-    h("div", { class: "tile" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value, unit ? h("small", {}, unit) : null), h("div", { class: "meta" }, meta || ""));
-
-  // ---------- list ----------
+  // ---------- tiles ----------
   const renderList = async (view) => {
-    const sessions = await api("sessions", { limit: 50 });
-    const games = [...new Set(sessions.map((s) => gameName(s.exe)))];
-    let filter = "all";
-
-    const head = h("div", { class: "page-head" }, h("h1", {}, "Gry"), h("div", { class: "spacer" }));
-    const body = h("div");
-    view.append(head, body);
-
-    const draw = () => {
-      body.innerHTML = "";
-      const rows = sessions.filter((s) => filter === "all" || gameName(s.exe) === filter);
-      if (!rows.length) {
-        body.append(h("div", { class: "empty" }, "Brak sesji gier – pojawią się po uruchomieniu gry"));
-        return;
-      }
-      const tbody = h("tbody");
-      for (const s of rows) {
-        const end = END[s.end_reason];
-        tbody.append(
-          h("tr", { onclick: () => (location.hash = `#/games?id=${s.id}`) },
-            h("td", { class: "muted" }, fmtTime(s.start_ts)),
-            h("td", {}, gameTitle(s),
-              s.running ? h("span", { class: "live" }, "trwa") : null,
-              end ? h("span", { class: `sev ${end[0]}` }, end[1]) : null,
-              BOTTLENECK[s.bottleneck] && s.bottleneck !== "mixed" ? h("span", { class: "chip" }, BOTTLENECK[s.bottleneck]) : null),
-            h("td", { class: "num" }, s.duration_s > 0 || s.running ? fmtDur(s.duration_s) : "–"),
-            h("td", { class: "num" }, fmt(s.fps_avg)),
-            h("td", { class: "num" }, fmt(s.fps_1low)))
-        );
-      }
-      body.append(
-        h("table", { class: "games-table" },
-          h("thead", {}, h("tr", {}, h("th", {}, "Start"), h("th", {}, "Gra"), h("th", { class: "num" }, "Czas"), h("th", { class: "num" }, "Śr. FPS"), h("th", { class: "num" }, "1% low"))),
-          tbody)
-      );
-    };
-
-    if (games.length > 1) head.append(segmented([["all", "Wszystkie"], ...games.map((g) => [g, g])], filter, (v) => { filter = v; draw(); }));
-    draw();
-  };
-
-  // ---------- detail ----------
-  const COLS = ["cpu_total", "cpu_core_max", "gpu_load", "cpu_temp", "gpu_hotspot"];
-  const DEFS = [
-    { title: "Procesor", unit: "%", keys: ["cpu_total", "cpu_core_max"], series: [{ label: "Średnio" }, { label: "Najbardziej obciążony wątek" }], yMax: 100 },
-    { title: "Karta graficzna", unit: "%", keys: ["gpu_load"], series: [{ label: "GPU" }], yMax: 100 },
-    { title: "Temperatury", unit: "°C", keys: ["cpu_temp", "gpu_hotspot"], series: [{ label: "CPU" }, { label: "GPU hotspot" }] },
-  ];
-
-  const renderDetail = async (view, id) => {
-    const d = await api("session", { id });
-    if (d.error) {
-      view.append(h("div", { class: "page-head" }, h("a", { class: "back", href: "#/games" }, "← Gry")), h("div", { class: "empty" }, d.error));
+    const games = await api("games");
+    view.append(h("div", { class: "page-head" }, h("h1", {}, "Gry")));
+    if (!games.length) {
+      view.append(h("div", { class: "empty" }, "Gry pojawią się tu po pierwszej sesji."));
       return;
     }
-    const s = d.session;
-    const game = gameTitle(s);
-    const now = Date.now() / 1000;
-    const t0 = s.start_ts;
-
-    // end_ts is already the effective end (last data) for sessions cut short by a reset
-    const t1 = s.running ? now : Math.max(s.end_ts || t0, t0 + 1);
-    const f = await api("frames", { from: t0, to: t1, session: id, points: 1200 });
-    const hasFrames = (f.ts || []).length > 0;
-    const dur = d.duration_s || t1 - t0;
-    const known = t1 - t0 > 1;
-
-    const zoom = (a, b) => (location.hash = `#/timeline?from=${Math.round(a)}&to=${Math.round(b)}`);
-    const end = END[s.end_reason];
-
-    view.append(
-      h("div", { class: "page-head" },
-        h("a", { class: "back", href: "#/games" }, "← Gry"),
-        h("h1", {}, game),
-        h("span", { class: "sub" }, `${fmtDate(t0)} · ${fmtTime(t0, false)}${known ? ` – ${fmtTime(t1, false)}` : ""}${dur ? ` · ${fmtDur(dur)}` : ""}${s.running ? " · trwa" : ""}`),
-        end ? h("span", { class: `sev ${end[0]}` }, end[1]) : null,
-        h("div", { class: "spacer" }),
-        known ? h("a", { class: "btn", href: `#/timeline?from=${Math.round(t0)}&to=${Math.round(t1)}` }, "Oś czasu") : null,
-        h("button", { class: "btn", onclick: () => askAgent(`Przeanalizuj sesję #${id} ${game} (pm session ${id}). Co powodowało spadki FPS i stuttery oraz co warto zoptymalizować?`) }, "Zapytaj agenta"))
-    );
-
-    const st = d.stutters || {};
-    if (hasFrames) {
-      // with frame generation the game renders fewer frames than the screen shows: judge the game's own frames
-      const fg = s.frame_gen_pct > 0 && s.app_fps_avg != null;
-      // lows of the game's frames exist only for sessions recorded with them; older ones show the presented lows
-      const low = (app, shown) => (fg && app != null ? [fmt(app), null, `wyświetlane ${fmt(shown)}`] : [fmt(shown), null, fg ? "z generowanymi" : ""]);
-      view.append(
-        h("div", { class: "tiles" },
-          tile("Średni FPS", fmt(fg ? s.app_fps_avg : s.fps_avg), null, fg ? `wyświetlane ${fmt(s.fps_avg)} · ${fmt(s.frame_gen_pct)}% generowanych` : ""),
-          tile("1% low", ...low(s.app_fps_1low, s.fps_1low)),
-          tile("0,1% low", ...low(s.app_fps_01low, s.fps_01low)),
-          tile("Przycięcia", fmt(st.per_min, 2), "/min", `${fmt(st.count)} łącznie · najgorsze ${fmt(st.worst_ft_ms)} ms`))
-      );
-    }
-
-    const cr = d.crash;
-    if (cr) {
-      const ip = cr.interpretation || {};
-      const rows = [
-        ["Moduł", [cr.module, cr.module_version].filter(Boolean).join(" ")],
-        ["Kod", [cr.exception_code, cr.exception_name].filter(Boolean).join(" ")],
-        ["Wersja gry", cr.app_version],
-        ["Interpretacja", ip.verdict ? `${ip.verdict}${ip.confidence ? ` (pewność: ${ip.confidence})` : ""}` : null],
-      ].filter(([, v]) => v);
-      view.append(
-        h("h2", {}, "Crash"),
-        h("div", { class: "kv" }, rows.flatMap(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "v" }, v)])),
-        (ip.next_steps || []).length ? h("div", { class: "list static" }, ip.next_steps.map((x) => h("div", { class: "row" }, h("span", { class: "title" }, x)))) : null
-      );
-    }
-
-    if ((d.findings || []).length) {
-      view.append(
-        h("h2", {}, "Wnioski"),
-        h("div", { class: "list static" },
-          d.findings.map((x) =>
-            h("div", { class: "row find" },
-              h("span", { class: `sev ${x.severity}` }, ""),
-              h("div", { class: "title" }, x.title, x.detail ? h("div", { class: "detail" }, x.detail) : null)))
-        )
-      );
-    }
-
-    // Charts
-    const wrap = h("div", { class: "charts" });
-    view.append(h("h2", {}, "Przebieg sesji"), wrap);
-    if (!known) {
-      wrap.append(h("div", { class: "empty" }, "Brak danych sesji"));
-    } else {
-      const [sr, diag, gp, net] = await Promise.all([
-        api("series", { from: t0, to: t1, cols: COLS.join(","), points: 1200 }),
-        diagMarkers(t0, t1),
-        api("game_proc", { session: id, points: 1200 }),
-        api("net_series", { from: t0, to: t1, points: 1200 }),
-      ]);
-      const worst = (st.worst || []).map((w) => ({ ts: w.ts, severity: "serious" }));
-      const markers = () => [...worst, ...diag.lines];
-      const diagLines = () => diag.lines;
-      const xRange = [t0, t1];
-      if (hasFrames) {
-        charts.push(chart(wrap, { title: "FPS", series: [{ label: "FPS" }], height: 150, markers, onSelect: zoom, longRange: false, xRange }, cols(f, ["fps"])));
-        charts.push(chart(wrap, { title: "Czas klatki", unit: "ms", decimals: 1, series: [{ label: "Średni" }, { label: "99. percentyl" }], height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(f, ["ft_avg", "ft_p99"])));
-      } else {
-        wrap.append(h("div", { class: "empty" }, "Brak danych o klatkach (PresentMon)"));
-      }
-      if ((sr.ts || []).length) for (const def of DEFS) charts.push(chart(wrap, { ...def, height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(sr, def.keys)));
-      const ping = pingChart(wrap, net, { height: 130, markers: diagLines, onSelect: zoom, xRange });
-      if (ping) charts.push(ping);
-      if (diag.legend && charts.length) charts[0].el.append(diag.legend);
-
-      // Game VRAM: toggled on demand, only when the session has per-process data
-      if ((gp.ts || []).length) {
-        let vram = null;
-        view.append(
-          h("button", {
-            class: "btn more",
-            onclick: () => {
-              if (vram) {
-                vram.destroy();
-                vram.el.remove();
-                charts = charts.filter((c) => c !== vram);
-                vram = null;
-                return;
-              }
-              vram = chart(wrap, { title: "VRAM gry", unit: "MB", series: [{ label: "Dedykowana" }, { label: "Współdzielona" }], height: 130, markers: diagLines, onSelect: zoom, xRange }, cols(gp, ["vram_dedicated_mb", "vram_shared_mb"]));
-              charts.push(vram);
-            },
-          }, "VRAM gry")
-        );
-      }
-    }
-
-    // Stutters
-    const causes = Object.entries(st.cause_counts || {}).sort((a, b) => b[1] - a[1]);
-    // where the long frames' time went (PresentMon busy times; sessions recorded before them have none)
-    const sides = Object.entries(st.sides || {}).sort((a, b) => b[1] - a[1]);
-    if (causes.length || sides.length) {
-      view.append(
-        h("h2", {}, "Przyczyny przycięć"),
-        h("div", { class: "list static" },
-          causes.map(([c, n]) => h("div", { class: "row" }, h("span", { class: "title" }, causeLabel(c)), h("span", { class: "aside" }, fmt(n)))),
-          sides.map(([c, n]) => h("div", { class: "row" }, h("span", { class: "title" }, `Klatka utknęła ${SIDE[c] || c}`), h("span", { class: "aside" }, fmt(n)))))
-      );
-    }
-    const worst = (st.worst || []).slice(0, 5);
-    if (worst.length) {
-      view.append(
-        h("h2", {}, "Najgorsze przycięcia"),
-        h("div", { class: "list" },
-          worst.map((w) =>
-            h("div", { class: "row go", onclick: () => zoom(w.ts - 30, w.ts + 30) },
-              h("span", { class: "time" }, fmtTime(w.ts, false)),
-              h("span", { class: "title" }, [(w.causes || []).map(causeLabel).join(", ") || "Nieznana przyczyna", SIDE[w.side]].filter(Boolean).join(" · ")),
-              h("span", { class: "aside" }, `${fmt(w.ft_ms)} ms`))))
-      );
-    }
-
-    const b = d.bound_pct;
-    const bn = d.bottleneck;
-    if (bn) {
-      view.append(h("div", { class: "line" }, `Wąskie gardło: ${BOTTLENECK[bn.kind] || bn.kind} – ${[bn.why, bn.advice].filter(Boolean).join(". ")}`));
-    } else if (b && hasFrames) {
-      view.append(h("div", { class: "line" }, `Ograniczenie: GPU ${fmt(b.GPU)}% · CPU ${fmt(b.CPU)}% · limit FPS ${fmt(b.limit)}% czasu`));
-    }
-
-    const p = d.present;
-    if (p) {
-      const lat = p.click_lat_avg ?? p.input_lat_avg;
-      const parts = [
-        p.label,
-        p.runtime,
-        p.composed_pct > 0 ? `przez DWM ${fmt(p.composed_pct)}%` : null,
-        lat != null ? `opóźnienie klik→obraz ${fmt(lat)} ms` : null,
-        p.frame_gen_pct > 0 ? `generowane klatki ${fmt(p.frame_gen_pct)}%` : null,
-        d.pacing && d.pacing.disp_jitter_pct != null ? `nierówność klatek ${fmt(d.pacing.disp_jitter_pct, 1)}%` : null,
-      ].filter(Boolean);
-      if (parts.length) view.append(h("div", { class: "line" }, `Prezentacja: ${parts.join(" · ")}`));
-    }
-
-    const mg = d.mem_growth;
-    if (mg) {
-      view.append(h("div", { class: "line" }, `Pamięć gry: ${fmt(mg.private_start_mb)} → ${fmt(mg.private_end_mb)} MB (${mg.mem_growth_mb_h > 0 ? "+" : ""}${fmt(mg.mem_growth_mb_h)} MB/h)${mg.leak ? " – możliwy wyciek" : ""}`));
-    }
-
-    const dt = d.disk_temp;
-    if (dt && dt.hottest_max_c != null) {
-      view.append(h("div", { class: "line" }, `Dysk z grą: do ${fmt(dt.hottest_max_c)}°C${dt.warn_c ? ` (próg ostrzegawczy ${fmt(dt.warn_c)}°C)` : ""}`));
-    }
-
-    const inc = d.incidents || [];
-    if (inc.length) {
-      view.append(
-        h("h2", {}, "Zdarzenia w trakcie sesji"),
-        h("div", { class: "list" },
-          inc.map((i) =>
-            h("div", { class: "row go", onclick: () => zoom(i.ts - 120, (i.end_ts || i.ts) + 120) },
-              h("span", { class: "time" }, fmtTime(i.ts, false)),
-              h("span", { class: "title" }, i.count > 1 ? `${i.title} · ${i.count}×` : i.title),
-              h("span", { class: `sev ${i.severity}` }, sevLabel[i.severity] || i.severity)))
-        )
-      );
-    }
-
-    // Context: what was in effect (what changed vs the previous session is a finding above)
-    const c = s.context || {};
-    const cfg = d.config || {};
-    const kv = [
-      ["Ustawienia gry", gameSettings(cfg.game_settings)],
-      ["Nakładki w grze", overlays(cfg.modules)],
-      ["Plan zasilania", (cfg.power || {}).name],
-      ["Sterownik GPU", [c.adrenalin || s.gpu_driver, c.gpu_driver ? `(${c.gpu_driver})` : null].filter(Boolean).join(" ")],
-      ["Wersja gry", s.game_version],
-      ["Windows", c.os_build],
-      ["BIOS", c.bios],
-    ].filter(([, v]) => v);
-    if (kv.length) {
-      view.append(h("h2", {}, "Środowisko"), h("div", { class: "kv" }, kv.flatMap(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "v" }, v)])));
-    }
+    view.append(h("div", { class: "cards" }, games.map((g) =>
+      h("a", { class: "tile card", href: `#/games?exe=${encodeURIComponent(g.exe)}` },
+        banner(g),
+        h("div", { class: "card-body" }, h("b", {}, g.title), h("i", {}, fps(g.last.fps)), status(g.status))))));
   };
 
-  const render = async (view, params) => {
-    if (params.id) await renderDetail(view, params.id);
-    else await renderList(view);
+  // ---------- one game ----------
+  const setting = (g, key) => {
+    const v = g[key];
+    if (v == null || v === "") return null;
+    if (key === "resolution") return String(v).replace(/\s*x\s*/i, " × ");
+    if (key === "upscaler") return [v, g.upscaler_mode].filter(Boolean).join(", ");
+    return v === true ? "włączony" : v === false || v === "off" ? "wyłączony" : v;
+  };
+
+  const rate = (s) => {
+    const m = perMin(s);
+    return !m ? "żadnych" : m < 1 ? `jedno na ${fmt(1 / m)} min` : `${fmt(m)} na minutę`;
+  };
+
+  // "Cel": the FPS the user wants here. Click to type it; Enter or leaving the field saves, Escape cancels.
+  const targetTile = (g) => {
+    const value = h("div", { class: "value" });
+    const meta = h("div", { class: "meta" });
+    const box = h("div", { class: "tile target", role: "button", tabindex: "0", "aria-label": "Zmień cel FPS" }, h("div", { class: "label" }, "Cel"), value, meta);
+    const show = () => {
+      const t = g.target_fps, now = g.last.fps;
+      value.replaceChildren(...(t ? fps(t) : ["Ustaw"]));
+      meta.textContent = !t ? "ile FPS chcesz mieć" : now == null ? "" : now >= t ? "osiągnięty" : `brakuje ${fmt(Math.ceil(t - now))}`;
+    };
+    const edit = () => {
+      const input = h("input", { type: "number", min: "1", max: "1000", value: g.target_fps ?? "", "aria-label": "Cel FPS" });
+      let cancelled = false;
+      input.onkeydown = (e) => {
+        if (e.key === "Escape") cancelled = true;
+        if (e.key === "Enter" || e.key === "Escape") input.blur();
+        e.stopPropagation();
+      };
+      input.onblur = async () => {
+        if (!cancelled && String(g.target_fps ?? "") !== input.value.trim()) {
+          try {
+            g.target_fps = (await apiPost("game_target", { exe: g.exe, fps: input.value.trim() || null })).target_fps;
+          } catch (e) {
+            toast(e.message);
+          }
+        }
+        show();
+      };
+      value.replaceChildren(input);
+      input.focus();
+      input.select();
+    };
+    box.onclick = () => box.querySelector("input") || edit();
+    box.onkeydown = (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      edit();
+    };
+    show();
+    return box;
+  };
+
+  const sessionRow = (s) => {
+    const level = stutterLevel(s);
+    const end = ENDED[s.end_reason];
+    const sev = s.end_reason === "crash" ? "critical" : level === "bad" || end ? "serious" : level === "warn" ? "warning" : "good";
+    const notes = [s.running ? "na żywo" : fmtDur(s.duration_s), level === "warn" ? "sporo przycięć" : level === "bad" ? "dużo przycięć" : null];
+    return h("div", { class: "row" },
+      h("span", { class: "time" }, when(s.start_ts)),
+      h("span", { class: `sev ${sev} title` }, h("span", {}, notes.filter(Boolean).join(", "), end ? [", ", h("span", { class: "bad" }, end)] : null)),
+      h("span", { class: "fps" }, fps(s.fps)));
+  };
+
+  const renderGame = async (view, exe) => {
+    const g = await api("game", { exe });
+    const back = h("a", { class: "back", href: "#/games" }, "← Gry");
+    if (g.error) {
+      view.append(h("div", { class: "page-head" }, back), h("div", { class: "empty" }, "Nie ma jeszcze sesji tej gry."));
+      return;
+    }
+    const last = g.last;
+    const ask = () => askAgent(`Przeanalizuj grę ${g.title} (pm regress --exe ${g.exe}, pm sessions, pm session <id> dla ostatnich sesji). `
+      + "Jak chodzi względem wcześniejszych sesji, co powoduje spadki FPS i przycięcia, co zmienić? "
+      + (g.target_fps ? `Mój cel to ${g.target_fps} FPS. ` : "")
+      + `Wniosek zapisz: pm note add --exe ${g.exe} "...".`);
+    const settings = g.settings ? SETTINGS.map(([k, label]) => [label, setting(g.settings, k)]).filter(([, v]) => v != null) : [];
+    const versions = g.versions.map((v) => [VERSIONS[v.key], v.value, v.since_ts ? `od ${whenDay(v.since_ts)}` : null]);
+    const level = stutterLevel(last);
+    view.append(
+      h("div", { class: "page-head" }, back, h("h1", {}, g.title), h("div", { class: "spacer" }), h("button", { class: "btn primary", onclick: ask }, "Zapytaj agenta")),
+      h("div", { class: "game" },
+        h("div", { class: "game-col" },
+          g.appid ? h("div", { class: "tile game-banner" }, banner(g)) : null,
+          settings.length ? kv("Ustawienia gry", settings) : null,
+          versions.length ? kv("Wersje", versions) : null),
+        h("div", { class: "game-col" },
+          h("div", { class: "tiles" },
+            tile("Średnio", fps(last.fps), g.vs_usual != null ? `${signed(g.vs_usual)} względem zwykle` : ""),
+            targetTile(g),
+            tile("1% low", last.fps_1low == null ? "–" : fmt(last.fps_1low), "najgorsze chwile"),
+            last.frames ? tile("Przycięcia", STUTTERS[level], rate(last), level) : null),
+          agentCard(g.agent),
+          h("section", {}, h("h2", {}, "Ostatnie sesje"), h("div", { class: "list" }, g.recent.map(sessionRow))))));
   };
 
   return {
-    render,
-    destroy: () => {
-      charts.forEach((c) => c.destroy());
-      charts = [];
-    },
+    render: (view, params) => (params.exe ? renderGame(view, params.exe) : renderList(view)),
+    destroy: () => {},
   };
 })();

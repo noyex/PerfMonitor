@@ -11,9 +11,9 @@ import re
 import socket
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from . import (bottleneck, crashinfo, ctxreport, diagreport, episodes, framestats, gameplay, marks, regression,
+from . import (crashinfo, ctxreport, diagreport, episodes, framestats, gameplay, marks, regression,
                reportcache, stuttercause)
 
 # --------------------------------------------------------------------------
@@ -98,13 +98,6 @@ def _table_cols(con, table):
     return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
 
 
-TEXT_SAMPLE_COLS = {"fg_exe", "disk_lat_disk", "extra"}
-MAX_AGG_SAMPLE = {"disk_lat_ms", "ui_ms", "dwm_ms", "disk_queue", "hard_faults_s"}
-FRAME_AGG = {  # name -> SQL aggregate expression
-    "fps": "AVG(fps)", "fps_min": "MIN(fps)", "ft_avg": "AVG(ft_avg)", "ft_p99": "MAX(ft_p99)",
-    "ft_max": "MAX(ft_max)", "cpu_busy": "AVG(cpu_busy)", "gpu_busy": "AVG(gpu_busy)",
-    "display_lat": "AVG(display_lat)", "frames": "AVG(frames)",
-}
 KEY_COLS = ["cpu_total", "cpu_core_max", "cpu_clock_mhz", "cpu_temp", "cpu_power_w", "dpc_pct", "interrupt_pct",
             "ram_pct", "ram_used_gb", "commit_gb", "hard_faults_s", "gpu_load", "gpu_vram_mb", "gpu_clock_mhz",
             "gpu_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_power_w", "gpu_fan_rpm", "disk_lat_ms",
@@ -150,79 +143,18 @@ def latest(con):
     }
 
 
-# share of session time behind each bottleneck kind (metrics key from bottleneck.compute)
-_BOTTLENECK_SHARE = {"gpu": "gpu_bound_pct", "gpu_power": "gpu_bound_pct", "cpu": "cpu_bound_pct",
-                     "cpu_thread": "cpu_bound_pct", "limit": "limit_pct", "vram": "vram_shared_over_pct"}
-
-
 _OVERVIEW_LIVE_S = 120          # a running session's FPS is the average of this window
-_CRASH_WINDOW_S = 14 * 86400    # "awarie" on the overview
-_BOTTLENECK_TTL_S = 30          # live bottleneck refresh; finished sessions are cached for good
-_bottleneck_cache = {}          # session id -> (computed at, result)
-
-
-def _overview_bottleneck(con, cur, now):
-    sid = cur["id"]
-    if not cur["running"]:
-        b = (_json(_one(con, "SELECT summary FROM sessions WHERE id=?", (sid,))["summary"]) or {}).get("bottleneck")
-        if b:
-            return b
-    hit = _bottleneck_cache.get(sid)
-    if hit and (not cur["running"] or now - hit[0] < _BOTTLENECK_TTL_S):
-        return hit[1]
-    b = bottleneck.compute(con, sid, cur["start_ts"], cur["end_ts"] or now)
-    _bottleneck_cache[sid] = (now, b)
-    return b
-
-
-def _session_limit(con, s, now):
-    """{kind, share} of a session; a stored summary keeps the metrics flat, bottleneck.compute nests them."""
-    if not s["running"] and not s.get("frames"):
-        return None
-    b = _overview_bottleneck(con, s, now)
-    if not b:
-        return None
-    return {"kind": b["kind"], "share": (b.get("metrics") or b).get(_BOTTLENECK_SHARE.get(b["kind"]))}
-
-
-def _overview_totals(con, now, live_id):
-    """Play time overall and this calendar week (Monday 00:00 local, a session over the edge counts its part in the
-    week), time-weighted FPS, app crashes in 14 days.
-
-    Time counts every session, also those without frames (PresentMon can fail during a real game); an open row counts
-    only while it really runs, a stale one would grow forever. FPS = sum(fps_avg * time) / sum(time) over the sessions
-    with frames."""
-    rows = _rows(con, "SELECT id, start_ts, end_ts, summary FROM sessions")
-    ends = _eff_ends(con, rows)
-    today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
-    week0 = (today - timedelta(days=today.weekday())).timestamp()
-    play = week = fps_sum = fps_time = 0.0
-    for r in rows:
-        end = now if r["id"] == live_id else ends[r["id"]]
-        if end is None:
-            continue
-        dur = max(0.0, end - r["start_ts"])
-        play += dur
-        week += max(0.0, end - max(r["start_ts"], week0))
-        summ = _json(r["summary"]) or {}
-        if summ.get("frames") and summ.get("fps_avg") is not None:
-            fps_sum += summ["fps_avg"] * dur
-            fps_time += dur
-    crashes = _one(con, "SELECT COUNT(*) AS n FROM incidents WHERE kind='app_crash' AND ts>=?",
-                   (now - _CRASH_WINDOW_S,))["n"]
-    return {"play_s": round(play), "week_s": round(week), "fps_avg": _r(fps_sum / fps_time) if fps_time else None,
-            "crashes_14d": crashes}
 
 
 def overview(con, recent=5):
-    """Overview screen: the running game session, else the last one with frames, the latest sessions and the totals.
+    """Overview screen: the running game session, else the last one with frames, and the latest sessions.
 
     A running session counts only while the collector is alive and the game renders (a frame in the last 30 s, or
     started under a minute ago), so a stale row after a crash or a launcher without frames doesn't take the card.
-    `current` and `recent` carry the bottleneck ({kind, share}); a running `current` adds fps_live (average of the
-    last 2 minutes) and its ft_max from the frames, since the stored summary lags a minute behind.
-    `temps` are the live CPU/GPU temperatures, None while the collector is down. `game_running` is any open session
-    with a live collector: wider than a running `current`, a game also runs without frames or on a loading screen."""
+    A running `current` adds fps_live (average of the last 2 minutes) and its ft_max from the frames, since the stored
+    summary lags a minute behind. `temps` are the live CPU/GPU temperatures, None while the collector is down.
+    `game_running` is any open session with a live collector: wider than a running `current`, a game also runs
+    without frames or on a loading screen."""
     now = time.time()
     s = _one(con, "SELECT ts, cpu_temp, gpu_temp FROM samples ORDER BY ts DESC LIMIT 1")
     alive = bool(s and now - s["ts"] < 5)
@@ -240,14 +172,11 @@ def overview(con, recent=5):
     # sessions without frames that ended normally are launchers / short starts, not games played
     played = [r for r in rows if not r["running"] and r is not cur
               and (r.get("frames") or r["end_reason"] != "exit")][:recent]
-    for r in ([cur] if cur else []) + played:
-        r["bottleneck"] = _session_limit(con, r, now)
     return {
         "now": now,
         "current": cur,
         "recent": played,
         "game_running": alive and any(r["running"] for r in rows),
-        "totals": _overview_totals(con, now, live["id"] if live else None),
         "temps": {"cpu": _r(s["cpu_temp"]), "gpu": _r(s["gpu_temp"])} if alive else None,
     }
 
@@ -328,13 +257,6 @@ def sessions(con, limit=20):
     ends = _eff_ends(con, rows)
     ext = diagreport.session_extras(con, rows)
     return [{**_flatten_session(r, st.get(r["id"], 0), ends), **ext.get(r["id"], {})} for r in rows]
-
-
-def game_list(con):
-    """Games with at least one session, most played first (cheap list for pickers)."""
-    return _rows(con, f"SELECT exe, COUNT(*) AS sessions, MAX(start_ts) AS last_ts FROM sessions WHERE {GAMES_ONLY} "
-                      "GROUP BY exe ORDER BY sessions DESC, last_ts DESC")
-
 
 def _causes_for_stutter(st, samples_ts, samples, procs_ts, procs, game_exe, ext=None):
     ts = st["ts"]
@@ -1000,27 +922,6 @@ def _net_verdict(con, rep, t0, t1):
         v.append("Ping stabilny" + (f" (internet: mediana {inet['p50']} ms, p99 {inet['p99']} ms)" if inet.get("p50") is not None else ""))
     return v
 
-
-def net_series(con, t0, t1, max_points=1500):
-    """Chart series like series(): ts + gw/isp/inet/game ms (max per bucket), inet_loss in % (max), wifi_signal (min)."""
-    t0, t1 = float(t0), float(t1)
-    cols = ["gw_ms", "isp_ms", "inet_ms", "game_ms", "inet_loss", "wifi_signal"]
-    if not _has_net(con):
-        return {"ts": [], "step_s": 1.0, **{c: [] for c in cols}}
-    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
-    rows = con.execute("SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, MAX(gw_ms) AS gw_ms, MAX(isp_ms) AS isp_ms, "
-                       "MAX(inet_ms) AS inet_ms, MAX(game_ms) AS game_ms, MAX(inet_loss) AS inet_loss, "
-                       "MIN(wifi_signal) AS wifi_signal FROM net_samples WHERE ts BETWEEN ? AND ? GROUP BY b ORDER BY b",
-                       (t0, step, t0, t1)).fetchall()
-    out = {"ts": [r["ts"] for r in rows], "step_s": step}
-    for c in cols:
-        if c == "inet_loss":
-            out[c] = [_r(100 * r[c], 1) if r[c] is not None else None for r in rows]
-        else:
-            out[c] = [_r(r[c], 2) for r in rows]
-    return out
-
-
 def _net_bad_seconds(rows):
     """Timestamps of seconds with packet loss or a latency spike on any target (spike = well above that target's median)."""
     med = {k: _pct([r[f"{k}_ms"] for r in rows if r[f"{k}_ms"] is not None], 0.5) for k in NET_TARGETS}
@@ -1336,14 +1237,6 @@ def _session_metrics(con, exe=None, since=None):
         })
     return out
 
-
-def session_points(con, exe=None, since=None):
-    return [{"id": s["id"], "exe": s["exe"], "start_ts": s["start_ts"], "time": fmt_ts(s["start_ts"]),
-             "minutes": s["minutes"], "fps_avg": s["fps_avg"], "fps_1low": s["fps_1low"], "fps_01low": s["fps_01low"],
-             "stutters_per_min": s["stutters_per_min"], "gpu_driver": s["gpu_driver"], "game_version": s["game_version"]}
-            for s in _session_metrics(con, exe, since)]
-
-
 SMALL_SAMPLE_MIN, SMALL_SAMPLE_SESSIONS = 30, 3   # before/after groups below this: weak evidence
 
 
@@ -1505,42 +1398,3 @@ def timeline_markers(con, exe=None, since=None, diag=False):
         m["time"] = fmt_ts(m["ts"])
     return markers
 
-
-# --------------------------------------------------------------------------
-# time series for charts
-# --------------------------------------------------------------------------
-
-def series(con, t0, t1, cols, max_points=1500):
-    t0, t1 = float(t0), float(t1)
-    valid = set(_table_cols(con, "samples")) - TEXT_SAMPLE_COLS - {"ts"}
-    cols = [c for c in cols if c in valid]
-    if not cols:
-        return {"ts": []}
-    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
-    sel = ",".join(f"{'MAX' if c in MAX_AGG_SAMPLE else 'AVG'}({c}) AS {c}" for c in cols)
-    rows = con.execute(f"SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, {sel} FROM samples "
-                       f"WHERE ts BETWEEN ? AND ? GROUP BY b ORDER BY b", (t0, step, t0, t1)).fetchall()
-    out = {"ts": [r["ts"] for r in rows], "step_s": step}
-    for c in cols:
-        out[c] = [_r(r[c], 2) for r in rows]
-    return out
-
-
-def frame_series(con, t0, t1, session=None, max_points=1500):
-    if t0 is None or t1 is None:   # missing bounds: the session's own span, otherwise the last hour up to now
-        row = con.execute("SELECT start_ts, end_ts FROM sessions WHERE id=?", (int(session),)).fetchone()             if session is not None else None
-        t1 = t1 if t1 is not None else (row[1] if row and row[1] else time.time())
-        t0 = t0 if t0 is not None else (row[0] if row else float(t1) - 3600)
-    t0, t1 = float(t0), float(t1)
-    step = max(1.0, math.ceil((t1 - t0) / max(1, max_points)))
-    sel = ",".join(f"{expr} AS {name}" for name, expr in FRAME_AGG.items())
-    sql = (f"SELECT CAST((ts-?)/? AS INTEGER) AS b, MIN(ts) AS ts, {sel} FROM frames WHERE ts BETWEEN ? AND ?")
-    args = [t0, step, t0, t1]
-    if session is not None:
-        sql += " AND session=?"
-        args.append(int(session))
-    rows = con.execute(sql + " GROUP BY b ORDER BY b", args).fetchall()
-    out = {"ts": [r["ts"] for r in rows], "step_s": step}
-    for name in FRAME_AGG:
-        out[name] = [_r(r[name], 2) for r in rows]
-    return out

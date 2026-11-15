@@ -1,8 +1,7 @@
 /* Page-specific styles for #/problems (shared design tokens live in /style.css). */
-.row.finding { cursor: default; align-items: flex-start; }
-.row.finding:hover { background: transparent; }
-.row.finding .sev { width: 96px; flex: none; padding-top: 2px; }
-.row.finding .text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.row.finding .detail { color: var(--muted); font-size: 13px; }
-tbody tr.click { cursor: pointer; }
-tbody tr.click:hover { background: var(--surface-2); }
+[data-page="problems"] .page-head .sub { align-self: flex-end; padding-bottom: 6px; }
+[data-page="problems"] .note { margin-bottom: 12px; }
+.row.problem { align-items: flex-start; }
+.row.problem .sev { margin-top: 7px; }
+.row.problem .title { white-space: normal; }
+.row.problem small { display: block; color: var(--ink-2); font-size: 13px; }

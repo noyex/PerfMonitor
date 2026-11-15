@@ -9,7 +9,7 @@ from perfmon import db, episodes, notes, regression
 from perfmon.regression import game_key
 
 RECENT_S = 14 * 86400          # a crash or a version change older than this is no longer news
-SESSIONS = 8                   # sessions listed on a game's page
+SESSIONS = 6                   # sessions listed on a game's page
 TARGET_MAX = 1000
 _assessed = {}                 # finished session id -> regression verdict (its baseline is earlier sessions only)
 
@@ -73,7 +73,7 @@ def _status(con, last, test, now):
 
 def _played(con):
     """Game sessions, newest first, flattened; launchers and short starts (no frames, clean exit) are left out."""
-    rows = an._rows(con, f"SELECT * FROM sessions WHERE {an.GAMES_ONLY} ORDER BY id DESC")
+    rows = an._rows(con, f"SELECT * FROM sessions WHERE {an.GAMES_ONLY} ORDER BY start_ts DESC, id DESC")
     ends = an._eff_ends(con, rows)
     out = []
     for r in rows:

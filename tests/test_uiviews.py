@@ -74,7 +74,7 @@ class GamesTest(unittest.TestCase):
         self.assertEqual(g["settings"], CTX["game_settings"]["normalized"])
         self.assertEqual([(v["key"], v["value"], v["since_ts"]) for v in g["versions"]],
                          [("game", "build 101", now - DAY), ("driver", "26.10.2", now - DAY), ("os", "26200.1", None)])
-        self.assertEqual(len(g["recent"]), 6)
+        self.assertEqual(len(g["recent"]), uiviews.SESSIONS)
         self.assertEqual((g["recent"][0]["id"], g["recent"][0]["stutters"], g["recent"][1]["stutters"]), (sid, 1, 0))
         self.assertEqual(g["agent"]["note"]["text"], "Wszystko w normie")
         self.assertIn("error", uiviews.game(con, "nope.exe"))

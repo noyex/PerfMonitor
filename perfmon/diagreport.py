@@ -298,15 +298,3 @@ def health_incidents(con, t0):
     """`pm health` / Problems list of the diagnostics incidents, newest first."""
     rows = an.incidents_between(con, t0, 4e9, kinds=DIAG_INCIDENTS, limit=100000)
     return sorted(rows, key=lambda i: -i["ts"])[:200]
-
-
-def game_series(con, session, max_points=1500):
-    """Game process series for the session chart: VRAM dedicated/shared, private memory (game_proc, every ~5 s)."""
-    rows = con.execute("SELECT ts, vram_dedicated_mb, vram_shared_mb, private_mb FROM game_proc WHERE session=? "
-                       "ORDER BY ts", (int(session),)).fetchall()
-    step = max(1, -(-len(rows) // max(1, int(max_points))))
-    rows = rows[::step]
-    out = {"ts": [r[0] for r in rows]}
-    for i, k in enumerate(("vram_dedicated_mb", "vram_shared_mb", "private_mb"), 1):
-        out[k] = [round(r[i]) if r[i] is not None else None for r in rows]
-    return out

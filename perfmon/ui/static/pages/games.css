@@ -1,24 +1,37 @@
 /* Page-specific styles for #/games (shared design tokens live in /style.css). */
-.games-table tbody tr { cursor: pointer; }
-.games-table tbody tr:hover { background: var(--surface-2); }
-.games-table td.muted { color: var(--muted); }
-.games-table .sev { margin-left: 10px; }
-.games-table .chip { margin-left: 10px; padding: 1px 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--muted); }
-.games-table .live { color: var(--good); font-size: 13px; margin-left: 10px; }
-.page-head .back { color: var(--muted); text-decoration: none; font-size: 13px; }
-.page-head .back:hover { color: var(--ink); }
-.page-head a.btn { text-decoration: none; }
-.list.static .row { cursor: default; }
-.list.static .row:hover { background: transparent; }
-.list .row.go { cursor: pointer; }
-.list .row.go:hover { background: var(--surface-2); }
-.list .row .detail { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: normal; }
-.list .row.find { align-items: flex-start; }
-.list .row.find .title { white-space: normal; }
-.list .row.find .sev { margin-top: 3px; }
-.line { color: var(--ink-2); font-size: 13px; margin: 20px 0 0; }
-.line + .line { margin-top: 6px; }
-.kv + .list { margin-top: 12px; }
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 24px; font-size: 13px; }
-.kv .k { color: var(--muted); }
-.kv .v { color: var(--ink-2); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+.card { padding: 0; overflow: hidden; transition: transform .18s cubic-bezier(.2, .8, .2, 1); }
+.card:hover { background: var(--glass-hover); }
+.card:active { transform: scale(.985); }
+.card-body { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 12px 18px 14px; }
+.card-body b { font-weight: 600; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-body i, .row .fps { font-style: normal; font-family: var(--font-display); font-weight: 500; letter-spacing: -.02em; }
+.card-body i { font-size: 24px; grid-row: span 2; align-self: center; }
+.card-body small, .row .fps small { font-family: var(--font-text); font-weight: 400; font-size: 13px; color: var(--ink-2); margin-left: 4px; letter-spacing: 0; }
+.card-body .sev { font-size: 13.5px; color: var(--label); }
+
+.game { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
+.game-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.game-banner { padding: 0; overflow: hidden; }
+.game .tiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.game .value.ok { color: var(--good); }
+.game .value.warn { color: var(--warning); }
+.game .value.bad { color: var(--critical); }
+.game h2 { margin: 12px 0 10px; }
+.kv { padding: 16px 20px 10px; }
+.kv h2 { margin: 0 0 6px; }
+.kv div { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; border-top: 1px solid var(--border); }
+.kv h2 + div { border-top: 0; }
+.kv div span:first-child { color: var(--ink-2); flex: none; }
+.kv div span:last-child { text-align: right; overflow-wrap: anywhere; }
+.kv em { font-style: normal; color: var(--warning); font-size: 13px; margin-left: 8px; }
+.target { cursor: pointer; }
+.target:hover { background: var(--glass-hover); }
+.target input { width: 100%; padding: 0; border: 0; border-bottom: 1px solid var(--ink-2); background: none; color: inherit; font: inherit; letter-spacing: inherit; outline: none; appearance: textfield; }
+.target input::-webkit-inner-spin-button { appearance: none; }
+.row .sev.title { font-size: 14px; color: var(--ink); }
+.row .fps { font-size: 17px; }
+.row .bad { color: var(--critical); }
+
+@media (max-width: 1000px) { .game { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .card { transition: none; } }

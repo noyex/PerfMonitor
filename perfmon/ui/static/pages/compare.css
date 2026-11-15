@@ -1,6 +1,0 @@
-/* Page-specific styles for #/compare (shared design tokens live in /style.css). */
-.page-head .seg { margin-left: 4px; }
-.headline { margin: 0 0 16px; color: var(--ink-2); font-size: 15px; }
-.tbl { overflow-x: auto; }
-tr.small td { color: var(--muted); }
-td .note { margin-left: 8px; font-size: 13px; color: var(--muted); }

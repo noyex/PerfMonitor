@@ -5,6 +5,7 @@ on Steam's public CDN (config "steam_banners": false turns the download off). A 
 import glob
 import os
 import time
+import urllib.error
 import urllib.request
 
 from perfmon import config
@@ -52,10 +53,13 @@ def _local(appid):
 
 
 def _download(appid):
+    """JPEG bytes; b"" when Steam has no banner for this id; None when it could not be asked (offline)."""
     try:
         req = urllib.request.Request(CDN.format(appid=appid), headers={"User-Agent": "NXFrame"})
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
-            return _jpeg(r.read(2_000_000))
+            return _jpeg(r.read(2_000_000)) or b""
+    except urllib.error.HTTPError:
+        return b""
     except (OSError, ValueError):
         return None
 
@@ -76,10 +80,14 @@ def get(appid):
             return None
     except OSError:
         pass
-    data = _local(appid) or (_download(appid) if config.load().get("steam_banners", True) else None)
+    data = _local(appid)
+    if data is None and config.load().get("steam_banners", True):
+        data = _download(appid)
+    if data is None:
+        return None   # nothing local and Steam not asked or not reachable: try again next time
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        (path if data else miss).write_bytes(data or b"")
+        (path if data else miss).write_bytes(data)
     except OSError:
         pass
-    return data
+    return data or None
