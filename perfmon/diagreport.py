@@ -41,6 +41,13 @@ class StutterExt:
         self.resets = [r[0] for r in con.execute("SELECT ts FROM incidents WHERE kind IN ('nvme_reset','disk_retry') "
                                                  "AND ts BETWEEN ? AND ? ORDER BY ts", (start - 15, end + 15))]
         self.disk_temp = disktemp.DiskTemp(con, row["path"] if "path" in row.keys() else None, start, end)
+        # ETW dumps: wpr -stop flushes the buffer to disk and merges it, which stutters the game itself
+        self.dumps = []
+        for ts, trig, summ in con.execute("SELECT ts, trigger, summary FROM etw_captures WHERE ts BETWEEN ? AND ? "
+                                          "ORDER BY ts", (start - 300, end)):
+            stop_s = etwbox._loads(summ).get("stop_s")
+            if stop_s is not None:
+                self.dumps.append((ts, ts + stop_s + etwbox.DUMP_SETTLE_S, trig == "stutter_burst"))
 
     def _win(self, ts_list, items, a, b):
         return items[bisect.bisect_left(ts_list, a):bisect.bisect_right(ts_list, b)]
@@ -73,6 +80,14 @@ class StutterExt:
         """Add the extra causes to the list from analyze._causes_for_stutter (before its unknown fallback)."""
         if self._win(self.resets, self.resets, ts - 15, ts + 15):
             causes.insert(0, "disk_reset")
+        # after the trigger only: the burst that caused the dump is the game's. A burst dump's disk flush and wpr CPU
+        # would pass for disk/background causes, so it replaces them; other triggers fire on a problem that may still
+        # be going on, so there it is one cause among the rest
+        dumps = [burst for a, b, burst in self.dumps if a < ts <= b]
+        if any(dumps):
+            return ["etw_dump"]
+        if dumps:
+            causes.append("etw_dump")
         if any((s.get("pagefile_pct") or 0) > 60 and (s.get("hard_faults_s") or 0) > 200 for s in win):
             causes.append("pagefile")
         if self.disk_temp.hot(ts):
@@ -202,6 +217,11 @@ def findings(rep, row):
         add("warning", f"{cc['pagefile']} stutterów przy intensywnym czytaniu z pliku wymiany",
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
+    if cc.get("etw_dump", 0) >= 3:
+        add("info", f"{cc['etw_dump']} stutterów w trakcie zapisu nagrania ETW przez NX Frame",
+            "Zapis czarnej skrzynki ETW (wpr -stop) obciąża dysk i CPU, więc przycina grę. To koszt pomiaru, nie "
+            "problem gry ani komputera; seria stutterów zapisuje najwyżej jedno nagranie na "
+            f"{etwbox.settings(config.load())['burst_cooldown_s'] // 60} min.")
     sh = rep.get("shader") or {}
     change = {"driver": "sterownika GPU", "game_update": "aktualizacji gry"}.get(sh.get("first_session_after_change"))
     n_sh = cc.get("shader_compile", 0)

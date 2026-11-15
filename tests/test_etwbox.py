@@ -22,7 +22,8 @@ import sys
 out = sys.argv[sys.argv.index("-o") + 1]
 mode = open(sys.argv[2]).read()
 if mode == "fail":
-    sys.stdout.buffer.write("Dane wejściowe\nPliki:\n  x.etl\n0.00%50.00%\nBłąd: Odmowa dostępu.\n".encode("oem"))
+    # ASCII only: the OEM code page of the machine running the tests may lack Polish letters
+    sys.stdout.buffer.write(b"Input\nFiles:\n  x.etl\n0.00%50.00%\nError: Access is denied.\n")
     sys.exit(0x80070005)
 open(out, "r+b").close()
 with open(out, "r+b") as f:
@@ -148,9 +149,11 @@ class ParseTest(unittest.TestCase):
 class BoxTest(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.flags = {}
 
-        def fake_wpr(*args, timeout=0):
+        def fake_wpr(*args, timeout=0, flags=0):
             self.calls.append(args[0])
+            self.flags[args[0]] = flags
             if args[0] == "-stop":
                 with open(args[1], "wb") as f:
                     f.write(b"x" * 1024)
@@ -190,11 +193,53 @@ class BoxTest(unittest.TestCase):
         self.assertFalse(self.box.active)
         self.assertEqual(self.calls, ["-cancel", "-start", "-stop", "-start", "-cancel"])
 
+    def test_dump_runs_below_normal(self):
+        self.box.active = True
+        self.box.want = True
+        self.assertTrue(self.box.trigger("user_mark", now=1000.0))
+        self.drain()
+        self.assertEqual(self.calls[-2:], ["-stop", "-start"])
+        self.assertEqual(self.flags["-stop"], etwbox.BELOW_NORMAL_PRIORITY_CLASS)
+
+    def test_failed_burst_dump_frees_the_burst_cooldown(self):
+        self.box.active = True
+        with mock.patch.object(etwbox, "wpr", lambda *a, **k: (1, "error")):
+            self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0))
+            self.drain()
+        self.assertEqual(self.captures[-1]["status"], "failed")
+        self.box.active = True
+        self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0 + etwbox.COOLDOWN_S))
+
+    def test_burst_dump_skipped_after_the_box_stopped_frees_the_burst_cooldown(self):
+        self.box.active = True
+        with mock.patch.object(self.box.q, "put"):                   # the worker gets to it only after the box stopped
+            self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0))
+        self.box.active = False
+        self.box._dump("stutter_burst", None, 10_000.0)
+        self.assertEqual(self.captures, [])
+        self.box.active = True
+        self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0 + etwbox.COOLDOWN_S))
+
+    def test_burst_cooldown(self):
+        self.box.active = True
+        p = mock.patch.object(self.box.q, "put")                     # no worker: the box stays recording
+        p.start()
+        self.addCleanup(p.stop)
+        for i in range(5):
+            self.box.on_stutter(100.0 + i, 1)
+        self.assertEqual(self.box.last_burst, self.box.last_dump)
+        later = self.box.last_dump + etwbox.COOLDOWN_S + 1
+        self.assertFalse(self.box.trigger("stutter_burst", now=later))   # burst cooldown, not the 120 s one
+        self.assertTrue(self.box.trigger("dwm_stall", now=later))        # other triggers keep the short one
+        self.assertTrue(self.box.trigger("stutter_burst", now=self.box.last_burst + self.box.s["burst_cooldown_s"]))
+
     def test_burst_and_dpc_triggers(self):
         self.box.active = True
         for i in range(4):
             self.assertFalse(self.box.on_stutter(100.0 + i, 1))
         self.assertTrue(self.box.on_stutter(104.0, 1))
+        self.drain()
+        self.box.active = True                                       # not restarted: the box was never wanted
         self.box.last_dump = 0
         self.assertFalse(self.box.on_sample(200.0, 9.0, 1))
         self.assertFalse(self.box.on_sample(201.0, 3.0, 1))          # dropped below: timer resets
@@ -272,6 +317,24 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(status, "failed")
         self.assertIn("retencja", json.loads(summ)["error"])
 
+    def test_stutters_during_a_dump_are_tagged(self):
+        from perfmon import diagreport
+        self.con.row_factory = sqlite3.Row
+        self.con.executemany("INSERT INTO etw_captures(ts, trigger, session, status, summary) VALUES (?,?,?,?,?)",
+                             [(1000.0, "stutter_burst", 1, "analyzed", json.dumps({"stop_s": 8.0})),
+                              (2000.0, "dwm_stall", 1, "analyzed", json.dumps({"stop_s": 8.0})),
+                              (3000.0, "user_mark", 1, "failed", "not json")])
+        ext = diagreport.StutterExt(self.con, {"exe": "game.exe", "id": 1, "path": None}, 900, 3000)
+        tags = lambda ts: ext.refine(ts, [], ["disk"])
+        self.assertEqual(tags(1000.0), ["disk"])                     # the burst that triggered it is the game's
+        self.assertEqual(tags(1005.0), ["etw_dump"])                 # the dump's flush is no disk problem
+        self.assertEqual(tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S), ["etw_dump"])
+        self.assertEqual(tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S + 1), ["disk"])
+        self.assertEqual(tags(2005.0), ["disk", "etw_dump"])         # a freeze dump: the problem may still be on
+        self.assertEqual(tags(3005.0), ["disk"])                     # no stop_s: not a dump that ran
+        ext.dumps = [(4000.0, 4200.0, False), (4100.0, 4120.0, True)]
+        self.assertEqual(tags(4110.0), ["etw_dump"])                 # overlapping windows: the burst dump wins
+
     def test_settings_merge(self):
         s = etwbox.settings({"etw": {"mode": "always", "triggers": {"dpc_pct": 0}}})
         self.assertEqual(s["mode"], "always")
@@ -311,7 +374,7 @@ class StreamTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as e:
             list(etwbox.tracerpt_lines(self.etl("fail"), timeout=60))
         self.assertIn("0x80070005 (odmowa dostępu)", str(e.exception))
-        self.assertIn("Odmowa dostępu.", str(e.exception))
+        self.assertIn("Access is denied.", str(e.exception))
 
 
 class BacklogTest(unittest.TestCase):
