@@ -62,7 +62,7 @@ Pages.oc = (() => {
       active && st && !st.error ? h("span", { class: `sev ${VERDICT_SEV[st.verdict] || ""}` }, st.verdict) : null,
       h("div", { class: "spacer" }), h("button", { class: "btn primary", onclick: ask }, "Zapytaj agenta")));
     if (ov.gpu_change) {
-      view.append(h("p", { class: "oc-changed" }, `Ustawienia karty zmieniły się ${when(ov.gpu_change.ts)}: ${(ov.gpu_change.changes || []).slice(0, 3).join(", ")}. Poproś agenta o nowy profil.`));
+      view.append(h("p", { class: "oc-changed" }, `Ustawienia karty zmieniły się ${when(ov.gpu_change.ts)}. Poproś agenta o nowy profil.`));
     }
     put(view,
       agentCard(card),

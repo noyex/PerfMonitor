@@ -72,6 +72,19 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(self.get("/api/banner?appid=2")[0].status, 404)
         self.assertEqual([c.args[0] for c in dl.call_args_list], ["730", "1", "2", "2"])   # hits and misses are remembered
 
+    def test_banner_is_read_from_the_steam_library_cache(self):
+        jpg = b"\xff\xd8" + b"y" * 5000
+        steam = Path(self.dir) / "Steam"
+        folder = steam / "appcache" / "librarycache" / "440" / "42dd64e5"
+        folder.mkdir(parents=True)
+        (folder / "library_header.jpg").write_bytes(jpg)
+        (folder.parent / "logo.jpg").write_bytes(jpg[:100])
+        with mock.patch.object(banners, "_steam_dirs", return_value=[str(steam)]), \
+                mock.patch.object(banners, "_download") as dl:
+            self.assertEqual(banners._local("440"), jpg)
+            self.assertIsNone(banners._local("441"))
+        dl.assert_not_called()
+
     def test_keep_alive_reuses_pooled_connection(self):
         c = http.client.HTTPConnection("127.0.0.1", self.port)
         self.get("/api/games", conn=c)

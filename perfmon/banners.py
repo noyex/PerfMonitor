@@ -37,10 +37,12 @@ def _jpeg(data):
 
 
 def _local(appid):
-    """header.jpg from the Steam client's library cache; its layout changed over the years."""
+    """The 460x215 header from the Steam client's library cache. Its layout changed over the years: today
+    <appid>/<hash>/library_header.jpg, before that <appid>/header.jpg and <appid>_header.jpg."""
     for root in _steam_dirs():
         cache = os.path.join(root, "appcache", "librarycache")
-        for pat in (f"{appid}_header.jpg", os.path.join(appid, "header.jpg"), os.path.join(appid, "*", "header.jpg")):
+        for pat in (os.path.join(appid, "*", "library_header.jpg"), os.path.join(appid, "library_header.jpg"),
+                    os.path.join(appid, "*", "header.jpg"), os.path.join(appid, "header.jpg"), f"{appid}_header.jpg"):
             for path in glob.glob(os.path.join(cache, pat)):
                 try:
                     with open(path, "rb") as f:

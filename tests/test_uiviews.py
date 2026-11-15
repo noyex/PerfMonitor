@@ -75,6 +75,18 @@ class GamesTest(unittest.TestCase):
         with mock.patch.object(uiviews.regression, "assess", side_effect=KeyError("stutters")):
             self.assertEqual(uiviews.games(con)[0]["status"], {"kind": "unknown"})
 
+    def test_fps_is_gameplay_only_and_a_start_and_quit_is_not_a_session(self):
+        con, now = new_db(), time.time()
+        sid = add(con, now - DAY)
+        summ = json.loads(con.execute("SELECT summary FROM sessions WHERE id=?", (sid,)).fetchone()[0])
+        summ["gameplay"].update(fps_avg=118.0, fps_1low=80.0)   # the whole session, menus included, stays at 140 / 95
+        con.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summ), sid))
+        add(con, now - 3600, fps=300.0, minutes=1)              # opened and closed: the menu's FPS
+        tile = uiviews.games(con)[0]
+        self.assertEqual((tile["sessions"], tile["last"]["id"]), (1, sid))
+        self.assertEqual((tile["last"]["fps"], tile["last"]["fps_1low"]), (118.0, 80.0))
+        self.assertEqual(uiviews.home(con)["recent"][0]["play"], {"fps": 118.0, "fps_1low": 80.0})
+
     def test_frame_generation_shows_the_games_own_frames(self):
         con, now = new_db(), time.time()
         sid = add(con, now - DAY)
@@ -149,10 +161,11 @@ class ProblemsTest(unittest.TestCase):
         rows = [(r["group"], r["severity"], r["count"], r["game"], r["app"]) for r in d["items"]]
         self.assertEqual(rows, [("crash", "serious", 1, "Counter-Strike 2", None),
                                 ("crash", "serious", 2, None, "Discord.exe"),   # named by the program, not the game
-                                ("reset", "critical", 1, "Counter-Strike 2", None),
                                 ("freeze", "warning", 1, "Counter-Strike 2", None),
+                                ("reset", "critical", 1, "Counter-Strike 2", None),
                                 ("gpu_driver", "critical", 2, "Counter-Strike 2", None)])
-        self.assertEqual(d["items"][3]["duration_s"], 4.0)
+        self.assertEqual(d["items"][2]["duration_s"], 4.0)
+        self.assertEqual(d["items"][3]["ts"], start + 3000)   # the reset: when the samples stopped, not the next boot
         self.assertEqual(d["agent"]["note"]["text"], "Reset wygląda na zasilanie")   # the note about the whole PC
 
 

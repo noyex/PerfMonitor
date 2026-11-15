@@ -43,7 +43,9 @@ Pages.games = (() => {
     if (v == null || v === "") return null;
     if (key === "resolution") return String(v).replace(/\s*x\s*/i, " × ");
     if (key === "upscaler") return [v, g.upscaler_mode].filter(Boolean).join(", ");
-    return v === true ? "włączony" : v === false || v === "off" ? "wyłączony" : v;
+    // games write switches in their own words
+    const word = String(v).toLowerCase();
+    return v === true || ["on", "enabled", "true"].includes(word) ? "włączony" : v === false || ["off", "disabled", "false"].includes(word) ? "wyłączony" : v;
   };
 
   const rate = (s) => {

@@ -18,7 +18,8 @@ Pages.overview = (() => {
   const hasFrames = (s) => !!s.frames || s.fps_live != null;
   // with frame generation the game's own frames are the number to judge; the presented ones go in the stat row
   const frameGen = (s) => s.frame_gen_pct > 0 && s.app_fps_avg != null;
-  const fpsOf = (s) => (s.running ? (frameGen(s) ? s.app_fps_live : null) ?? s.fps_live ?? s.fps_avg : frameGen(s) ? s.app_fps_avg : s.fps_avg);
+  // a finished session shows its gameplay FPS (s.play: menus and loading left out), the number "względem zwykle" compares
+  const fpsOf = (s) => (s.running ? (frameGen(s) ? s.app_fps_live : null) ?? s.fps_live ?? s.fps_avg : s.play.fps);
   const shownOf = (s) => (s.running ? s.fps_live ?? s.fps_avg : s.fps_avg);
   const count = (v) => String(v).replace(/\B(?=(\d{3})+$)/g, " ");
   const label = (s) => `${s.running ? "na żywo" : when(s.start_ts)}, ${fmtDur(s.duration_s)}`;
@@ -50,7 +51,7 @@ Pages.overview = (() => {
 
   const pair = (s) => [
     ...(frameGen(s) ? [stat(fmt(shownOf(s)), "wyświetlane")] : []),
-    stat(fmt(frameGen(s) ? s.app_fps_1low ?? s.fps_1low : s.fps_1low), "1% low"),
+    stat(fmt(s.running ? (frameGen(s) ? s.app_fps_1low ?? s.fps_1low : s.fps_1low) : s.play.fps_1low), "1% low"),
     stat(count(s.stutters || 0), "przycięcia", severity(s)),
     ...(s.vs_usual != null ? [stat(`${signed(s.vs_usual)} fps`, "względem zwykle")] : []),
   ];

@@ -9,6 +9,7 @@ from perfmon import db, episodes, notes, regression
 from perfmon.regression import game_key
 
 RECENT_S = 14 * 86400          # a crash or a version change older than this is no longer news
+MIN_PLAY_S = 120               # shorter finished sessions are a start and quit, not play: their FPS is the menu's
 SESSIONS = 6                   # sessions listed on a game's page
 TARGET_MAX = 1000
 _assessed = {}                 # (finished session id, end ts) -> regression verdict (the baseline is earlier sessions)
@@ -20,8 +21,17 @@ def title(exe, ctx):
     return re.sub("[®™]", "", name).strip() or re.sub(r"(?i)\.exe$", "", exe or "")
 
 
-def _fps(s):
-    """The game's own frames: with frame generation the presented FPS says little about how it plays."""
+def _fps(con, s, row):
+    """How the game itself ran: gameplay only (menus and loading left out) and the game's own frames (frame generation
+    left out), the numbers the comparison with earlier sessions uses. Falls back to the whole session.
+    row: the session's row with id, start_ts, end_ts, summary."""
+    if not s["running"]:
+        try:
+            m = regression.metrics(con, row)
+        except Exception:
+            m = None
+        if m and m["usable"] and m["fps_avg"] is not None:
+            return {"fps": m["fps_avg"], "fps_1low": m["fps_1low"]}
     fg = s.get("frame_gen_pct") and s.get("app_fps_avg") is not None
     return {"fps": s["app_fps_avg"] if fg else s.get("fps_avg"),
             "fps_1low": (s.get("app_fps_1low") if fg else None) or s.get("fps_1low")}
@@ -78,13 +88,16 @@ def _status(con, newest, last, test, now):
 
 
 def _played(con):
-    """Game sessions, newest first, flattened; launchers and short starts (no frames, clean exit) are left out."""
+    """Game sessions, newest first, flattened (`row`: the raw row). Left out: launchers (no frames, clean exit) and
+    a start and quit under MIN_PLAY_S; a crash or a cut-off session stays however short."""
     rows = an._rows(con, f"SELECT * FROM sessions WHERE {an.GAMES_ONLY} ORDER BY start_ts DESC, id DESC")
     ends = an._eff_ends(con, rows)
     out = []
     for r in rows:
         s = an._flatten_session(r, None, ends)
-        if s["frames"] or s["running"] or s["end_reason"] != "exit":
+        clean = s["end_reason"] == "exit"
+        if s["running"] or not clean or (s["frames"] and s["duration_s"] >= MIN_PLAY_S):
+            s["row"] = r
             out.append(s)
     return out
 
@@ -97,9 +110,10 @@ def _stutters(con, sessions):
         s["stutters"] = n.get(s["id"], 0)
 
 
-def _brief(s):
+def _brief(con, s):
     return {"id": s["id"], "start_ts": s["start_ts"], "duration_s": s["duration_s"], "running": s["running"],
-            "end_reason": s["end_reason"], "frames": bool(s["frames"]), "stutters": s.get("stutters", 0), **_fps(s)}
+            "end_reason": s["end_reason"], "frames": bool(s["frames"]), "stutters": s.get("stutters", 0),
+            **_fps(con, s, s["row"])}
 
 
 def _card(con, sessions, test, now):
@@ -108,7 +122,7 @@ def _card(con, sessions, test, now):
     ctx = next((s["context"] for s in sessions if (s["context"] or {}).get("steam")), None) or last["context"]
     return {"key": game_key(last["exe"]), "exe": last["exe"], "title": title(last["exe"], ctx),
             "appid": ((ctx or {}).get("steam") or {}).get("appid"), "sessions": len(sessions),
-            "running": sessions[0]["running"], "last": _brief(last),
+            "running": sessions[0]["running"], "last": _brief(con, last),
             "status": _status(con, sessions[0], last, test, now)}
 
 
@@ -165,10 +179,10 @@ def game(con, exe):
     a = _assess(con, last) if not last["running"] else {}
     target = db.get_meta(con, _target_key(exe))
     gs = next((g for g in (((s["context"] or {}).get("game_settings") or {}).get("normalized") for s in ss) if g), None)
-    return {**card, "last": _brief(last), "vs_usual": _vs_usual(a),
+    return {**card, "last": _brief(con, last), "vs_usual": _vs_usual(a),
             "baseline_sessions": len((a.get("baseline") or {}).get("sessions") or []),
             "target_fps": int(target) if target else None, "settings": gs, "versions": _versions(ss, now),
-            "recent": [_brief(s) for s in recent], "agent": notes.card(con, last["exe"])}
+            "recent": [_brief(con, s) for s in recent], "agent": notes.card(con, last["exe"])}
 
 
 def set_target(con, body):
@@ -192,9 +206,14 @@ def set_target(con, body):
 
 
 def home(con):
-    """GET /api/overview: analyze.overview plus how each finished session compares with the usual, and the agent card."""
+    """GET /api/overview: analyze.overview plus, per finished session, its gameplay FPS (`play`) and how that compares
+    with the usual, and the agent card."""
     o = an.overview(con)
-    for s in ([o["current"]] if o["current"] else []) + o["recent"]:
+    ss = ([o["current"]] if o["current"] else []) + o["recent"]
+    rows = {r["id"]: r for r in an._rows(con, f"SELECT id, start_ts, end_ts, summary FROM sessions WHERE id IN "
+                                              f"({','.join('?' * len(ss))})", [s["id"] for s in ss])} if ss else {}
+    for s in ss:
+        s["play"] = None if s["running"] else _fps(con, s, rows[s["id"]])
         s["vs_usual"] = None if s["running"] else _vs_usual(_assess(con, s))
     o["agent"] = notes.card(con)
     return o
@@ -222,22 +241,23 @@ PROBLEM_ROWS = 30
 
 
 def _game_at(con, ts, back, cache):
-    """(exe, title) of the game session the last sample before `ts` belonged to, None outside a game."""
-    r = con.execute("SELECT game_session FROM samples WHERE ts<=? AND ts>? ORDER BY ts DESC LIMIT 1",
+    """((exe, title) of the game session the last sample before `ts` belonged to, None outside a game; that sample's
+    ts, None when there is none within `back` seconds)."""
+    r = con.execute("SELECT game_session, ts FROM samples WHERE ts<=? AND ts>? ORDER BY ts DESC LIMIT 1",
                     (ts, ts - back)).fetchone()
-    sid = r[0] if r else None
-    if sid is None:
-        return None
-    if sid not in cache:
+    if not r:
+        return None, None
+    sid = r[0]
+    if sid is not None and sid not in cache:
         s = con.execute(f"SELECT exe, context FROM sessions WHERE id=? AND {an.GAMES_ONLY}", (sid,)).fetchone()
         cache[sid] = (s["exe"], title(s["exe"], an._json(s["context"]))) if s else None
-    return cache[sid]
+    return cache.get(sid), r[1]
 
 
 def problems(con, days=14):
     """GET /api/problems: what went wrong lately in plain words, newest first, repeats folded into one row.
 
-    Row: {group, severity, ts (latest), count, game (title, None outside a game), app (the crashed program when it
+    Row: {group, severity, ts (of the latest one), count, game (title, None outside a game), app (the crashed program when it
     is not a game; such a row has no game), duration_s (longest freeze)}. The window words the row from `group`."""
     t0 = time.time() - float(days) * 86400
     rows = an.incidents_between(con, t0, time.time() + 1, list(PROBLEMS), limit=100000, group=True)
@@ -251,7 +271,7 @@ def problems(con, days=14):
     cache, events, open_ = {}, [], {}
     for r in rows:   # oldest first
         group, sev, gap, back = PROBLEMS[r["kind"]]
-        at = _game_at(con, r["ts"], back, cache)
+        at, seen = _game_at(con, r["ts"], back, cache)
         app = None
         if group in ("crash", "hang"):
             app = r["title"].split(":", 1)[-1].strip()
@@ -261,8 +281,9 @@ def problems(con, days=14):
                 at = None   # another program: the row names it, whatever game was running
         e = open_.get((group, app))
         if e is None or r["ts"] - e["ts"] > gap:
-            e = open_[(group, app)] = {"group": group, "severity": sev, "ts": r["ts"], "at": at, "app": app,
-                                       "duration_s": None}
+            # a reset is logged at the next boot: it happened when the samples stopped
+            e = open_[(group, app)] = {"group": group, "severity": sev, "at": at, "app": app, "duration_s": None,
+                                       "when": seen if group in ("reset", "bsod") and seen else r["ts"]}
             events.append(e)
         e["ts"], e["at"] = r["ts"], e["at"] or at
         if episodes._SEV[sev] > episodes._SEV[e["severity"]]:
@@ -272,11 +293,11 @@ def problems(con, days=14):
     # 2. rows: the same thing happening again to the same game or program is one row with a count
     out = {}
     for e in events:
-        at = e.pop("at")
+        at, when = e.pop("at"), e.pop("when")
         row = out.setdefault((e["group"], game_key(at[0]) if at else None, e["app"]),
                              {**e, "count": 0, "game": at[1] if at else None})
         row["count"] += 1
-        row["ts"] = e["ts"]
+        row["ts"] = when
         if episodes._SEV[e["severity"]] > episodes._SEV[row["severity"]]:
             row["severity"] = e["severity"]
         if e["duration_s"]:
