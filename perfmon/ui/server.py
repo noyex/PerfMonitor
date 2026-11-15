@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression
+from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression, updater
 
 STATIC = Path(__file__).parent / "static"
 
@@ -167,7 +167,13 @@ def test_action(con, body):
     raise ValueError("nieznana akcja")
 
 
-POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action}   # the only write endpoints
+POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action,   # the only write endpoints
+         "/api/update": lambda con, body: updater.start_install()}
+NO_DB_ROUTES = {
+    "update": lambda q: updater.status(q.get("force") == "1"),   # GitHub
+    "agent": lambda q: {"guide": str(config.AGENT_GUIDE), "cli": str(config.cli_path())},   # "Zapytaj agenta" prompt
+}
+NO_DB = {"/api/update"}   # POSTs that never touch the database (work before the first sample, never wait on a lock)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -245,11 +251,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("oczekiwano obiektu JSON")
-            con = db.connect()
-            try:
-                res = handler(con, body)
-            finally:
-                con.close()
+            if u.path in NO_DB:
+                res = handler(None, body)
+            else:
+                con = db.connect()
+                try:
+                    res = handler(con, body)
+                finally:
+                    con.close()
             return self._send(200, json.dumps(res).encode(), "application/json")
         except ValueError as e:
             return self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"),
@@ -263,10 +272,13 @@ class Handler(BaseHTTPRequestHandler):
             if not _local_host(self.headers.get("Host", "")):   # DNS rebinding: only 127.0.0.1 / localhost
                 return self._send(403, b'{"error":"forbidden"}', "application/json")
             name = u.path[5:]
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if name in NO_DB_ROUTES:   # not the database: works before the first sample too
+                return self._send(200, json.dumps(NO_DB_ROUTES[name](q), ensure_ascii=False).encode("utf-8"),
+                                  "application/json; charset=utf-8")
             fn = ROUTES.get(name)
             if not fn:
                 return self._send(404, b'{"error":"not found"}', "application/json")
-            q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if not config.DB_PATH.exists():
                 return self._send(503, b'{"error":"no data yet"}', "application/json")
             con, ver = POOL.get()

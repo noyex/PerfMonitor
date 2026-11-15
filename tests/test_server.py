@@ -68,6 +68,14 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(r.status, 200, body)
         self.assertEqual(opened.call_count, 0)
 
+    def test_agent_paths_without_database(self):
+        with mock.patch.object(config, "DB_PATH", Path(self.dir) / "missing.db"):
+            r, body = self.get("/api/agent")
+        self.assertEqual(r.status, 200, body)
+        paths = json.loads(body)
+        self.assertEqual(Path(paths["guide"]), config.AGENT_GUIDE)
+        self.assertEqual(Path(paths["cli"]).name, "pm.cmd")   # source checkout; pm.exe in the installed build
+
     def test_static_etag_revalidation(self):
         r, body = self.get("/lib.js", **{"Accept-Encoding": "gzip"})
         self.assertEqual(r.getheader("Cache-Control"), "no-cache")

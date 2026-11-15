@@ -1,16 +1,33 @@
-"""Paths and settings. Overridable via data/config.json."""
+"""Paths and settings. Overridable via config.json in the data folder."""
 import json
 import os
+import sys
 from pathlib import Path
 
+FROZEN = bool(getattr(sys, "frozen", False))   # the installed build (PyInstaller); else a source checkout
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or ROOT / "data")   # env override: tests
+# The installed build keeps data outside its own folder, so an update (which replaces that folder) never touches it
+_DEFAULT_DATA = Path(os.environ.get("LOCALAPPDATA", ROOT)) / "NX Frame" if FROZEN else ROOT / "data"
+DATA_DIR = Path(os.environ.get("PERFMON_DATA_DIR") or _DEFAULT_DATA)   # env override: tests
 DB_PATH = DATA_DIR / "perf.db"
 GPU_PCT_MAX = 100.0   # GPU load of one process / engine above this is a PDH artifact (seen: 3e13 %), never real
 LOG_PATH = DATA_DIR / "collector.log"
 CONFIG_PATH = DATA_DIR / "config.json"
 
-_WINGET = Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"))
+def _program_files():
+    """Program Files from the registry, not from %ProgramFiles%: a user can override environment variables for all
+    their processes (HKCU\\Environment), the elevated collector included."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion") as key:
+        return winreg.QueryValueEx(key, "ProgramFilesDir")[0]
+
+
+# LibreHardwareMonitor and PresentMon from winget: per user for a source checkout. The installed build's collector
+# runs elevated from Program Files, so it takes them from the machine-wide folder only (the installer puts them
+# there), where nothing but an administrator can replace the code it loads; see CODE_PATHS
+_WINGET = (Path(_program_files()) / "WinGet" / "Packages" if FROZEN
+           else Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages")))
+CODE_PATHS = ("lhm_dir", "presentmon_exe")   # config.json (user-writable) cannot move these in the installed build
 
 DEFAULTS = {
     "sample_interval_s": 1.0,
@@ -103,12 +120,31 @@ DEFAULTS = {
 }
 
 
+AGENT_GUIDE = Path(__file__).resolve().parent / "agent" / "AGENT.md"   # what "Zapytaj agenta" points an AI agent at
+
+
+def cli_path() -> Path:
+    """The `pm` CLI as a user's AI agent should call it: pm.exe next to the installed build, else pm.cmd."""
+    return Path(sys.executable).with_name("pm.exe") if FROZEN else ROOT / "pm.cmd"
+
+
+def module_argv(module, *args, console=False):
+    """argv running `python -m module args`: the installed build's exe dispatches "-m" itself (perfmon/launcher.py).
+    console: python.exe rather than pythonw.exe in a source checkout (a child whose output is read)."""
+    exe = sys.executable
+    if console and not FROZEN and exe.lower().endswith("pythonw.exe") and os.path.exists(exe[:-5] + ".exe"):
+        exe = exe[:-5] + ".exe"
+    return [exe, "-m", module, *map(str, args)]
+
+
 def load() -> dict:
     cfg = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
             user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             for k, v in user.items():
+                if FROZEN and k in CODE_PATHS:
+                    continue
                 if k in ("game_exes", "not_game_exes", "game_path_markers") and isinstance(v, list):
                     cfg[k] = list(dict.fromkeys(cfg[k] + [x.lower() for x in v]))
                 elif k in ("stress_exes", "stress_path_markers") and isinstance(v, dict):

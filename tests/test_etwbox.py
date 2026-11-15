@@ -310,6 +310,23 @@ class RetentionTest(unittest.TestCase):
         etwbox.retention(self.con, {"retention_days": 14, "max_gb": 0}, self.now, self.dir)
         self.assertTrue(os.path.exists(p))
 
+    def test_installed_build_never_deletes_through_a_linked_folder(self):
+        real = tempfile.TemporaryDirectory()
+        self.addCleanup(real.cleanup)
+        old = os.path.join(real.name, "old.etl")
+        touch(old, 1, self.now - 2 * 3600)
+        link = os.path.join(self.dir, "traces")
+        try:
+            os.symlink(real.name, link, target_is_directory=True)
+        except OSError:
+            self.skipTest("no privilege to create a symlink")
+        s = {"retention_days": 14, "max_gb": 2}
+        with mock.patch.object(etwbox.config, "FROZEN", True):
+            self.assertEqual(etwbox.retention(self.con, s, self.now, link), 0)
+        self.assertTrue(os.path.exists(old))
+        self.assertEqual(etwbox.retention(self.con, s, self.now, link), 1)   # a source checkout: the user's link
+        self.assertFalse(os.path.exists(old))
+
     def test_unanalysed_capture_without_file_fails_with_reason(self):
         cid = self.capture("gone.etl", 20, 1)
         etwbox.retention(self.con, {"retention_days": 14, "max_gb": 2}, self.now, self.dir)

@@ -1,5 +1,7 @@
-//! NX Frame window: serves the static UI (from the checkout on disk) and talks to the Python API over HTTP.
+//! NX Frame window: serves the static UI and talks to the Python API over HTTP.
 //! The collector, analytics and CLI stay in Python; this crate only owns the window and its API server process.
+//! Python is the venv of a source checkout (the UI is then read from the checkout on disk), or `nxframe-core.exe`
+//! next to this exe in the installed build (the UI embedded at build time).
 
 use std::borrow::Cow;
 use std::net::TcpListener;
@@ -111,16 +113,47 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Starts `<root>\.venv\Scripts\pythonw.exe -m perfmon.ui.server <port>` hidden, when the venv exists.
-fn spawn_server(root: &Path, port: u16, token: &str) -> Option<SpawnedServer> {
-    let python = root.join(".venv").join("Scripts").join("pythonw.exe");
-    if !python.is_file() {
-        return None;
+/// The Python side of this window.
+enum Backend {
+    /// A source checkout: `<root>\.venv\Scripts\pythonw.exe`.
+    Checkout(PathBuf),
+    /// The installed build: `nxframe-core.exe` (PyInstaller) next to this exe.
+    Installed(PathBuf),
+}
+
+impl Backend {
+    fn find() -> Option<Self> {
+        let core = std::env::current_exe()
+            .ok()
+            .map(|exe| exe.with_file_name("nxframe-core.exe"))
+            .filter(|core| core.is_file());
+        core.map(Self::Installed)
+            .or_else(|| find_root().map(Self::Checkout))
     }
-    let mut cmd = Command::new(python);
-    cmd.args(["-m", "perfmon.ui.server", &port.to_string()])
-        .env("PERFMON_UI_TOKEN", token)
-        .current_dir(root)
+
+    /// `<python> -m perfmon.ui.server <port>`, when that Python exists.
+    fn server(&self, port: u16) -> Option<Command> {
+        let (python, dir) = match self {
+            Self::Checkout(root) => (
+                root.join(".venv").join("Scripts").join("pythonw.exe"),
+                root.as_path(),
+            ),
+            Self::Installed(core) => (core.clone(), core.parent()?),
+        };
+        if !python.is_file() {
+            return None;
+        }
+        let mut cmd = Command::new(python);
+        cmd.args(["-m", "perfmon.ui.server", &port.to_string()])
+            .current_dir(dir);
+        Some(cmd)
+    }
+}
+
+/// Starts the API server hidden, when the backend's Python exists.
+fn spawn_server(backend: &Backend, port: u16, token: &str) -> Option<SpawnedServer> {
+    let mut cmd = backend.server(port)?;
+    cmd.env("PERFMON_UI_TOKEN", token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -157,12 +190,14 @@ mod job {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     /// A job object that kills every process in it when the last handle closes, also when this process is killed.
+    /// A process may leave it when its parent asks for that (CREATE_BREAKAWAY_FROM_JOB): the updater starts the
+    /// installer that way, because the installer closes this window and must outlive it (perfmon/updater.py).
     pub struct Job(HANDLE);
 
     // SAFETY: a job handle is only closed in Drop; the kernel serialises everything else.
@@ -178,7 +213,8 @@ mod job {
                 }
                 let job = Job(handle);
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                info.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
                 let set = SetInformationJobObject(
                     handle,
                     JobObjectExtendedLimitInformation,
@@ -231,14 +267,17 @@ mod job {
 }
 
 pub fn run() {
-    let root = find_root();
+    let backend = Backend::find();
     let server: Arc<Mutex<Option<SpawnedServer>>> = Arc::default();
     let spawned = server.clone();
 
-    // The copy embedded at build time is only the fallback for an exe without a checkout around it.
+    // A checkout serves its own files; the copy embedded at build time is for the installed build, and the
+    // fallback for an exe with nothing around it.
     let mut context = tauri::generate_context!();
-    if let Some(assets) = root.as_deref().and_then(DiskAssets::new) {
-        context.set_assets(Box::new(assets));
+    if let Some(Backend::Checkout(root)) = &backend {
+        if let Some(assets) = DiskAssets::new(root) {
+            context.set_assets(Box::new(assets));
+        }
     }
 
     tauri::Builder::default()
@@ -268,9 +307,9 @@ pub fn run() {
                 ))
                 .build()?;
 
-            if let Some(root) = root {
+            if let Some(backend) = backend {
                 std::thread::spawn(move || {
-                    let server = spawn_server(&root, port, &token);
+                    let server = spawn_server(&backend, port, &token);
                     if let Ok(mut slot) = spawned.lock() {
                         *slot = server;
                     }

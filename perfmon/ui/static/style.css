@@ -81,6 +81,8 @@ main[data-page="overview"] { padding-top: 0; }
 .temps .warn b { color: var(--warning); }
 .status.bad { color: var(--critical); }
 .status.warn { color: var(--warning); }
+.update { border: 0; margin: -8px 0; padding: 8px 14px 7px; border-radius: 11px; cursor: pointer; color: #000; background: var(--glass-on); }
+.update:disabled { cursor: default; color: #d6d6dc; background: var(--glass); box-shadow: var(--rim-thin); }
 
 h1 { font-family: var(--font-display); font-size: clamp(40px, 4.4vw, 64px); font-weight: 500; line-height: 1; margin: 0; letter-spacing: -.03em; }
 h2 { font-family: var(--font-display); font-size: 21px; font-weight: 500; color: var(--ink); margin: 36px 0 14px; letter-spacing: -.01em; }

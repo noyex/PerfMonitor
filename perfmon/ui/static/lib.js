@@ -112,9 +112,15 @@ const toast = (msg) => {
   toast._t = setTimeout(() => t.classList.remove("show"), 1800);
 };
 
-// Copies a ready-made prompt for the T3 agent (perf-analyst skill).
+// Copies a ready-made prompt for any AI agent with a terminal: it names the bundled guide and the pm CLI by full path,
+// so nothing has to be installed on the agent's side.
 const askAgent = async (text) => {
-  const prompt = `Użyj skilla perf-analyst. ${text}`;
+  let intro = "";
+  try {
+    const a = await api("agent");
+    intro = `Przeczytaj instrukcję ${a.guide} i używaj CLI NX Frame: & "${a.cli}" <komenda>. `;
+  } catch {}
+  const prompt = `${intro}${text}`;
   try {
     await navigator.clipboard.writeText(prompt);
   } catch {
@@ -124,7 +130,7 @@ const askAgent = async (text) => {
     document.execCommand("copy");
     ta.remove();
   }
-  toast("Skopiowano – wklej w T3");
+  toast("Skopiowano – wklej agentowi AI");
 };
 
 const segmented = (options, value, onChange) => {

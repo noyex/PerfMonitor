@@ -3,6 +3,8 @@ data/
 scratch/
 __pycache__/
 *.pyc
+build/
+dist/
 src-tauri/target/
 src-tauri/gen/
 /PerfMonitor.exe
