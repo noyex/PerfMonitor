@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from perfmon import cli, notes
 from tests.test_bottleneck import new_db
@@ -6,6 +7,9 @@ from tests.test_uiviews import add
 
 
 class NotesTest(unittest.TestCase):
+    def setUp(self):
+        notes._tests.clear()
+
     def test_latest_by_scope(self):
         con = new_db()
         notes.add(con, "Zasilacz do sprawdzenia", now=100)
@@ -45,6 +49,9 @@ class NotesTest(unittest.TestCase):
         self.assertEqual(notes.card(con, "cod.exe")["test"]["id"], test["id"])
         self.assertIsNone(notes.card(con, "cs2.exe")["test"])
         self.assertIsNone(notes.card(con, general=True)["test"])
+        with mock.patch.object(notes.experiments, "evaluate") as evaluate:   # polled every 2 s: kept for a while
+            self.assertEqual(notes.open_test(con), test)
+        evaluate.assert_not_called()
 
     def test_cli_parses_note_commands(self):
         a = cli.build().parse_args(["note", "add", "Przycięcia", "robi", "X", "--exe", "cod.exe"])

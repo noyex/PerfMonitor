@@ -1,6 +1,7 @@
 import json
 import time
 import unittest
+from unittest import mock
 
 from perfmon import notes, uiviews
 from tests.test_bottleneck import new_db
@@ -28,6 +29,7 @@ def history(con, now, n=5, **kw):
 class GamesTest(unittest.TestCase):
     def setUp(self):
         uiviews._assessed.clear()
+        notes._tests.clear()
 
     def test_tiles_last_played_first_with_status(self):
         con, now = new_db(), time.time()
@@ -52,6 +54,26 @@ class GamesTest(unittest.TestCase):
         con.execute("INSERT INTO experiments(name, exe, start_ts, status) VALUES ('limit 141', 'cs2.exe', ?, 'open')", (now,))
         self.assertEqual(uiviews.games(con)[0]["status"], {"kind": "test"})
         self.assertEqual(uiviews.games(con)[0]["last"]["id"], crashed)
+
+    def test_crash_before_the_first_frame_shows_on_the_tile(self):
+        con, now = new_db(), time.time()
+        history(con, now)
+        good = add(con, now - DAY)
+        add(con, now - 3600, reason="crash", frames=False)
+        tile = uiviews.games(con)[0]
+        self.assertEqual((tile["last"]["id"], tile["status"]["kind"]), (good, "crash"))
+        con.execute("INSERT INTO stutters(ts, session, ft_ms, median_ms, causes) VALUES (?,?,40,7,'[]')", (now - DAY + 5, good))
+        for i in range(uiviews.SESSIONS):   # the tile's session drops out of the listed ones
+            add(con, now - 3000 + i * 60, minutes=0, reason="unknown", frames=False)
+        g = uiviews.game(con, "cs2.exe")
+        self.assertNotIn(good, [s["id"] for s in g["recent"]])
+        self.assertEqual(g["last"]["stutters"], 1)
+
+    def test_a_session_that_cannot_be_judged_does_not_break_the_tiles(self):
+        con, now = new_db(), time.time()
+        add(con, now - DAY)
+        with mock.patch.object(uiviews.regression, "assess", side_effect=KeyError("stutters")):
+            self.assertEqual(uiviews.games(con)[0]["status"], {"kind": "unknown"})
 
     def test_frame_generation_shows_the_games_own_frames(self):
         con, now = new_db(), time.time()
@@ -84,7 +106,9 @@ class GamesTest(unittest.TestCase):
         add(con, now - DAY, exe="sp26-cod.exe", ctx={})
         self.assertEqual(uiviews.set_target(con, {"exe": "cod.exe", "fps": "120"}), {"target_fps": 120})
         self.assertEqual(uiviews.game(con, "sp26-cod.exe")["target_fps"], 120)
-        uiviews.set_target(con, {"exe": "cod.exe", "fps": None})
+        for clear in (None, "0", ""):
+            uiviews.set_target(con, {"exe": "cod.exe", "fps": 90})
+            self.assertEqual(uiviews.set_target(con, {"exe": "cod.exe", "fps": clear}), {"target_fps": None})
         self.assertIsNone(uiviews.game(con, "cod.exe")["target_fps"])
         for body in ({"fps": 60}, {"exe": "cod.exe", "fps": 5000}, {"exe": "cod.exe", "fps": "abc"}):
             with self.assertRaises(ValueError):
@@ -107,12 +131,15 @@ class ProblemsTest(unittest.TestCase):
         sid = add(con, now - 3 * DAY, minutes=60)
         start = now - 3 * DAY
         con.executemany("INSERT INTO samples(ts, game_session) VALUES (?,?)",
-                        [(start + 100, sid), (start + 1500, sid), (start + 3000, sid), (now - DAY, None)])
+                        [(start + 100, sid), (start + 1500, sid), (start + 3000, sid),
+                         (start + 3 * 3600 + 30, None),   # first sample after the reboot, between the two log entries
+                         (now - DAY, sid), (now - DAY + 10, None)])
         inc = [(start + 101, None, "gpu_driver", "Display 4101"), (start + 1501, None, "gpu_driver", "Display 4101"),
                (start + 3001, start + 3005, "ui_freeze", "UI"), (start + 3001, start + 3004, "dwm_stall", "DWM"),
                (start + 3 * 3600, None, "unclean_shutdown", "Kernel-Power 41"),      # logged at the next boot
                (start + 3 * 3600 + 60, None, "unclean_shutdown", "EventLog 6008"),   # the same reset
-               (now - DAY + 5, None, "app_crash", "Crash aplikacji: Discord.exe"),
+               (now - DAY + 5, None, "app_crash", "Crash aplikacji: Discord.exe"),   # during the game
+               (now - DAY + 3600, None, "app_crash", "Crash aplikacji: Discord.exe"),   # again, outside it
                (now - 3600, None, "app_crash", "Crash aplikacji: cs2.exe"),          # after its session closed
                (now - 1800, None, "vram_full", "VRAM")]                              # not a stability problem
         con.executemany("INSERT INTO incidents(ts, end_ts, kind, severity, title) VALUES (?,?,?,'warning',?)", inc)
@@ -120,7 +147,8 @@ class ProblemsTest(unittest.TestCase):
         notes.add(con, "o grze", "cs2.exe")
         d = uiviews.problems(con, 14)
         rows = [(r["group"], r["severity"], r["count"], r["game"], r["app"]) for r in d["items"]]
-        self.assertEqual(rows, [("crash", "serious", 1, "Counter-Strike 2", None), ("crash", "serious", 1, None, "Discord.exe"),
+        self.assertEqual(rows, [("crash", "serious", 1, "Counter-Strike 2", None),
+                                ("crash", "serious", 2, None, "Discord.exe"),   # named by the program, not the game
                                 ("reset", "critical", 1, "Counter-Strike 2", None),
                                 ("freeze", "warning", 1, "Counter-Strike 2", None),
                                 ("gpu_driver", "critical", 2, "Counter-Strike 2", None)])

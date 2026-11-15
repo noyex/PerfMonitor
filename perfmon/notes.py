@@ -9,6 +9,8 @@ from perfmon.regression import game_key
 
 MAX_LEN = 400     # a card, not a report
 KEEP = 200
+TEST_TTL_S = 30   # the home screen polls every 2 s during a game; the test's progress moves once per session
+_tests = {}       # (test id, start ts) -> (computed at, open_test result)
 
 
 def _row(r):
@@ -56,9 +58,16 @@ def open_test(con, exe=None):
     o = experiments._open(con)
     if not o or (exe is not None and game_key(o["exe"]) != game_key(exe)):
         return None
+    key, now = (o["id"], o["start_ts"]), time.time()
+    hit = _tests.get(key)
+    if hit and now - hit[0] < TEST_TTL_S:
+        return hit[1]
     r = experiments.evaluate(con, o)
-    return {"id": r["id"], "name": r["name"], "exe": r["exe"], "sessions": r["after"].get("sessions") or 0,
-            "need": experiments.MIN_SESSIONS, "missing": r["missing"], "verdict": r["verdict"]}
+    res = {"id": r["id"], "name": r["name"], "exe": r["exe"], "sessions": r["after"].get("sessions") or 0,
+           "need": experiments.MIN_SESSIONS, "missing": r["missing"], "verdict": r["verdict"]}
+    _tests.clear()
+    _tests[key] = (now, res)
+    return res
 
 
 def card(con, exe=None, general=False):

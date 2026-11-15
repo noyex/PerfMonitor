@@ -20,7 +20,7 @@ Pages.problems = (() => {
     h("div", { class: "row problem" },
       h("span", { class: `sev ${r.severity}` }),
       h("span", { class: "title" }, TITLE[r.group](r),
-        h("small", {}, [r.game || r.app || "poza grą", r.count > 1 ? `${r.count} razy` : null].filter(Boolean).join(", "))),
+        h("small", {}, [r.app || r.game || "poza grą", r.count > 1 ? `${r.count} razy` : null].filter(Boolean).join(", "))),
       h("span", { class: "aside" }, when(r.ts)));
 
   const render = async (view) => {

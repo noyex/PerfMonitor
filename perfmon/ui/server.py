@@ -102,7 +102,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body: bytes, ctype, cache="no-store", etag=None, gz=None):
         """gz: pre-compressed body to send instead when the client accepts gzip."""
-        if gz is None and len(body) >= GZIP_MIN and self._gzip_ok():
+        if gz is None and len(body) >= GZIP_MIN and not ctype.startswith("image/") and self._gzip_ok():
             gz = gzip.compress(body, 5)
         use_gz = gz is not None and self._gzip_ok()
         if use_gz:

@@ -58,8 +58,8 @@ def _download(appid):
         req = urllib.request.Request(CDN.format(appid=appid), headers={"User-Agent": "NXFrame"})
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
             return _jpeg(r.read(2_000_000)) or b""
-    except urllib.error.HTTPError:
-        return b""
+    except urllib.error.HTTPError as e:
+        return b"" if e.code == 404 else None   # 429 / 5xx say nothing about the banner
     except (OSError, ValueError):
         return None
 
