@@ -3,3 +3,7 @@ data/
 scratch/
 __pycache__/
 *.pyc
+src-tauri/target/
+src-tauri/gen/
+/PerfMonitor.exe
+/NXFrame.exe

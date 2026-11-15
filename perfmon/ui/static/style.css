@@ -31,11 +31,14 @@
   --glass-on: linear-gradient(170deg, #fff, #d9dae4);
   --rim: inset 0 1.5px 0 rgba(255, 255, 255, .55), inset 0 -1.5px 0 rgba(255, 255, 255, .16), inset 1px 0 0 rgba(255, 255, 255, .12), inset -1px 0 0 rgba(255, 255, 255, .12), inset 0 -14px 24px -14px rgba(255, 255, 255, .14), 0 24px 50px rgba(0, 0, 0, .55);
   --rim-thin: inset 0 1px 0 rgba(255, 255, 255, .34), inset 0 -1px 0 rgba(255, 255, 255, .1), inset 1px 0 0 rgba(255, 255, 255, .08), inset -1px 0 0 rgba(255, 255, 255, .08);
-  font-family: Nohemi, system-ui, sans-serif;
+  /* Nohemi is a display face: it renders badly at body sizes on Windows, so it stays on text of ~19 px and larger. */
+  --font-display: Nohemi, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-text: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-text);
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; background: var(--page); color: var(--ink); font-size: 14px; line-height: 1.45; letter-spacing: .192px; }
+html, body { margin: 0; background: var(--page); color: var(--ink); font-size: 14px; line-height: 1.45; }
 a, button, select { color: inherit; font: inherit; letter-spacing: inherit; }
 a { text-decoration: none; }
 :focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
@@ -62,7 +65,7 @@ a { text-decoration: none; }
 .shell { position: relative; min-height: 100vh; display: flex; flex-direction: column; padding: 30px 34px 0; }
 /* Scrolled content must not show in the gap under the dock. */
 .shell::after { content: ""; position: sticky; bottom: 0; z-index: 9; flex: none; height: 26px; margin: 0 -34px; background: var(--page); }
-.brand { position: absolute; top: 30px; left: 34px; z-index: 1; font-weight: 600; font-size: 19px; line-height: normal; }
+.brand { position: absolute; top: 30px; left: 34px; z-index: 1; font-family: var(--font-display); font-weight: 600; font-size: 19px; line-height: normal; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; padding-top: 68px; }
 main[data-page="overview"] { padding-top: 0; }
 .dock {
@@ -74,13 +77,13 @@ main[data-page="overview"] { padding-top: 0; }
 .dock nav a:hover { background: rgba(255, 255, 255, .08); }
 .dock nav a.on { color: #fff; background: linear-gradient(170deg, rgba(255, 255, 255, .26), rgba(255, 255, 255, .09)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5); }
 .temps { padding-right: 14px; font-size: 14.5px; color: #d6d6dc; display: flex; gap: 16px; }
-.temps b { color: #fff; font-weight: 500; }
+.temps b { color: #fff; font-weight: 600; }
 .temps .warn b { color: var(--warning); }
 .status.bad { color: var(--critical); }
 .status.warn { color: var(--warning); }
 
-h1 { font-size: clamp(40px, 4.4vw, 64px); font-weight: 500; line-height: 1; margin: 0; letter-spacing: -.03em; }
-h2 { font-size: 21px; font-weight: 500; color: var(--ink); margin: 36px 0 14px; letter-spacing: -.01em; }
+h1 { font-family: var(--font-display); font-size: clamp(40px, 4.4vw, 64px); font-weight: 500; line-height: 1; margin: 0; letter-spacing: -.03em; }
+h2 { font-family: var(--font-display); font-size: 21px; font-weight: 500; color: var(--ink); margin: 36px 0 14px; letter-spacing: -.01em; }
 .page-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 28px; }
 .page-head .spacer { flex: 1; }
 .sub { color: var(--ink-2); font-size: 15px; }
@@ -102,8 +105,8 @@ select.btn option { background: #000; color: #fff; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 .tile { padding: 18px 20px; }
 .tile .label { color: var(--label); font-size: 14px; }
-.tile .value { font-size: 32px; font-weight: 500; margin-top: 4px; letter-spacing: -.02em; line-height: 1.15; }
-.tile .value small { font-size: 15px; font-weight: 400; color: var(--ink-2); margin-left: 4px; letter-spacing: 0; }
+.tile .value { font-family: var(--font-display); font-size: 32px; font-weight: 500; margin-top: 4px; letter-spacing: -.02em; line-height: 1.15; }
+.tile .value small { font-family: var(--font-text); font-size: 15px; font-weight: 400; color: var(--ink-2); margin-left: 4px; letter-spacing: 0; }
 .tile .meta { color: var(--ink-2); font-size: 13px; margin-top: 4px; min-height: 16px; }
 
 /* ---------- charts ---------- */
@@ -111,7 +114,7 @@ select.btn option { background: #000; color: #fff; }
 .charts.two { grid-template-columns: 1fr 1fr; }
 .chart { padding: 16px 20px 8px; min-width: 0; }
 .chart-head { display: flex; align-items: baseline; gap: 12px; min-height: 18px; margin-bottom: 6px; }
-.chart-title { font-size: 15px; font-weight: 500; }
+.chart-title { font-size: 15px; font-weight: 600; }
 .chart-read { margin-left: auto; display: flex; gap: 14px; font-size: 13px; color: var(--ink-2); }
 .chart-read .k { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
 .chart-read .sw { width: 10px; height: 2px; border-radius: 1px; }
@@ -167,3 +170,19 @@ tbody tr:hover { background: var(--surface-2); }
   .dock nav { overflow-x: auto; }
   .temps { padding: 0 8px 6px; flex-wrap: wrap; }
 }
+
+/* ---------- desktop shell (src-tauri): frameless window, see titlebar.js ---------- */
+/* The title bar is a 32 px row above the page, and the page scrolls inside .shell below it: nothing slides under the
+   drag strip or the window controls, and no viewport scrollbar pushes the controls off the window edge. */
+.titlebar { display: none; }
+.tauri, .tauri body { height: 100%; overflow: hidden; }
+.tauri .titlebar { position: relative; z-index: 30; display: flex; justify-content: flex-end; height: 32px; }
+.wc { width: 46px; height: 32px; padding: 0; border: 0; background: none; color: #d6d6dc; display: grid; place-items: center; cursor: default; transition: background-color .15s ease-out; }
+.wc:hover { background: rgba(255, 255, 255, .08); }
+.wc.close:hover { background: #c42b1c; color: #fff; }
+.wc:focus-visible { outline-offset: -3px; }
+.wc svg { display: block; }
+/* The row takes 32 px of the 34 px between the window top and the brand: brand and content stay where they were. */
+.tauri .shell { height: calc(100vh - 32px); min-height: 0; overflow-y: auto; padding-top: 2px; scrollbar-width: thin; scrollbar-color: #3a3a40 transparent; }
+.tauri .brand { top: 2px; }
+.tauri .oc-panel { top: 44px; }
