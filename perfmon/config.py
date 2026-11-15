@@ -14,11 +14,19 @@ GPU_PCT_MAX = 100.0   # GPU load of one process / engine above this is a PDH art
 LOG_PATH = DATA_DIR / "collector.log"
 CONFIG_PATH = DATA_DIR / "config.json"
 
+def _program_files():
+    """Program Files from the registry, not from %ProgramFiles%: a user can override environment variables for all
+    their processes (HKCU\\Environment), the elevated collector included."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion") as key:
+        return winreg.QueryValueEx(key, "ProgramFilesDir")[0]
+
+
 # LibreHardwareMonitor and PresentMon from winget: per user for a source checkout. The installed build's collector
 # runs elevated from Program Files, so it takes them from the machine-wide folder only (the installer puts them
 # there), where nothing but an administrator can replace the code it loads; see CODE_PATHS
-_WINGET = Path(os.path.expandvars(r"%ProgramFiles%\WinGet\Packages" if FROZEN
-                                  else r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"))
+_WINGET = (Path(_program_files()) / "WinGet" / "Packages" if FROZEN
+           else Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages")))
 CODE_PATHS = ("lhm_dir", "presentmon_exe")   # config.json (user-writable) cannot move these in the installed build
 
 DEFAULTS = {

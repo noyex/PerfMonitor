@@ -228,6 +228,8 @@ class EtwBox:
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
         t0 = time.time()
         try:
+            if _redirected(TRACES):
+                raise OSError("folder zrzutów jest dowiązaniem")
             # below normal: the merge and rundown compete with the game for CPU
             rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300, flags=BELOW_NORMAL_PRIORITY_CLASS)
         except (OSError, subprocess.TimeoutExpired) as e:   # still recorded as a failed capture, with the reason
@@ -246,6 +248,12 @@ class EtwBox:
             self._start()
 
 
+def _redirected(folder):
+    """The installed build's collector runs elevated in a data folder its user owns: a link planted as the traces
+    folder (or as the data folder) would make it delete or write somewhere else with administrator rights."""
+    return config.FROZEN and any(p.is_symlink() or p.is_junction() for p in (folder, folder.parent))
+
+
 def retention(con, s, now=None, folder=None):
     """Keep the whole traces folder under max_gb, not just the files etw_captures points at:
     - intermediate .csv files (left by a crashed or old-style analysis) are always deleted,
@@ -256,7 +264,7 @@ def retention(con, s, now=None, folder=None):
     Returns the number of deleted files."""
     now = now or time.time()
     folder = Path(folder or TRACES)
-    if not folder.is_dir():
+    if not folder.is_dir() or _redirected(folder):
         return 0
     rows = con.execute("SELECT id, ts, path, status FROM etw_captures WHERE path IS NOT NULL").fetchall()
     # only files inside this folder: a DB copy run with another data dir still points at the live traces
