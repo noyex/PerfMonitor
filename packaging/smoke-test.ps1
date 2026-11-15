@@ -59,7 +59,10 @@ else { Write-Host "::warning::the installed collector did not keep running here 
 Stop-Process -Id $collector.Id -Force -ErrorAction SilentlyContinue
 $collectorLog = Join-Path $env:PERFMON_DATA_DIR 'collector.log'
 if (Test-Path $collectorLog) { Get-Content $collectorLog -Tail 25 }
+# The window the installer opened after the silent install, and the API server it started (informational: it needs a
+# desktop and WebView2)
 Get-Process NXFrame, nxframe-core -ErrorAction SilentlyContinue | Format-Table Name, Id, Path -AutoSize | Out-String | Write-Host
+if (-not (Get-Process NXFrame -ErrorAction SilentlyContinue)) { Write-Host '::warning::the window was not running after the silent install' }
 
 $code = Run (Join-Path $app 'unins000.exe') '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
 foreach ($i in 1..60) { if (-not (Test-Path (Join-Path $app 'NXFrame.exe'))) { break }; Start-Sleep 1 }

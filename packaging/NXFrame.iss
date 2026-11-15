@@ -71,9 +71,11 @@ Name: "{autodesktop}\NX Frame"; Filename: "{app}\NXFrame.exe"; Tasks: desktopico
 Filename: "{cmd}"; Parameters: "/c winget install --exact --id LibreHardwareMonitor.LibreHardwareMonitor --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden
 Filename: "{cmd}"; Parameters: "/c winget install --exact --id Intel.PresentMon.Console --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"; StatusMsg: "{cm:Winget}"; Tasks: sensors; Flags: runhidden
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\collector-task.ps1"" -AppDir ""{app}"""; StatusMsg: "{cm:Collector}"; Flags: runhidden
-; after an update (silent) the window comes back on its own; after a wizard install it is a checkbox
-Filename: "{app}\NXFrame.exe"; Description: "{cm:Launch}"; Flags: nowait postinstall runasoriginaluser skipifsilent
-Filename: "{app}\NXFrame.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent
+; After an update (silent) the window comes back on its own; after a wizard install it is a checkbox. Through the
+; shell: the updater starts Setup already elevated, where runasoriginaluser has no original user to go back to, and
+; the window must never run elevated
+Filename: "{win}\explorer.exe"; Parameters: """{app}\NXFrame.exe"""; Description: "{cm:Launch}"; Flags: nowait postinstall skipifsilent
+Filename: "{win}\explorer.exe"; Parameters: """{app}\NXFrame.exe"""; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\collector-task.ps1"" -AppDir ""{app}"" -Remove"; Flags: runhidden; RunOnceId: "RemoveTask"
