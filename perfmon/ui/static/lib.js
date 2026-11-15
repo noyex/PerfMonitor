@@ -118,7 +118,7 @@ const askAgent = async (text) => {
   let intro = "";
   try {
     const a = await api("agent");
-    intro = `Przeczytaj instrukcję ${a.guide} i używaj CLI PerfMonitor: & "${a.cli}" <komenda>. `;
+    intro = `Przeczytaj instrukcję ${a.guide} i używaj CLI NX Frame: & "${a.cli}" <komenda>. `;
   } catch {}
   const prompt = `${intro}${text}`;
   try {

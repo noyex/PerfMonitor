@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping. PerfMonitor is maintained by [@noyex](https://github.com/noyex), who reviews and merges every
+Thanks for helping. NX Frame is maintained by [@noyex](https://github.com/noyex), who reviews and merges every
 pull request. Nobody else merges into `main`.
 
 ## Before you start
@@ -36,4 +36,4 @@ pull request. Nobody else merges into `main`.
 ## Reporting bugs
 
 Open an issue with the Windows version, CPU/GPU, what happened and when, and the output of `pm status`. Attach
-`collector.log` (from `%LOCALAPPDATA%\PerfMonitor`) only after checking it contains nothing you don't want to share.
+`collector.log` (from `%LOCALAPPDATA%\NX Frame`) only after checking it contains nothing you don't want to share.

@@ -1,14 +1,14 @@
-# PerfMonitor: guide for AI agents
+# NX Frame: guide for AI agents
 
-PerfMonitor is a Windows gaming-PC monitor: a background collector stores samples, game sessions, incidents and event-log data in a local SQLite database. This guide tells an AI agent with a terminal how to query it and analyze lags, stutters, freezes, resets and crashes.
+NX Frame is a Windows gaming-PC monitor: a background collector stores samples, game sessions, incidents and event-log data in a local SQLite database. This guide tells an AI agent with a terminal how to query it and analyze lags, stutters, freezes, resets and crashes.
 The CLI path is given in the user's prompt. Wherever this guide says `pm <command>`, run that executable (PowerShell: `& "<path>\pm.exe" <command>`; in a source checkout it is `pm.cmd` in the repo root). It works from any cwd.
 
 Rules: answer in the user's language (the app UI is Polish, so default to Polish); code and commands stay as-is. Base every claim on data: cite exact timestamps and numbers. NEVER change system settings (BIOS, drivers, registry, services, uninstalls) without asking first - propose, then wait.
 
 ## Data
-- The collector writes 1 s samples, game sessions (PresentMon frames/stutters), network quality, top processes, Windows event log, detected incidents and config snapshots to a SQLite database (UTC epoch seconds; the CLI prints local time). The CLI finds the database itself; `pm status` shows its location. Installed builds keep data in `%LOCALAPPDATA%\PerfMonitor`.
+- The collector writes 1 s samples, game sessions (PresentMon frames/stutters), network quality, top processes, Windows event log, detected incidents and config snapshots to a SQLite database (UTC epoch seconds; the CLI prints local time). The CLI finds the database itself; `pm status` shows its location. Installed builds keep data in `%LOCALAPPDATA%\NX Frame`.
 - Add `--json` for JSON. Time args: `2026-01-15 23:30`, `23:30` (today), `2h` / `30m` / `7d` (that long ago - write WITHOUT a leading minus), `now`.
-- The user can browse the same data in the PerfMonitor window: charts, sessions, incidents, "Co zrobić" (advice).
+- The user can browse the same data in the NX Frame window: charts, sessions, incidents, "Co zrobić" (advice).
 - `game_proc` (every ~5 s per game session): rss_mb, private_mb, thread_max_pct (busiest game thread, % of one core), threads, handles, io_read_mbs, gpu_pct, gpu_3d_pct, vram_dedicated_mb, vram_shared_mb, shader_bytes (shader cache size, where readable).
 - `proc_events`: ts, pid, name, ppid, parent_name, action start|stop, session, path.
 - `events.data`: raw event fields as JSON (crash 1000/1001/1002, Kernel-Power 41, disk/stornvme/Ntfs, WHEA, Defender).
