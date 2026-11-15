@@ -30,6 +30,7 @@ log = logging.getLogger("perfmon.etwbox")
 
 CREATE_NO_WINDOW = 0x08000000
 IDLE_PRIORITY_CLASS = 0x00000040
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 INSTANCE = "PerfMonBox"
 PROFILE = Path(__file__).parent / "etw" / "perfmon.wprp"
 TRACES = config.DATA_DIR / "traces"
@@ -38,6 +39,7 @@ COOLDOWN_S = 120
 ANALYZE_DELAY_S = 30       # let the disk settle after writing the .etl
 RETRY_S = 600              # after a failed wpr -start (no admin, another kernel logger, ...)
 BURST_WINDOW_S = 10
+DUMP_SETTLE_S = 10        # after wpr -stop: stutters until then are still the dump's (disk flush, wpr -start)
 DPC_TRIGGER_S = 2
 MAX_DPC_US = 1_000_000   # no DPC/ISR runs this long, the watchdog would bugcheck
 ORPHAN_S = 3600           # a trace file no row points at yet may still be written by wpr -stop
@@ -52,14 +54,14 @@ def settings(cfg):
     return s
 
 
-def _run(args, timeout=180):
+def _run(args, timeout=180, flags=0):
     r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
-                       creationflags=CREATE_NO_WINDOW)
+                       creationflags=CREATE_NO_WINDOW | flags)
     return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
 
 
-def wpr(*args, timeout=180):
-    return _run(["wpr", *args, "-instancename", INSTANCE], timeout)   # -instancename must be the last parameter
+def wpr(*args, timeout=180, flags=0):
+    return _run(["wpr", *args, "-instancename", INSTANCE], timeout, flags)   # -instancename must be the last parameter
 
 
 def profile_copy(buffer_mb):
@@ -108,7 +110,9 @@ class EtwBox:
         self.manual = None          # True/False from pm etw start|stop, until the collector restarts
         self.pending = False        # a sync is queued
         self.failed_until = 0.0
+        self.lock = threading.Lock()   # trigger() runs on the collector and the PresentMon reader threads
         self.last_dump = 0.0
+        self.last_burst = 0.0       # burst_cooldown_s (>> a dump) also keeps the dump's own stutters from re-triggering
         self.stutters = []          # recent stutter ts for the burst trigger
         self.dpc_since = None
         self.warned = False
@@ -134,9 +138,14 @@ class EtwBox:
     def trigger(self, name, session=None, now=None):
         """Dump the buffer for this trigger (if enabled, recording and not in cooldown). True when queued."""
         now = now or time.time()
-        if not self.s["triggers"].get(name) or not self.active or now - self.last_dump < COOLDOWN_S:
-            return False
-        self.last_dump = now
+        with self.lock:
+            if not self.s["triggers"].get(name) or not self.active or now - self.last_dump < COOLDOWN_S:
+                return False
+            if name == "stutter_burst":
+                if now - self.last_burst < self.s["burst_cooldown_s"]:
+                    return False
+                self.last_burst = now
+            self.last_dump = now
         log.info("ETW capture trigger %s", name)
         self.q.put(("dump", name, session, now))
         return True
@@ -205,14 +214,22 @@ class EtwBox:
             (log.warning if not self.warned else log.debug)("wpr -start failed (%s): %s", rc, out[-300:])
             self.warned = True
 
+    def _free_burst(self, trigger):
+        """Nothing was captured: the next stutter burst may try again."""
+        if trigger == "stutter_burst":
+            with self.lock:
+                self.last_burst = 0.0
+
     def _dump(self, trigger, session, ts):
-        if not self.active:
+        if not self.active:   # stopped between the trigger and here (the game exited)
+            self._free_burst(trigger)
             return
         TRACES.mkdir(parents=True, exist_ok=True)
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
         t0 = time.time()
         try:
-            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300)
+            # below normal: the merge and rundown compete with the game for CPU
+            rc, out = wpr("-stop", str(path), "-skipPdbGen", timeout=300, flags=BELOW_NORMAL_PRIORITY_CLASS)
         except (OSError, subprocess.TimeoutExpired) as e:   # still recorded as a failed capture, with the reason
             rc, out = -1, f"{type(e).__name__}: {e}"
         self.active = False
@@ -220,6 +237,7 @@ class EtwBox:
         summary = {"stop_s": round(time.time() - t0, 1)}
         if not ok:
             summary["error"] = tool_error("wpr -stop", rc, out) if rc else f"wpr -stop: brak pliku {path.name}"
+            self._free_burst(trigger)
         self.on_capture({"ts": ts, "trigger": trigger, "session": session, "path": str(path) if ok else None,
                          "size_mb": round(path.stat().st_size / 2**20, 1) if ok else None,
                          "status": "captured" if ok else "failed", "summary": summary})

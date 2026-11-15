@@ -16,6 +16,7 @@ Pages.games = (() => {
     disk_hot: "Gorący dysk z grą",
     pagefile: "Plik wymiany",
     shader_compile: "Kompilacja shaderów",
+    etw_dump: "Zrzut ETW (NX Frame)",
     "background_scan:defender": "Skan Defendera",
   };
   const CAUSE_PREFIX = { "background:": "Proces w tle", "background_start:": "Start procesu", "background_gpu:": "GPU w tle" };
