@@ -1,50 +1,107 @@
 name: Release
 
-# Push a tag matching perfmon/__init__.py's __version__ (e.g. v0.2.0): tests, the PyInstaller build, the installer and
-# a GitHub release with PerfMonitor-Setup-<version>.exe + SHA256SUMS.txt (the in-app updater needs both).
+# Builds the installer: the window (src-tauri), the Python side (PyInstaller) and the setup (Inno Setup), then
+# installs it on the runner as a smoke test.
+#   pull request touching the build: the installer is kept as a workflow artifact
+#   tag vX.Y.Z (must match perfmon/__init__.py's __version__): also published as a GitHub release with
+#   NXFrame-Setup-<version>.exe + SHA256SUMS.txt (the in-app updater needs both)
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - src-tauri/**
+      - perfmon/launcher.py
+      - perfmon/updater.py
+      - perfmon/config.py
+      - requirements*.txt
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: requirements-build.txt
+          cache-dependency-path: requirements*.txt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
       - run: pip install -r requirements-build.txt
 
-      - name: Check the tag matches the version
+      - name: Check the versions agree (and match the tag)
         shell: pwsh
+        env:
+          REF: ${{ github.ref }}
         run: |
           $version = python packaging/version_info.py
-          if ("v$version" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} != __version__ $version" }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($env:REF.StartsWith('refs/tags/') -and $env:REF -ne "refs/tags/v$version") {
+            throw "$env:REF does not match __version__ $version"
+          }
           "VERSION=$version" >> $env:GITHUB_ENV
 
       - run: python -m unittest discover -s tests -t .
       - run: pyinstaller packaging/perfmon.spec --noconfirm
+
+      - name: Build the window
+        shell: pwsh
+        run: |
+          cargo build --release --features custom-protocol --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item src-tauri\target\release\nxframe.exe dist\NXFrame.exe
 
       - name: Build the installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /Q "/DAppVersion=$env:VERSION" packaging\PerfMonitor.iss
+          & $iscc /Q "/DAppVersion=$env:VERSION" packaging\NXFrame.iss
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $setup = "NXFrame-Setup-$env:VERSION.exe"
+          "$((Get-FileHash dist\$setup -Algorithm SHA256).Hash.ToLower())  $setup" | Out-File dist\SHA256SUMS.txt -Encoding ascii
 
-      - name: Publish the release
+      - name: Install it, check what it installed, uninstall
         shell: pwsh
+        run: packaging\smoke-test.ps1 -Setup "dist\NXFrame-Setup-$env:VERSION.exe" -Version $env:VERSION
+
+      - name: Sensors from winget land where the installed collector looks (informational)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          foreach ($id in 'LibreHardwareMonitor.LibreHardwareMonitor', 'Intel.PresentMon.Console') {
+            winget install --exact --id $id --scope machine --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          }
+          Get-ChildItem "$env:ProgramFiles\WinGet\Packages" -Depth 1 -ErrorAction SilentlyContinue | ForEach-Object FullName
+          python -c "import os, sys; sys.frozen = True; from perfmon import config; d = config.DEFAULTS; print(d['lhm_dir'], os.path.isfile(os.path.join(d['lhm_dir'], 'LibreHardwareMonitorLib.dll'))); print(d['presentmon_exe'], os.path.isfile(d['presentmon_exe']))"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NXFrame-Setup
+          path: |
+            dist/NXFrame-Setup-*.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: NXFrame-Setup
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd dist
-          $setup = "PerfMonitor-Setup-$env:VERSION.exe"
-          "$((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower())  $setup" | Out-File SHA256SUMS.txt -Encoding ascii
-          gh release create "${{ github.ref_name }}" $setup SHA256SUMS.txt --title "PerfMonitor $env:VERSION" --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" NXFrame-Setup-*.exe SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --title "NX Frame ${TAG#v}" --generate-notes
