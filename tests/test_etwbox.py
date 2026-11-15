@@ -209,6 +209,16 @@ class BoxTest(unittest.TestCase):
         self.box.active = True
         self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0 + etwbox.COOLDOWN_S))
 
+    def test_burst_dump_skipped_after_the_box_stopped_frees_the_burst_cooldown(self):
+        self.box.active = True
+        with mock.patch.object(self.box.q, "put"):                   # the worker gets to it only after the box stopped
+            self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0))
+        self.box.active = False
+        self.box._dump("stutter_burst", None, 10_000.0)
+        self.assertEqual(self.captures, [])
+        self.box.active = True
+        self.assertTrue(self.box.trigger("stutter_burst", now=10_000.0 + etwbox.COOLDOWN_S))
+
     def test_burst_cooldown(self):
         self.box.active = True
         p = mock.patch.object(self.box.q, "put")                     # no worker: the box stays recording
@@ -321,6 +331,8 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(tags(1000.0 + 8 + etwbox.DUMP_SETTLE_S + 1), ["disk"])
         self.assertEqual(tags(2005.0), ["disk", "etw_dump"])         # a freeze dump: the problem may still be on
         self.assertEqual(tags(3005.0), ["disk"])                     # no stop_s: not a dump that ran
+        ext.dumps = [(4000.0, 4200.0, False), (4100.0, 4120.0, True)]
+        self.assertEqual(tags(4110.0), ["etw_dump"])                 # overlapping windows: the burst dump wins
 
     def test_settings_merge(self):
         s = etwbox.settings({"etw": {"mode": "always", "triggers": {"dpc_pct": 0}}})

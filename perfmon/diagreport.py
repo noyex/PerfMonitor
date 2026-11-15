@@ -83,10 +83,10 @@ class StutterExt:
         # after the trigger only: the burst that caused the dump is the game's. A burst dump's disk flush and wpr CPU
         # would pass for disk/background causes, so it replaces them; other triggers fire on a problem that may still
         # be going on, so there it is one cause among the rest
-        dump = next((burst for a, b, burst in self.dumps if a < ts <= b), None)
-        if dump:
+        dumps = [burst for a, b, burst in self.dumps if a < ts <= b]
+        if any(dumps):
             return ["etw_dump"]
-        if dump is not None:
+        if dumps:
             causes.append("etw_dump")
         if any((s.get("pagefile_pct") or 0) > 60 and (s.get("hard_faults_s") or 0) > 200 for s in win):
             causes.append("pagefile")

@@ -214,8 +214,15 @@ class EtwBox:
             (log.warning if not self.warned else log.debug)("wpr -start failed (%s): %s", rc, out[-300:])
             self.warned = True
 
+    def _free_burst(self, trigger):
+        """Nothing was captured: the next stutter burst may try again."""
+        if trigger == "stutter_burst":
+            with self.lock:
+                self.last_burst = 0.0
+
     def _dump(self, trigger, session, ts):
-        if not self.active:
+        if not self.active:   # stopped between the trigger and here (the game exited)
+            self._free_burst(trigger)
             return
         TRACES.mkdir(parents=True, exist_ok=True)
         path = TRACES / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{trigger}.etl"
@@ -230,9 +237,7 @@ class EtwBox:
         summary = {"stop_s": round(time.time() - t0, 1)}
         if not ok:
             summary["error"] = tool_error("wpr -stop", rc, out) if rc else f"wpr -stop: brak pliku {path.name}"
-            if trigger == "stutter_burst":   # nothing was captured: the next burst may try again
-                with self.lock:
-                    self.last_burst = 0.0
+            self._free_burst(trigger)
         self.on_capture({"ts": ts, "trigger": trigger, "session": session, "path": str(path) if ok else None,
                          "size_mb": round(path.stat().st_size / 2**20, 1) if ok else None,
                          "status": "captured" if ok else "failed", "summary": summary})
