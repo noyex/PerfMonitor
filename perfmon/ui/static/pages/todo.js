@@ -1,16 +1,11 @@
 // "Co zrobić": ranked changes backed by the user's data, and before/after tests proving what helped.
-// PerfMonitor changes nothing itself: the user applies a change, then starts a test here.
+// NX Frame changes nothing itself: the user applies a change, then starts a test here.
 Pages.todo = (() => {
   const VERDICT_SEV = { pomogło: "good", pogorszyło: "critical", mieszane: "warning", "bez zmian": "muted", "za mało danych": "muted" };
   const KIND = { stability: "Stabilność", smoothness: "Płynność", latency: "Opóźnienie", fps: "FPS" };
   let view = null;
 
-  const post = async (body) => {
-    const r = await fetch("/api/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.statusText);
-    return j;
-  };
+  const post = (body) => apiPost("test", body);
   const act = (body) => async () => {
     try {
       await post(body);

@@ -73,7 +73,10 @@ document.getElementById("update").addEventListener("click", async () => {
 
 window.addEventListener("hashchange", route);
 // uPlot paints its axes on a canvas, which does not repaint when a web font arrives late.
-Promise.all(["400 13px Nohemi", "500 13px Nohemi"].map((f) => document.fonts.load(f))).catch(() => {}).then(route);
+const TEXT = css("--font-text"), DISPLAY = css("--font-display");
+Promise.all([`400 13px ${TEXT}`, `600 13px ${TEXT}`, `400 19px ${DISPLAY}`, `500 21px ${DISPLAY}`, `600 19px ${DISPLAY}`].map((f) => document.fonts.load(f)))
+  .catch(() => {})
+  .then(route);
 status();
 setInterval(status, 5000);
 update();

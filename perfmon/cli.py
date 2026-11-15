@@ -1,4 +1,4 @@
-"""Command line access to the PerfMonitor database (for AI agents and the user).
+"""Command line access to the NX Frame database (for AI agents and the user).
 
 Usage: pm <command> [args] [--json]. Output is compact Markdown by default.
 """
@@ -799,7 +799,7 @@ def _oc_next(r):
         out(f"Jeśli OK: {r['next_if_ok']}")
     if r["rollback_if_bad"]:
         out(f"Jeśli źle: {r['rollback_if_bad']}")
-    out("_PerfMonitor tylko doradza - niczego nie zmienia w BIOS ani Adrenalin i sam nie oznacza profilu jako stabilny._")
+    out("_NX Frame tylko doradza - niczego nie zmienia w BIOS ani Adrenalin i sam nie oznacza profilu jako stabilny._")
 
 
 def cmd_oc(con, a):
@@ -973,7 +973,7 @@ def cmd_stress(con, a):
 
 
 def build():
-    p = argparse.ArgumentParser(prog="pm", description="PerfMonitor CLI")
+    p = argparse.ArgumentParser(prog="pm", description="NX Frame CLI")
     p.add_argument("--json", action="store_true", help="output JSON instead of Markdown")
     sp = p.add_subparsers(dest="cmd", required=True)
 

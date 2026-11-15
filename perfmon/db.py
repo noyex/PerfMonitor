@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS hw_detail (          -- UV/OC telemetry: every 1 s du
     gpu_clk REAL, gpu_mem_clk REAL, gpu_v REAL, gpu_w REAL, gpu_load REAL,
     gpu_temp REAL, gpu_hot REAL, gpu_mem_temp REAL, gpu_fan REAL
 );
-CREATE TABLE IF NOT EXISTS oc_profiles (        -- UV/OC settings profiles (entered by the user, never applied by PerfMonitor)
+CREATE TABLE IF NOT EXISTS oc_profiles (        -- UV/OC settings profiles (entered by the user, never applied by NX Frame)
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT, created_ts REAL,
     status TEXT,                                 -- testing | stable | rejected
