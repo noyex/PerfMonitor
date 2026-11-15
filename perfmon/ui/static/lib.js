@@ -1,4 +1,4 @@
-// Shared helpers: API, formatting, DOM, charts. Pages register themselves in window.Pages.
+// Shared helpers: API, formatting, DOM, the agent card and game banners. Pages register themselves in window.Pages.
 window.Pages = {};
 
 // In the desktop shell the page is served by Tauri, window.__PERFMON_API__ is the origin of the window's own Python API
@@ -29,7 +29,7 @@ const api = async (name, params = {}) => {
   return j;
 };
 
-// The write endpoints (/api/oc_profile, /api/test): JSON body, JSON answer.
+// The write endpoints (/api/game_target, /api/update): JSON body, JSON answer.
 const apiPost = async (name, body) => {
   const headers = { "Content-Type": "application/json", ...(API_TOKEN && { "X-PerfMon-Token": API_TOKEN }) };
   const r = await fetch(apiUrl(`/api/${name}`), { method: "POST", headers, body: JSON.stringify(body) });
@@ -37,11 +37,6 @@ const apiPost = async (name, body) => {
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 };
-
-const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-// uPlot draws its axes on a canvas, which does not follow CSS: pass the text face explicitly.
-const axisFont = () => `13px ${css("--font-text")}`;
-const SERIES = ["--s1", "--s2", "--s3", "--s4"];
 
 // ---------- formatting ----------
 const nf = (d = 0) => new Intl.NumberFormat("pl-PL", { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -53,10 +48,6 @@ const fmtTime = (ts, withDate = true) => {
   const t = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   return withDate ? `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${t}` : t;
 };
-const fmtDate = (ts) => {
-  const d = new Date(ts * 1000);
-  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
-};
 const fmtDur = (s) => {
   if (s == null) return "–";
   s = Math.round(s);
@@ -67,12 +58,18 @@ const fmtDur = (s) => {
 const gameName = (exe) => (exe || "").replace(/\.exe$/i, "");
 // Session's game title: the Steam name when the session context has one, else the exe name.
 const gameTitle = (s) => ((s.context && s.context.steam && s.context.steam.name) || "").replace(/[®™]/g, "").trim() || gameName(s.exe);
-// Polish plural: plural(n, "przycięcie", "przycięcia", "przycięć") -> 1 / 2-4, 22-24... / 0, 5-21, 25...
-const plural = (n, one, few, many) => {
-  if (n === 1) return one;
-  const d = n % 10, t = n % 100;
-  return d >= 2 && d <= 4 && (t < 12 || t > 14) ? few : many;
+// "dziś, 21:08", "wczoraj, 21:08", "czw., 21:08", then "09.11, 21:08".
+const DAYS = ["niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."];
+const whenDay = (ts) => {
+  const d = new Date(ts * 1000);
+  const diff = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(d).setHours(0, 0, 0, 0)) / 86400000);
+  return diff === 0 ? "dziś" : diff === 1 ? "wczoraj" : diff < 7 ? DAYS[d.getDay()] : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
 };
+const when = (ts) => `${whenDay(ts)}, ${fmtTime(ts, false)}`;
+// Stutters of a session per minute, and how that reads: ok | warn | bad.
+const perMin = (s) => (s.duration_s > 0 ? (s.stutters || 0) / (s.duration_s / 60) : 0);
+const stutterLevel = (s) => (perMin(s) >= 20 ? "bad" : perMin(s) >= 5 ? "warn" : "ok");
+const signed = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${fmt(Math.abs(v))}`;
 
 // ---------- DOM ----------
 const h = (tag, attrs = {}, ...children) => {
@@ -87,6 +84,9 @@ const h = (tag, attrs = {}, ...children) => {
   for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) e.append(c.nodeType ? c : String(c));
   return e;
 };
+
+// el.append() that skips null / false: DOM append would print them as text.
+const put = (el, ...nodes) => el.append(...nodes.flat().filter((n) => n !== null && n !== undefined && n !== false));
 
 // Live temperatures in the dock; null while the collector is down.
 const setTemps = (t) => {
@@ -130,199 +130,43 @@ const askAgent = async (text) => {
     document.execCommand("copy");
     ta.remove();
   }
-  toast("Skopiowano – wklej agentowi AI");
+  toast("Skopiowano. Wklej agentowi AI.");
 };
 
-const segmented = (options, value, onChange) => {
-  const wrap = h("div", { class: "seg" });
-  for (const [v, label] of options) {
-    const b = h("button", { class: v === value ? "on" : "" }, label);
-    b.onclick = () => {
-      wrap.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
-      b.classList.add("on");
-      onChange(v);
-    };
-    wrap.append(b);
+// What the user's agent wrote with `pm note` plus the open `pm test`; `ask` adds the "Zapytaj agenta" button.
+// card = {note, test} from the API. Returns null when there is nothing to show.
+const agentCard = (card, { ask, cls = "tile" } = {}) => {
+  const { note, test } = card || {};
+  if (!note && !test && !ask) return null;
+  const done = test && !test.missing.length;
+  return h("section", { class: `${cls} note` },
+    h("div", { class: "who" }, h("b", {}, "Agent"), note ? h("span", {}, when(note.ts)) : null),
+    note ? h("p", {}, note.text) : test ? null : h("p", { class: "hint" }, "Skopiuj gotowy prompt i wklej go swojemu agentowi AI."),
+    test ? h("div", { class: `sev ${done ? "good" : "warning"}` },
+      done ? `Test „${test.name}”: ${test.verdict}` : `Trwa test „${test.name}”: ${test.missing[0]}`) : null,
+    ask ? h("button", { class: "btn primary", onclick: ask }, "Zapytaj agenta") : null);
+};
+
+// A game's Steam banner as a blob URL: the desktop shell's CSP allows blob: images, not the API origin. null = none.
+const banners = new Map();
+const bannerUrl = (appid) => {
+  if (!appid) return Promise.resolve(null);
+  if (!banners.has(appid)) {
+    banners.set(appid, fetch(apiUrl(`/api/banner?appid=${appid}`))
+      .then((r) => (r.ok ? r.blob() : null))
+      .then((b) => b && URL.createObjectURL(b))
+      .catch(() => null));
   }
-  return wrap;
+  return banners.get(appid);
 };
-
-const sevLabel = { critical: "Krytyczne", serious: "Poważne", warning: "Ostrzeżenie", info: "Info" };
-
-const BOTTLENECK = { vram: "VRAM", gpu_power: "Limit mocy GPU", cpu_thread: "Wątek CPU", cpu: "CPU", limit: "Limit FPS", gpu: "GPU", mixed: "Mieszane" };
-
-// ---------- charts ----------
-// Vertical markers (incidents, driver updates). marker = {ts, severity|color}
-const markersPlugin = (getMarkers) => ({
-  hooks: {
-    draw: (u) => {
-      const ms = getMarkers() || [];
-      if (!ms.length) return;
-      const { ctx } = u;
-      const { top, height } = u.bbox;
-      ctx.save();
-      ctx.lineWidth = 1.5 * devicePixelRatio;
-      for (const m of ms) {
-        const x = Math.round(u.valToPos(m.ts, "x", true));
-        if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
-        ctx.strokeStyle = m.color || css(`--${m.severity || "muted"}`) || css("--muted");
-        ctx.globalAlpha = ms.length > 40 ? 0.3 : 0.75;  // hundreds of incidents would paint a solid block
-        ctx.setLineDash(m.dash ? [4 * devicePixelRatio, 4 * devicePixelRatio] : []);
-        ctx.beginPath();
-        ctx.moveTo(x, top);
-        ctx.lineTo(x, top + height);
-        ctx.stroke();
-      }
-      ctx.restore();
-    },
-  },
-});
-
-// User marks, Defender scans and background process starts within [t0, t1]: chart lines + a one-row legend (null if none).
-const DIAG = { mark: ["--s3", false], scan: ["--muted", true], start: ["--warning", true] };
-const diagMarkers = async (t0, t1) => {
-  const ms = (await api("diag_markers", { from: t0, to: t1 })).filter((m) => DIAG[m.kind]);
-  const item = (kind, text) => h("span", { class: "mark" }, h("i", { class: DIAG[kind][1] ? "dash" : "", style: `border-left-color:var(${DIAG[kind][0]})` }), text);
-  const has = (kind) => ms.some((m) => m.kind === kind);
-  const legend = [
-    ...ms.filter((m) => m.kind === "mark").slice(-6).map((m) => item("mark", `${fmtTime(m.ts, t1 - t0 > 86400)} ${m.label}`)),
-    has("scan") ? item("scan", "Skan Defendera") : null,
-    has("start") ? item("start", "Start procesu w tle") : null,
-  ].filter(Boolean);
-  return {
-    lines: ms.map((m) => ({ ts: m.ts, color: css(DIAG[m.kind][0]), dash: DIAG[m.kind][1] })),
-    legend: legend.length ? h("div", { class: "marks" }, legend) : null,
-  };
-};
-
-const syncKey = "pm";
-
-// 24 h Polish tick labels (uPlot defaults to US "9:20pm" + "10/18/26").
-const timeTicks = (u, vals) => {
-  const span = u.scales.x.max - u.scales.x.min;
-  return vals.map((v) => {
-    const d = new Date(v * 1000);
-    const day = `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
-    if (span > 3 * 86400) return day;
-    const t = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    return span > 86400 ? `${day} ${t}` : t;
+// Banner box of a fixed shape: the game's name, covered by the picture once (and if) it loads.
+const banner = (g) => {
+  const box = h("div", { class: "banner" }, h("span", {}, g.title));
+  bannerUrl(g.appid).then((url) => {
+    if (!url) return;
+    const img = h("img", { src: url, alt: "" });
+    img.onload = () => img.classList.add("in");
+    box.append(img);
   });
-};
-
-/**
- * chart(container, {title, unit, decimals, series:[{label, color?}], height, markers:()=>[], yMin, yMax, onSelect, xRange:[t0,t1]})
- * data = [xs, ys1, ys2...]. Returns {u, setData(data)}.
- * Single series: no legend, title names it; hover readout shows the value. 2+ series: swatch legend with values.
- */
-const chart = (container, opt, data) => {
-  const box = h("div", { class: "chart" });
-  const read = h("div", { class: "chart-read" });
-  box.append(h("div", { class: "chart-head" }, h("div", { class: "chart-title" }, opt.title), read));
-  const plot = h("div");
-  box.append(plot);
-  container.append(box);
-
-  const colors = opt.series.map((s, i) => s.color || css(SERIES[i]));
-  const unit = opt.unit ? ` ${opt.unit}` : "";
-  const multi = opt.series.length > 1;
-
-  const readout = (idx) => {
-    read.innerHTML = "";
-    const d = u.data;
-    const i = idx ?? (d[0].length ? d[0].length - 1 : null);
-    if (i === null) return;
-    opt.series.forEach((s, k) => {
-      const v = d[k + 1][i];
-      read.append(
-        multi
-          ? h("span", { class: "k" }, h("span", { class: "sw", style: `background:${colors[k]}` }), s.label, " ", h("span", { class: "v" }, `${fmt(v, opt.decimals ?? 0)}${unit}`))
-          : h("span", { class: "v" }, `${fmt(v, opt.decimals ?? 0)}${unit}`)
-      );
-    });
-    if (idx !== null && idx !== undefined) read.append(h("span", { class: "t" }, fmtTime(d[0][i], opt.longRange)));
-  };
-
-  const axis = {
-    stroke: css("--muted"),
-    grid: { stroke: css("--grid"), width: 1 },
-    ticks: { show: false },
-    font: axisFont(),
-  };
-  const u = new uPlot(
-    {
-      width: Math.max(300, plot.clientWidth || container.clientWidth - 32),
-      height: opt.height || 150,
-      padding: [6, 4, 0, 0],
-      legend: { show: false },
-      cursor: {
-        sync: { key: syncKey, setSeries: false },
-        points: { size: 7, width: 2, fill: css("--surface") },
-        drag: { x: !!opt.onSelect, y: false, setScale: false },
-        y: false,
-      },
-      scales: {
-        // xRange pins every chart of a page to the same window, even when a series covers only part of it
-        x: opt.xRange ? { time: true, range: () => opt.xRange } : { time: true },
-        y: { range: (u, mn, mx) => [opt.yMin ?? Math.min(0, mn ?? 0), opt.yMax ?? Math.max((mx ?? 1) * 1.08, opt.yFloor ?? 1)] },
-      },
-      axes: [
-        { ...axis, space: 70, values: timeTicks },
-        { ...axis, size: 44, values: (u, vals) => vals.map((v) => (v === 0 ? "0" : fmt(v, opt.decimals && v < 10 ? 1 : 0))) },
-      ],
-      series: [
-        {},
-        ...opt.series.map((s, i) => ({
-          label: s.label,
-          stroke: colors[i],
-          width: 2,
-          points: { show: false },
-          spanGaps: false,
-          fill: !multi && opt.fill !== false ? colors[i] + "1f" : undefined,
-        })),
-      ],
-      hooks: {
-        setCursor: [(u) => readout(u.cursor.idx)],
-        setSelect: [
-          (u) => {
-            if (!opt.onSelect || u.select.width < 4) return;
-            const a = u.posToVal(u.select.left, "x");
-            const b = u.posToVal(u.select.left + u.select.width, "x");
-            u.setSelect({ width: 0, height: 0 }, false);
-            opt.onSelect(a, b);
-          },
-        ],
-      },
-      plugins: opt.markers ? [markersPlugin(opt.markers)] : [],
-    },
-    data,
-    plot
-  );
-  readout(null);
-  const ro = new ResizeObserver(() => u.setSize({ width: plot.clientWidth, height: opt.height || 150 }));
-  ro.observe(plot);
-  return {
-    u,
-    el: box,
-    setData: (d) => {
-      u.setData(d);
-      readout(null);
-    },
-    destroy: () => {
-      ro.disconnect();
-      u.destroy();
-    },
-  };
-};
-
-// Builds uPlot data arrays from analyze.series() output ({ts:[], col:[]}), optional value transform.
-const cols = (s, keys, map = {}) => [s.ts || [], ...keys.map((k) => (s[k] || []).map((v) => (v == null ? null : map[k] ? map[k](v) : v)))];
-
-// "Ping" chart from net_series() output: router / internet / game server lines, packet loss as markers. Returns null without data.
-const pingChart = (container, n, opt = {}) => {
-  const has = (k) => (n[k] || []).some((v) => v != null);
-  if (!has("gw_ms") && !has("inet_ms") && !has("game_ms")) return null;
-  const keys = [["gw_ms", "Router"], ["inet_ms", "Internet"], ["game_ms", "Serwer gry"]].filter(([k]) => has(k));
-  // one mark where a loss streak starts: a mark per bucket would bury the diag lines under amber
-  const loss = (n.ts || []).filter((_, i) => n.inet_loss[i] > 0 && !(n.inet_loss[i - 1] > 0)).map((ts) => ({ ts, color: css("--warning") }));
-  return chart(container, { title: "Ping", unit: "ms", series: keys.map(([, label]) => ({ label })), yFloor: 50, ...opt, markers: () => [...loss, ...(opt.markers ? opt.markers() : [])] }, cols(n, keys.map(([k]) => k)));
+  return box;
 };

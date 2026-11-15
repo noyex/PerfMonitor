@@ -5,10 +5,12 @@ The CLI path is given in the user's prompt. Wherever this guide says `pm <comman
 
 Rules: answer in the user's language (the app UI is Polish, so default to Polish); code and commands stay as-is. Base every claim on data: cite exact timestamps and numbers. NEVER change system settings (BIOS, drivers, registry, services, uninstalls) without asking first - propose, then wait.
 
+The window is deliberately small: last session, game tiles, a plain problems list. The analysis is your job, and the user reads your conclusion there. After every analysis save it with `pm note add "..." [--exe game.exe]`: one or two plain sentences in the user's language (max 400 characters) saying what is wrong and what to do, no raw metrics. Use `--exe` when it is about one game (it shows on that game's page), no `--exe` when it is about the whole PC (it shows under Problemy and Podkręcanie); the newest note also shows on the home screen. A new note replaces the previous one on screen, so write the current state, not a diff. When you ask the user to change one setting and keep playing, start `pm test start NAME`: the window then shows "Trwa test" and its progress by itself.
+
 ## Data
 - The collector writes 1 s samples, game sessions (PresentMon frames/stutters), network quality, top processes, Windows event log, detected incidents and config snapshots to a SQLite database (UTC epoch seconds; the CLI prints local time). The CLI finds the database itself; `pm status` shows its location. Installed builds keep data in `%LOCALAPPDATA%\NX Frame`.
 - Add `--json` for JSON. Time args: `2026-01-15 23:30`, `23:30` (today), `2h` / `30m` / `7d` (that long ago - write WITHOUT a leading minus), `now`.
-- The user can browse the same data in the NX Frame window: charts, sessions, incidents, "Co zrobić" (advice).
+- The NX Frame window shows only a summary (no charts, no per-session detail): numbers and causes come from you.
 - `game_proc` (every ~5 s per game session): rss_mb, private_mb, thread_max_pct (busiest game thread, % of one core), threads, handles, io_read_mbs, gpu_pct, gpu_3d_pct, vram_dedicated_mb, vram_shared_mb, shader_bytes (shader cache size, where readable).
 - `proc_events`: ts, pid, name, ppid, parent_name, action start|stop, session, path.
 - `events.data`: raw event fields as JSON (crash 1000/1001/1002, Kernel-Power 41, disk/stornvme/Ntfs, WHEA, Defender).
@@ -37,6 +39,7 @@ Rules: answer in the user's language (the app UI is Polish, so default to Polish
 - `pm compare [--exe cod.exe] [--by week|day|month|driver|game_version|session|present_mode] [--since 90d]` - FPS, 1% low, stutters/min, bound shares per group with delta % vs the previous group. `present_mode` groups by IFlip / FSE / Composed / mixed.
 - `pm compare --exe X --before <time|m<n>> [--after <time|m<n>>]` - before/after groups around a change marker (`m<n>` = number from `pm markers --exe X`); warns `small_sample` (< 30 min or < 3 sessions in a group).
 - `pm markers [--exe X] [--since T]` - timeline of driver / game update / OS / BIOS / config changes, markers numbered `n`.
+- `pm note add TEXT [--exe X]`, `pm note list`, `pm note clear [ID]`: your conclusion shown in the window (see the top of this guide).
 - `pm test start NAME [--exe X] [--key K]`, `pm test stop|cancel|list|show [ID]` - one changed setting, before/after verdict (pomogło, pogorszyło, mieszane, bez zmian, za mało danych). Needs >= 30 gameplay minutes and >= 2 sessions per side. Only one open test.
 - `pm freeze-check` - LIVE diagnosis, run while the desktop is frozen (takes up to ~25 s): times DwmFlush (does DWM still compose frames?), pings explorer, foreground window hung?, GPU 3D load per adapter, display modes + which GPU drives each monitor, top CPU processes, dwm.exe/explorer.exe start times (restarts), collector's latest sample, incidents/events of the last 10 min, and a verdict.
 - `pm sensors dump` - every hardware sensor right now (read by the elevated collector).

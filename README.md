@@ -4,14 +4,14 @@ A Windows 11 black box for gamers: it records how your PC performs while you pla
 
 The interface is in Polish.
 
-![Overview: the last game session at a glance](docs/screenshots/overview.png)
+![Overview: the last game session at a glance, with the agent's conclusion](docs/screenshots/overview.png)
 
 <p>
-  <img src="docs/screenshots/session.png" width="49%" alt="Session: FPS, 1% lows and findings for one game session">
-  <img src="docs/screenshots/compare.png" width="49%" alt="Compare: FPS per week with driver and game-update markers">
+  <img src="docs/screenshots/games.png" width="49%" alt="Games: one tile per game with its Steam banner, FPS and state">
+  <img src="docs/screenshots/game.png" width="49%" alt="One game: FPS against your target, settings, versions and recent sessions">
 </p>
 <p>
-  <img src="docs/screenshots/problems.png" width="49%" alt="Problems: hard resets, freezes and driver faults">
+  <img src="docs/screenshots/problems.png" width="49%" alt="Problems: hard resets, driver faults, crashes and freezes in plain words">
 </p>
 
 The screenshots show synthetic demo data.
@@ -27,9 +27,11 @@ The screenshots show synthetic demo data.
 - **Advice.** A short ranked list of concrete changes, each backed by your own numbers. An item disappears once the condition is gone. Settings NX Frame cannot read are listed as manual checks. `pm test` verifies a single change with a before/after verdict.
 - **Network quality.** Ping, packet loss, DNS time and Wi-Fi link quality, with each incident placed at home, ISP or internet.
 - **Undervolt and overclock.** UV/OC profiles, stress tests and idle soaks, WHEA error attribution, per-core stability, and a single suggested next step. NX Frame only reads: it never changes a BIOS, Adrenalin or registry setting.
-- **CLI.** `pm` exposes the same data: `pm status`, `pm advise`, `pm sessions`, `pm session <id>`, `pm compare`, `pm health`, `pm incidents`, `pm net`, `pm oc`, `pm sql` and more (`pm --help`).
+- **CLI.** `pm` exposes the same data: `pm status`, `pm advise`, `pm sessions`, `pm session <id>`, `pm compare`, `pm health`, `pm incidents`, `pm net`, `pm oc`, `pm note`, `pm sql` and more (`pm --help`).
 
-The window has seven pages: Przegląd (overview), Co zrobić (advice), Oś czasu (timeline), Gry (games), Porównania (compare), Problemy (problems) and Podkręcanie (overclocking). The "Zapytaj agenta" buttons copy a ready-made prompt for any AI agent that can run terminal commands (Claude Code, Codex, Cursor and similar). The prompt points the agent at the guide bundled with the app ([`perfmon/agent/AGENT.md`](perfmon/agent/AGENT.md)) and at the `pm` CLI by full path, so there is nothing to set up: paste it and the agent analyses your own data.
+NX Frame collects; an AI agent analyses. The window stays small on purpose and has four pages: Przegląd (the last session), Gry (a tile per game with its Steam banner; a game's page shows its FPS against your target, its settings, versions and recent sessions), Problemy (what went wrong lately, in plain words) and Podkręcanie (the active UV/OC profile and the next step). There are no charts: the detail lives in the database for the agent.
+
+The "Zapytaj agenta" buttons copy a ready-made prompt for any AI agent that can run terminal commands (Claude Code, Codex, Cursor and similar). The prompt points the agent at the guide bundled with the app ([`perfmon/agent/AGENT.md`](perfmon/agent/AGENT.md)) and at the `pm` CLI by full path, so there is nothing to set up: paste it and the agent analyses your own data. When it is done it writes its conclusion back with `pm note`, and the window shows it on the home screen and on the game's page, together with any test it started (`pm test`).
 
 ## Requirements
 
@@ -56,6 +58,7 @@ The app checks GitHub Releases. When a newer version exists, an **Aktualizuj do 
 Everything stays on your machine, in a SQLite database under `%LOCALAPPDATA%\NX Frame`. There is no account, telemetry or upload. The UI server listens on `127.0.0.1` only. The only network traffic:
 
 - **Update check:** a request to `api.github.com` every few hours, and the installer download from GitHub when you click update.
+- **Game banners:** the tiles use the banner the Steam client already keeps on your PC. Only when it is missing does NX Frame fetch it once from Steam's public CDN, by the game's Steam app id (`"steam_banners": false` in `config.json` turns that off).
 - **Network monitor:** ICMP pings to your router, the first hop beyond it, `1.1.1.1` and `8.8.8.8` (change them with `net_targets` in `config.json`), and to the game server's address while a game is running. It also resolves a random, non-existent name through your system DNS resolver to time it.
 
 NX Frame records process names, Windows event log entries and hardware readings. It does not read game memory, with one opt-in exception: `game_modules` (off by default) lists the DLLs loaded in the game process, which some kernel anti-cheats may log.

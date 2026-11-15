@@ -1,10 +1,10 @@
-// "Przegląd": one session over the mercury drop; the glass buttons switch the whole view. The title opens the details.
+// "Przegląd": one session over the mercury drop; the glass buttons switch the whole view, the agent card sits under
+// them. The title opens the game.
 Pages.overview = (() => {
-  const SESSIONS = 5;
+  const SESSIONS = 4;
   const LIVE_POLL_MS = 2000;
   const IDLE_POLL_MS = 10000;
   const LONG_TITLE = 24;
-  const DAYS = ["niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."];
   const ENDED = { crash: ["bad", "awaria"], unknown: ["warn", "przerwana"] };
   const VERDICT = { ok: "Mało przycięć", warn: "Sporo przycięć", bad: "Dużo przycięć" };
   const calm = matchMedia("(prefers-reduced-motion: reduce)");
@@ -14,21 +14,13 @@ Pages.overview = (() => {
   let picked = null;   // session chosen by hand, kept across tabs; null follows the current one
   let liveId = null;
 
-  const when = (ts) => {
-    const d = new Date(ts * 1000);
-    const day = new Date(d).setHours(0, 0, 0, 0);
-    const diff = Math.round((new Date().setHours(0, 0, 0, 0) - day) / 86400000);
-    const label = diff === 0 ? "dziś" : diff === 1 ? "wczoraj" : diff < 7 ? DAYS[d.getDay()] : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
-    return `${label}, ${fmtTime(ts, false)}`;
-  };
-  const perMin = (s) => (s.duration_s > 0 ? (s.stutters || 0) / (s.duration_s / 60) : 0);
-  const severity = (s) => (perMin(s) >= 20 ? "bad" : perMin(s) >= 5 ? "warn" : "ok");
+  const severity = stutterLevel;
   const hasFrames = (s) => !!s.frames || s.fps_live != null;
   // with frame generation the game's own frames are the number to judge; the presented ones go in the stat row
   const frameGen = (s) => s.frame_gen_pct > 0 && s.app_fps_avg != null;
-  const fpsOf = (s) => (s.running ? (frameGen(s) ? s.app_fps_live : null) ?? s.fps_live ?? s.fps_avg : frameGen(s) ? s.app_fps_avg : s.fps_avg);
+  // a finished session shows its gameplay FPS (s.play: menus and loading left out), the number "względem zwykle" compares
+  const fpsOf = (s) => (s.running ? (frameGen(s) ? s.app_fps_live : null) ?? s.fps_live ?? s.fps_avg : s.play.fps);
   const shownOf = (s) => (s.running ? s.fps_live ?? s.fps_avg : s.fps_avg);
-  const ms = (v) => (v == null ? "–" : v >= 1000 ? `${fmt(v / 1000, 1)} s` : `${fmt(v)} ms`);
   const count = (v) => String(v).replace(/\B(?=(\d{3})+$)/g, " ");
   const label = (s) => `${s.running ? "na żywo" : when(s.start_ts)}, ${fmtDur(s.duration_s)}`;
 
@@ -57,18 +49,15 @@ Pages.overview = (() => {
 
   const stat = (value, text, cls) => h("div", { class: cls }, h("b", {}, value), text);
 
-  const pair = (s) => {
-    const b = s.bottleneck;
-    const share = b && b.share != null && b.kind !== "mixed" ? ` ${fmt(b.share)}% czasu` : "";
-    return [
-      ...(frameGen(s) ? [stat(fmt(shownOf(s)), "wyświetlane")] : []),
-      stat(fmt(frameGen(s) ? s.app_fps_1low ?? s.fps_1low : s.fps_1low), "1% low"),
-      stat(fmt(frameGen(s) ? s.app_fps_01low ?? s.fps_01low : s.fps_01low), "0,1% low"),
-      stat(count(s.stutters || 0), "przycięcia", severity(s)),
-      stat(ms(s.ft_max), "najdłuższa klatka"),
-      stat(b ? BOTTLENECK[b.kind] || b.kind : "–", `ogranicza${share}`),
-    ];
-  };
+  const pair = (s) => [
+    ...(frameGen(s) ? [stat(fmt(shownOf(s)), "wyświetlane")] : []),
+    stat(fmt(s.running ? (frameGen(s) ? s.app_fps_1low ?? s.fps_1low : s.fps_1low) : s.play.fps_1low), "1% low"),
+    stat(count(s.stutters || 0), "przycięcia", severity(s)),
+    ...(s.vs_usual != null ? [stat(`${signed(s.vs_usual)} fps`, "względem zwykle")] : []),
+  ];
+
+  const ask = (s) => askAgent(`Przeanalizuj sesję #${s.id} ${gameTitle(s)} (pm session ${s.id}) i stan komputera (pm health). `
+    + "Co powodowało spadki FPS i przycięcia, co poprawić? Wniosek zapisz przez pm note add.");
 
   const render = async (view) => {
     const r = {
@@ -86,7 +75,8 @@ Pages.overview = (() => {
     view.append(h("div", { class: "ov" }, h("section", { class: "ov-top" }, heading, r.meta), r.fps, r.side));
 
     let sessions = [];
-    let totals = null;
+    let agent = null;
+    let agentKey = null;
     let buttons = new Map();
     let sideKey = null;
     let loaded = false;
@@ -111,7 +101,7 @@ Pages.overview = (() => {
     const paint = (s) => {
       const frames = hasFrames(s);
       const end = ENDED[s.end_reason];
-      setTitle(gameTitle(s), `#/games?id=${s.id}`);
+      setTitle(gameTitle(s), `#/games?exe=${encodeURIComponent(s.exe)}`);
       r.meta.replaceChildren(...(s.running
         ? [h("span", { class: "live" }, "Na żywo"), `, od ${fmtTime(s.start_ts, false)}, ${fmtDur(s.duration_s)}`]
         : [`${when(s.start_ts)}, ${fmtDur(s.duration_s)}`, ...(end ? [", ", h("span", { class: end[0] }, end[1])] : [])]));
@@ -144,8 +134,9 @@ Pages.overview = (() => {
           b.el = h("button", { class: "slab ov-ses", onclick: () => { picked = s.id; select(); } }, b.name, b.fps, b.when);
           return [s.id, b];
         }));
-        r.total = h("div", { class: "slab ov-total" });
-        r.side.replaceChildren(...[...buttons.values()].map((b) => b.el), r.total);
+        r.agent = h("div", { class: "ov-agent" });
+        agentKey = null;
+        r.side.replaceChildren(...[...buttons.values()].map((b) => b.el), r.agent);
       }
       for (const s of sessions) {
         const b = buttons.get(s.id);
@@ -154,12 +145,12 @@ Pages.overview = (() => {
         b.fps.textContent = hasFrames(s) ? fmt(fpsOf(s)) : "–";
         b.when.textContent = `${label(s)}${end ? `, ${end[1]}` : ""}`;
       }
-      const n = totals.crashes_14d;
-      r.total.replaceChildren(
-        h("div", {}, h("b", {}, fmtDur(totals.play_s)), "w sumie"),
-        h("div", {}, h("b", {}, fmtDur(totals.week_s)), "w tym tygodniu"),
-        h("div", {}, h("b", {}, totals.fps_avg != null ? `${fmt(totals.fps_avg)} fps` : "–"), "średnio"),
-        h("div", {}, h("b", {}, `${n} ${plural(n, "awaria", "awarie", "awarii")}`), "w 14 dni"));
+      // rebuilt only when the note or the test changed: the button keeps its focus between polls
+      const card = JSON.stringify(agent);
+      if (card !== agentKey) {
+        agentKey = card;
+        r.agent.replaceChildren(agentCard(agent, { cls: "slab", ask: () => ask(sessions.find((x) => x.id === picked) || sessions[0]) }));
+      }
     };
 
     const tick = async () => {
@@ -172,7 +163,7 @@ Pages.overview = (() => {
       liveId = live;
       Mercury.pause(o.game_running);   // the drop costs ~1.5% GPU and ~15% of a core animated, ~0 as a still frame
       sessions = [cur, ...o.recent].filter(Boolean).slice(0, SESSIONS);
-      totals = o.totals;
+      agent = o.agent;
       loaded = true;
       if (!sessions.length) {
         blank("Czekam na grę", "Pomiar zacznie się sam, gdy włączysz grę.");

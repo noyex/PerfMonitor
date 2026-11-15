@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from perfmon import config, db
+from perfmon import banners, config, db, uiviews
 from perfmon.ui import server
 
 
@@ -48,16 +48,42 @@ class ServerTest(unittest.TestCase):
         r = c.getresponse()
         return r, r.read()
 
-    def test_incidents_compact_grouped_gzipped(self):
-        r, body = self.get("/api/incidents?since=1600000000", **{"Accept-Encoding": "gzip"})
+    def test_problems_fold_repeats_and_gzip(self):
+        with mock.patch.object(uiviews.time, "time", return_value=1.7e9 + 2000):
+            r, body = self.get("/api/problems?days=1", **{"Accept-Encoding": "gzip"})
         self.assertEqual(r.getheader("Content-Encoding"), "gzip")
-        rows = json.loads(gzip.decompress(body))
-        self.assertEqual(len(rows), 41)
-        self.assertEqual(rows[0]["count"], 30)
-        self.assertNotIn("details", rows[0])
-        r, body = self.get(f"/api/incident?id={rows[0]['id']}")
-        self.assertIsNone(r.getheader("Content-Encoding"))   # no Accept-Encoding: plain
-        self.assertEqual(json.loads(body)["details"], {"x": "y" * 500})
+        d = json.loads(gzip.decompress(body))
+        self.assertEqual(len(d["items"]), uiviews.PROBLEM_ROWS)   # 40 crashed programs + the memory episode, capped
+        self.assertEqual((d["items"][0]["group"], d["items"][0]["app"]), ("crash", "some-long-application-name-39.exe"))
+        self.assertEqual(d["agent"], {"note": None, "test": None})
+
+    def test_banner_is_served_from_the_cache_and_missing_is_404(self):
+        jpg = b"\xff\xd8" + b"x" * 5000
+        with mock.patch.object(config, "DATA_DIR", Path(self.dir)), \
+                mock.patch.object(banners, "_local", return_value=None), \
+                mock.patch.object(banners, "_download", side_effect=lambda appid: {"730": jpg, "1": b""}.get(appid)) as dl:
+            for _ in range(2):
+                r, body = self.get("/api/banner?appid=730")
+                self.assertEqual((r.status, r.getheader("Content-Type"), body), (200, "image/jpeg", jpg))
+            self.assertEqual(self.get("/api/banner?appid=1")[0].status, 404)
+            self.assertEqual(self.get("/api/banner?appid=1")[0].status, 404)
+            self.assertEqual(self.get("/api/banner?appid=../x")[0].status, 404)
+            for _ in range(2):   # Steam not reachable: asked again next time
+                self.assertEqual(self.get("/api/banner?appid=2")[0].status, 404)
+        self.assertEqual([c.args[0] for c in dl.call_args_list], ["730", "1", "2", "2"])   # hits and misses are remembered
+
+    def test_banner_is_read_from_the_steam_library_cache(self):
+        jpg = b"\xff\xd8" + b"y" * 5000
+        steam = Path(self.dir) / "Steam"
+        folder = steam / "appcache" / "librarycache" / "440" / "42dd64e5"
+        folder.mkdir(parents=True)
+        (folder / "library_header.jpg").write_bytes(jpg)
+        (folder.parent / "logo.jpg").write_bytes(jpg[:100])
+        with mock.patch.object(banners, "_steam_dirs", return_value=[str(steam)]), \
+                mock.patch.object(banners, "_download") as dl:
+            self.assertEqual(banners._local("440"), jpg)
+            self.assertIsNone(banners._local("441"))
+        dl.assert_not_called()
 
     def test_keep_alive_reuses_pooled_connection(self):
         c = http.client.HTTPConnection("127.0.0.1", self.port)
@@ -107,9 +133,9 @@ class ServerTest(unittest.TestCase):
         shell = "http://tauri.localhost"
         r, _ = self.get("/api/games", Origin=shell)
         self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
-        self.assertEqual(self.request("OPTIONS", "/api/test", shell).status, 403)
-        self.assertEqual(self.request("POST", "/api/test", shell, b'{"action": "nope"}').status, 403)
-        self.assertEqual(self.request("POST", "/api/test", None, b'{"action": "nope"}').status, 400)   # same origin
+        self.assertEqual(self.request("OPTIONS", "/api/game_target", shell).status, 403)
+        self.assertEqual(self.request("POST", "/api/game_target", shell, b'{}').status, 403)
+        self.assertEqual(self.request("POST", "/api/game_target", None, b'{}').status, 400)   # same origin
 
     def test_shell_token_gates_cors_and_posts(self):
         shell, token = "http://tauri.localhost", "0123456789abcdef0123456789abcdef"
@@ -123,21 +149,21 @@ class ServerTest(unittest.TestCase):
             r, _ = self.get("/lib.js", Origin=shell)   # static files are not part of the API
             self.assertIsNone(r.getheader("Access-Control-Allow-Origin"))
 
-            r = self.request("OPTIONS", "/api/test", shell, **{"Access-Control-Request-Method": "POST"})
+            r = self.request("OPTIONS", "/api/game_target", shell, **{"Access-Control-Request-Method": "POST"})
             self.assertEqual(r.status, 204)
             self.assertEqual(r.getheader("Access-Control-Allow-Origin"), shell)
             self.assertIn(server.TOKEN_HEADER, r.getheader("Access-Control-Allow-Headers"))
-            self.assertEqual(self.request("OPTIONS", "/api/test", "http://evil.example").status, 403)
+            self.assertEqual(self.request("OPTIONS", "/api/game_target", "http://evil.example").status, 403)
 
-            body = b'{"action": "nope"}'   # unknown action: 400 means the request reached the handler
-            self.assertEqual(self.request("POST", "/api/test", shell, body).status, 403)
-            self.assertEqual(self.request("POST", "/api/test", shell, body, **{server.TOKEN_HEADER: "wrong"}).status, 403)
+            body = b'{}'   # no game named: 400 means the request reached the handler
+            self.assertEqual(self.request("POST", "/api/game_target", shell, body).status, 403)
+            self.assertEqual(self.request("POST", "/api/game_target", shell, body, **{server.TOKEN_HEADER: "wrong"}).status, 403)
             # non-ASCII token: refused, not a crash in compare_digest
-            self.assertEqual(self.request("POST", "/api/test", shell, body, **{server.TOKEN_HEADER: "é"}).status, 403)
-            r = self.request("POST", "/api/test", shell, body, **{server.TOKEN_HEADER: token})
+            self.assertEqual(self.request("POST", "/api/game_target", shell, body, **{server.TOKEN_HEADER: "é"}).status, 403)
+            r = self.request("POST", "/api/game_target", shell, body, **{server.TOKEN_HEADER: token})
             self.assertEqual(r.status, 400)
             self.assertEqual(r.getheader("Access-Control-Allow-Origin"), shell)
-            self.assertEqual(self.request("POST", "/api/test", "http://evil.example", body,
+            self.assertEqual(self.request("POST", "/api/game_target", "http://evil.example", body,
                                           **{server.TOKEN_HEADER: token}).status, 403)
 
 

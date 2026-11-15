@@ -171,9 +171,3 @@ def by_key(con):
         res[r["key"]] = {"id": r["id"], "name": r["name"], "verdict": v, "status": r["status"],
                          "time": an.fmt_ts(r["start_ts"])}
     return res
-
-
-def overview(con):
-    """GET /api/tests: all tests, the open one with its live result, and the game a new test would default to."""
-    o = _open(con)
-    return {"tests": list_all(con), "open": evaluate(con, o) if o else None, "default_exe": default_exe(con)}

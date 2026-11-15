@@ -7,89 +7,25 @@ import os
 import sqlite3
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import advisor, analyze, config, db, diagreport, experiments, ocanalyze, ocassist, regression, updater
+from .. import analyze, banners, config, db, notes, ocanalyze, ocassist, uiviews, updater
 
 STATIC = Path(__file__).parent / "static"
 
-
-def _f(q, k, default=None):
-    v = q.get(k)
-    if v in (None, ""):
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        return analyze.parse_time(v)
-
-
-def _span(q):
-    """(from, to) of a chart route; a missing "from" means the last hour rather than a TypeError."""
-    t1 = _f(q, "to", time.time())
-    return _f(q, "from", t1 - 3600), t1
-
-
-def _since(q, default="14d"):
-    return analyze.parse_time(q.get("since") or default)
-
-
+# What the window reads. The rest of the data is for the user's AI agent, through the `pm` CLI.
 ROUTES = {
     "latest": lambda con, q: analyze.latest(con),
-    "overview": lambda con, q: analyze.overview(con),
-    "series": lambda con, q: analyze.series(con, *_span(q),
-                                            [c for c in q.get("cols", "").split(",") if c],
-                                            int(q.get("points", 1500))),
-    "net_series": lambda con, q: analyze.net_series(con, *_span(q), int(q.get("points", 1500))),
-    "frames": lambda con, q: analyze.frame_series(con, _f(q, "from"), _f(q, "to"),
-                                                  int(q["session"]) if q.get("session") else None,
-                                                  int(q.get("points", 1500))),
-    "sessions": lambda con, q: analyze.sessions(con, int(q.get("limit", 50))),
-    "diag_markers": lambda con, q: diagreport.diag_markers(con, *_span(q)),
-    "game_proc": lambda con, q: diagreport.game_series(con, int(q["session"]), int(q.get("points", 1500))),
-    "games": lambda con, q: analyze.game_list(con),
-    "session": lambda con, q: analyze.session_report(con, int(q["id"])),
-    "range": lambda con, q: analyze.range_report(con, *_span(q)),
-    "moment": lambda con, q: analyze.moment(con, _f(q, "ts", time.time()), int(q.get("window", 30))),
-    "incidents": lambda con, q: analyze.incidents(con, _since(q), [k for k in q.get("kinds", "").split(",") if k] or None),
-    "incident": lambda con, q: analyze.incident(con, int(q["id"])),
-    "advise": lambda con, q: advisor.advise(con),
-    "health": lambda con, q: analyze.health_overview(con, int(q.get("days", 14))),
-    "compare": lambda con, q: analyze.compare(con, q.get("exe") or None, q.get("by", "week"), _since(q, "180d"),
-                                              q.get("before") or None, q.get("after") or None),
-    "markers": lambda con, q: analyze.timeline_markers(con, q.get("exe") or None, _since(q, "180d"),
-                                                       diag=q.get("diag") == "1"),
-    "points": lambda con, q: analyze.session_points(con, q.get("exe") or None, _since(q, "180d")),
+    "overview": lambda con, q: uiviews.home(con),
+    "games": lambda con, q: uiviews.games(con),
+    "game": lambda con, q: uiviews.game(con, q["exe"]),
+    "problems": lambda con, q: uiviews.problems(con, int(q.get("days", 14))),
     "oc": lambda con, q: ocanalyze.overview(con),
-    "oc_compare": lambda con, q: ocanalyze.compare_profiles(con, q.get("exe") or None, q.get("since") or "180d"),
-    "oc_vf": lambda con, q: ocanalyze.vf_curve(con, _pid(q), q.get("since") or "30d"),
-    "oc_cores": lambda con, q: ocanalyze.per_core(con, _pid(q), q.get("since") or "30d"),
-    "tests": lambda con, q: experiments.overview(con),
-    "oc_stress": lambda con, q: ocanalyze.stress_runs(con, int(q.get("limit", 30))),
     "oc_next": lambda con, q: ocassist.next_step(con),
-    "regressions": lambda con, q: regression.overview(con, q.get("exe") or None),
+    "agent_card": lambda con, q: notes.card(con, general=True),   # the note about the whole PC
 }
-
-
-def _brief(rows):
-    """Incident lists without `details` (the UI shows time, title, severity; /api/incident?id= has the rest): the
-    14-day list was 404 KB, mostly ETW and freeze snapshots."""
-    return [{k: v for k, v in r.items() if k != "details"} for r in rows or []]
-
-
-def _compact(name, res):
-    if not isinstance(res, (dict, list)):
-        return res
-    if name == "incidents":
-        return _brief(res)
-    if name == "health" and isinstance(res, dict):
-        return {**res, "diag_incidents": _brief(res.get("diag_incidents"))}
-    if name == "session" and isinstance(res, dict) and "incidents" in res:
-        return {**res, "incidents": _brief(res["incidents"])}
-    return res
 
 
 GZIP_MIN = 1024
@@ -137,37 +73,7 @@ def _local_host(host):
     return urlparse(f"//{host}").hostname in ("127.0.0.1", "localhost")
 
 
-def _pid(q):
-    return int(q["profile"]) if q.get("profile") else None
-
-
-def save_profile(con, body):
-    """POST /api/oc_profile: create (no id) or update a profile; "activate": true = active from now."""
-    pid = body.get("id")
-    args = {k: body.get(k) for k in ("name", "cpu", "gpu", "notes", "status")}
-    if pid:
-        ocanalyze.update_profile(con, int(pid), **args, replace=True)
-    else:
-        pid = ocanalyze.create_profile(con, args["name"], args["cpu"], args["gpu"], args["notes"],
-                                       args["status"] or "testing")
-    if body.get("activate"):
-        ocanalyze.activate(con, int(pid))
-    return {"id": pid}
-
-
-def test_action(con, body):
-    """POST /api/test: {"action": "start", "name", "key"?, "exe"?} | {"action": "stop"} | {"action": "cancel"}."""
-    act = body.get("action")
-    if act == "start":
-        return {"id": experiments.start(con, body.get("name"), body.get("exe") or None, body.get("key") or None)}
-    if act == "stop":
-        return experiments.stop(con)
-    if act == "cancel":
-        return {"cancelled": experiments.cancel(con)}
-    raise ValueError("nieznana akcja")
-
-
-POSTS = {"/api/oc_profile": save_profile, "/api/test": test_action,   # the only write endpoints
+POSTS = {"/api/game_target": uiviews.set_target,   # the only write endpoints
          "/api/update": lambda con, body: updater.start_install()}
 NO_DB_ROUTES = {
     "update": lambda q: updater.status(q.get("force") == "1"),   # GitHub
@@ -196,7 +102,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body: bytes, ctype, cache="no-store", etag=None, gz=None):
         """gz: pre-compressed body to send instead when the client accepts gzip."""
-        if gz is None and len(body) >= GZIP_MIN and self._gzip_ok():
+        if gz is None and len(body) >= GZIP_MIN and not ctype.startswith("image/") and self._gzip_ok():
             gz = gzip.compress(body, 5)
         use_gz = gz is not None and self._gzip_ok()
         if use_gz:
@@ -232,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        """The write endpoints (POSTS: UV/OC profiles, tests). JSON-only + same-origin check: a web page in the browser
+        """The write endpoints (POSTS). JSON-only + same-origin check: a web page in the browser
         cannot post here (non-simple content type needs a CORS preflight); the desktop shell's page may, with its token."""
         u = urlparse(self.path)
         self.close_connection = True   # early refusals leave the body unread: never reuse this connection
@@ -273,6 +179,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, b'{"error":"forbidden"}', "application/json")
             name = u.path[5:]
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if name == "banner":   # a game's Steam banner, see perfmon/banners.py
+                img = banners.get(q.get("appid"))
+                if img is None:
+                    return self._send(404, b'{"error":"not found"}', "application/json")
+                return self._send(200, img, "image/jpeg", cache="private, max-age=604800")
             if name in NO_DB_ROUTES:   # not the database: works before the first sample too
                 return self._send(200, json.dumps(NO_DB_ROUTES[name](q), ensure_ascii=False).encode("utf-8"),
                                   "application/json; charset=utf-8")
@@ -283,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(503, b'{"error":"no data yet"}', "application/json")
             con, ver = POOL.get()
             try:   # back to the pool before sending: the next keep-alive request may arrive right after the body
-                body, err = json.dumps(_compact(name, fn(con, q)), ensure_ascii=False, default=str).encode("utf-8"), None
+                body, err = json.dumps(fn(con, q), ensure_ascii=False, default=str).encode("utf-8"), None
             except Exception as e:
                 body, err = None, e
             finally:

@@ -470,7 +470,7 @@ def next_step(con, now=None):
                 {"check": f"≥ {oc.STABLE_GAME_H} h gry na Stock", "ok": False, "value": 0},
                 {"check": f"≥ {oc.STABLE_WORK_DAYS} dni danych", "ok": False, "value": 0}]},
             next_if_ok="Po zebraniu bazy (i bez resetów) pierwszy krok to offset napięcia GPU -30 mV.",
-            rollback_if_bad="Nie dotyczy - nic nie zmieniasz.", warnings=_incident_blockers(_incidents(con, now)))
+            rollback_if_bad="Nie dotyczy: nic nie zmieniasz.", warnings=_incident_blockers(_incidents(con, now)))
     p = oc.profile(con, aid)
     st = oc.stability(con, aid)
     prev = _previous(con, aid)
