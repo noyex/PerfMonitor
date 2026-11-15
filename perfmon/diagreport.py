@@ -218,7 +218,7 @@ def findings(rep, row):
             "Plik wymiany zajęty w >60% i >200 odczytów stron/s: brakuje RAM. Zamknij przeglądarkę/aplikacje w tle; "
             "plik wymiany zarządzany przez system na Samsung 990 PRO.")
     if cc.get("etw_dump", 0) >= 3:
-        add("info", f"{cc['etw_dump']} stutterów w trakcie zapisu nagrania ETW przez PerfMonitor",
+        add("info", f"{cc['etw_dump']} stutterów w trakcie zapisu nagrania ETW przez NX Frame",
             "Zapis czarnej skrzynki ETW (wpr -stop) obciąża dysk i CPU, więc przycina grę. To koszt pomiaru, nie "
             "problem gry ani komputera; seria stutterów zapisuje najwyżej jedno nagranie na "
             f"{etwbox.settings(config.load())['burst_cooldown_s'] // 60} min.")

@@ -111,7 +111,7 @@ KEY_COLS = ["cpu_total", "cpu_core_max", "cpu_clock_mhz", "cpu_temp", "cpu_power
             "disk_busy_pct", "ui_ms", "dwm_ms"]
 
 NOT_BACKGROUND = {"system idle process", "system", "idle", "presentmon.exe", "memory compression", "registry",
-                  "wpr.exe"}   # wpr.exe: PerfMonitor's own ETW dump, tagged etw_dump instead
+                  "wpr.exe"}   # wpr.exe: NX Frame's own ETW dump, tagged etw_dump instead
 
 
 # --------------------------------------------------------------------------
