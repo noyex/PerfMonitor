@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS game_settings (      -- game config files parsed (per
     raw TEXT                                     -- JSON {key: value} as read from the files
 );
 CREATE INDEX IF NOT EXISTS ix_game_settings_exe ON game_settings(exe, ts);
+CREATE TABLE IF NOT EXISTS agent_notes (       -- `pm note`: conclusions the user's AI agent wrote for the window
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+    exe TEXT,                                    -- lowercase; NULL = about the whole PC
+    text TEXT
+);
 CREATE TABLE IF NOT EXISTS report_cache (      -- session_report of finished sessions (perfmon/reportcache.py)
     session INTEGER PRIMARY KEY, ts REAL,        -- ts = session end (retention)
     key TEXT,                                    -- code version + fingerprint of the session's data

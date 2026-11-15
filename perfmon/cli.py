@@ -17,7 +17,7 @@ from perfmon import analyze as an  # noqa: E402
 from perfmon import bottleneck, confdiff, config, db, present  # noqa: E402
 from perfmon import experiments as exps  # noqa: E402
 from perfmon import ocanalyze as oc  # noqa: E402
-from perfmon import ocassist  # noqa: E402
+from perfmon import notes, ocassist  # noqa: E402
 
 SEV = {"critical": "[KRYTYCZNE]", "serious": "[POWAZNE]", "warning": "[OSTRZEZENIE]", "info": "[info]"}
 
@@ -943,6 +943,22 @@ def cmd_test(con, a):
         table(rows, ["id", "time", "name", "exe", "status", "verdict"])
 
 
+def cmd_note(con, a):
+    act = a.action
+    if act == "add":
+        nid = notes.add(con, " ".join(a.text), a.exe)
+        out(json.dumps({"id": nid}) if a.json else f"Zapisano notatkę #{nid}: widać ją w oknie NX Frame.")
+    elif act == "clear":
+        n = notes.remove(con, a.id)
+        out(json.dumps({"removed": n}) if a.json else f"Usunięto notatek: {n}.")
+    else:
+        rows = notes.list_all(con, a.limit)
+        if a.json:
+            return dump(rows)
+        out("## Notatki agenta")
+        table(add_time(rows), ["id", "ts", "exe", "text"])
+
+
 def cmd_stress(con, a):
     act = a.action
     if act in ("start", "idle"):
@@ -1116,6 +1132,20 @@ def build():
         t_action(n, True).add_argument("id", nargs="?", type=int)
     t_action("list")
     t_action("show").add_argument("id", nargs="?", type=int)
+
+    s = add("note", cmd_note, help="the agent's conclusion shown in the window: add|list|clear")
+    np_ = s.add_subparsers(dest="action", required=True)
+
+    def n_action(name, writes=False):
+        x = np_.add_parser(name)
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        x.set_defaults(writes=writes)
+        return x
+    x = n_action("add", True)
+    x.add_argument("text", nargs="+")
+    x.add_argument("--exe", help="the game the note is about; without it the note is about the whole PC")
+    n_action("clear", True).add_argument("id", nargs="?", type=int)
+    n_action("list").add_argument("--limit", type=int, default=20)
     return p
 
 
