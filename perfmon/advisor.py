@@ -37,7 +37,8 @@ NET_HOME_KINDS = ("net_down", "net_link_down", "packet_loss", "latency_spike", "
 TIER_STABILITY, TIER_NORMAL, TIER_LAST = 0, 1, 2
 BG_GPU_IGNORE = {"dwm.exe", "system", "idle", "csrss.exe", "explorer.exe", "searchhost.exe"}
 # not autostart apps: our own tools, Windows components, the GPU driver service (judged by the background_gpu rule)
-OWN_PROCS = {"python.exe", "pythonw.exe", "powershell.exe", "presentmon.exe", "dwm.exe", "svchost.exe", "csrss.exe",
+OWN_PROCS = {"python.exe", "pythonw.exe", "nxframe.exe", "nxframe-core.exe", "pm.exe",   # the installed build's names
+             "powershell.exe", "presentmon.exe", "dwm.exe", "svchost.exe", "csrss.exe",
              "audiodg.exe", "lsass.exe", "services.exe", "winlogon.exe", "wmiprvse.exe", "msmpeng.exe", "sihost.exe",
              "taskhostw.exe", "ctfmon.exe", "searchhost.exe", "runtimebroker.exe", "fontdrvhost.exe", "gamingservices.exe",
              "amdrsserv.exe", "explorer.exe", "conhost.exe", "wudfhost.exe", "dllhost.exe", "smss.exe"}

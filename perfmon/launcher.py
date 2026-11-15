@@ -1,5 +1,6 @@
-"""Entry point of the installed build (PyInstaller): PerfMonitor.exe opens the UI, pm.exe is the CLI, and
-`<exe> -m perfmon.<module> args` runs a module the way `python -m` does (the collector task, its self-spawns)."""
+"""Entry point of the installed build's Python (PyInstaller). pm.exe is the CLI. nxframe-core.exe has no window and
+runs a module the way `python -m` does: `nxframe-core.exe -m perfmon.<module> args` (the collector task, the API
+server of the window, their self-spawns). The window itself is NXFrame.exe (src-tauri)."""
 import runpy
 import sys
 from pathlib import Path
@@ -14,8 +15,7 @@ def main():
         from perfmon import cli
         cli.main()
     else:
-        from perfmon.ui import app
-        app.main()
+        sys.exit(2)   # nothing to run
 
 
 if __name__ == "__main__":

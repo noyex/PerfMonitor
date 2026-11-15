@@ -1,8 +1,9 @@
-# PyInstaller spec: one folder with two executables sharing the runtime.
-#   PerfMonitor.exe  windowed: the UI, and the collector (`PerfMonitor.exe -m perfmon.collector`, see launcher.py)
-#   pm.exe           console: the CLI
+# PyInstaller spec: the Python side of the installed build, one folder with two executables sharing the runtime.
+#   nxframe-core.exe  no window: runs a module, e.g. `nxframe-core.exe -m perfmon.collector` (see launcher.py)
+#   pm.exe            console: the CLI
+# The window (NXFrame.exe, src-tauri) is built separately and put next to them by the installer.
 # Build (from the repository root): python packaging/version_info.py   (writes build/version.txt)
-#                                   pyinstaller packaging/perfmon.spec --noconfirm
+#                                   pyinstaller packaging/perfmon.spec --noconfirm   ->  dist\NXFrame\
 from pathlib import Path
 
 ROOT = Path(SPECPATH).parent
@@ -20,7 +21,8 @@ a = Analysis(
     datas=[(str(ROOT / "perfmon" / "ui" / "static"), "perfmon/ui/static"),
            (str(ROOT / "perfmon" / "etw"), "perfmon/etw"),
            (str(ROOT / "perfmon" / "agent"), "perfmon/agent")],
-    excludes=["tkinter", "unittest", "pydoc_data"],
+    # webview: the pywebview window of a source checkout without NXFrame.exe, never used here
+    excludes=["tkinter", "unittest", "pydoc_data", "webview"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -31,4 +33,4 @@ def exe(name, console):
                version=str(ROOT / "build" / "version.txt"), upx=False)
 
 
-coll = COLLECT(exe("PerfMonitor", False), exe("pm", True), a.binaries, a.datas, name="PerfMonitor", upx=False)
+coll = COLLECT(exe("nxframe-core", False), exe("pm", True), a.binaries, a.datas, name="NXFrame", upx=False)
